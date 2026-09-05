@@ -1213,6 +1213,7 @@ export function buildExecutiveBrief(items, now = new Date(), prioritization) {
     title: entry.item.title,
     status: "Needs tracking",
     gap: entry.gaps[0],
+    gapAction: entry.gapActions[0],
     instrumentation: entry.instrumentation,
     owner: entry.item.owner || "Unassigned",
     reviewDate: entry.reviewDate
@@ -1221,7 +1222,7 @@ export function buildExecutiveBrief(items, now = new Date(), prioritization) {
   const asks = [
     ...risks.map((risk) => ({ type: "Risk", title: risk.title, action: risk.action, owner: risk.owner, dueDate: risk.dueDate, itemId: risk.itemId })),
     ...decisions.map((decision) => ({ type: "Decision", title: decision.title, action: decision.ask, owner: decision.owner, dueDate: decision.dueDate, itemId: decision.itemId })),
-    ...metricGaps.map((gap) => ({ type: "Metric", title: gap.title, action: gap.instrumentation, owner: gap.owner, dueDate: gap.reviewDate, itemId: gap.itemId }))
+    ...metricGaps.map((gap) => ({ type: "Metric", title: gap.title, action: gap.gap, gapAction: gap.gapAction, owner: gap.owner, dueDate: gap.reviewDate, itemId: gap.itemId }))
   ].slice(0, 6);
   const health = calculateHealth(active, now);
   const headline = active.length
@@ -2087,12 +2088,13 @@ export function buildMetricsPlan(items, now = new Date(), prioritization) {
     const hasOwner = Boolean(item.owner);
     const hasDate = Boolean(item.dueDate);
     const hasEvidence = Boolean(item.problem || item.customer);
-    const gaps = [
-      hasTarget ? "" : "Add a target metric, experiment, or decision threshold.",
-      hasOwner ? "" : "Assign an owner for metric follow-up.",
-      hasDate ? "" : "Set a review date for the measurement readout.",
-      hasEvidence ? "" : "Capture customer evidence behind the metric."
+    const gapActions = [
+      hasTarget ? null : { field: "experiment", label: "Add measurement", description: "Add a target metric, experiment, or decision threshold." },
+      hasOwner ? null : { field: "owner", label: "Assign owner", description: "Assign an owner for metric follow-up." },
+      hasDate ? null : { field: "dueDate", label: "Set review date", description: "Set a review date for the measurement readout." },
+      hasEvidence ? null : { field: "problem", label: "Add customer evidence", description: "Capture customer evidence behind the metric." }
     ].filter(Boolean);
+    const gaps = gapActions.map((action) => action.description);
     return {
       item,
       objective,
@@ -2101,6 +2103,7 @@ export function buildMetricsPlan(items, now = new Date(), prioritization) {
       instrumentation: suggestInstrumentation(item, objective),
       status: gaps.length ? "Needs tracking" : "Tracked",
       gaps,
+      gapActions,
       reviewDate: item.dueDate || addDays(now, item.status === "shipped" ? 14 : 30).toISOString().slice(0, 10)
     };
   });

@@ -75,8 +75,8 @@ export class SupabaseWorkspaceRepository extends WorkspaceRepository {
     this._now = options.now || options.clock || (() => new Date());
     this._idFactory = typeof options.idFactory === "function" ? options.idFactory : defaultIdFactory;
     this._schedule = typeof options.schedule === "function" ? options.schedule : defaultSchedule;
-    this._setTimer = typeof options.setTimer === "function" ? options.setTimer : setTimeout;
-    this._clearTimer = typeof options.clearTimer === "function" ? options.clearTimer : clearTimeout;
+    this._setTimer = typeof options.setTimer === "function" ? options.setTimer : (callback, delay) => globalThis.setTimeout(callback, delay);
+    this._clearTimer = typeof options.clearTimer === "function" ? options.clearTimer : (timer) => globalThis.clearTimeout(timer);
     this._reconnectDelays = normalizeReconnectDelays(options.reconnectDelays);
     this._subscribeTimeoutMs = positiveInteger(options.subscribeTimeoutMs, 10000);
     this._onSubscriberError = typeof options.onSubscriberError === "function"
@@ -1260,6 +1260,9 @@ export class SupabaseTeamWorkspaceService extends TeamWorkspaceService {
   listWorkspaces() { return this._call("listWorkspaces", "pm_list_workspaces", {}); }
   async createWorkspace(input = {}) {
     const suppliedName = requiredText(input.name, this.providerId, "createWorkspace", "workspace name", 160);
+    const suppliedTemplateId = Object.prototype.hasOwnProperty.call(input, "templateId")
+      ? requireWorkspaceTemplate(input.templateId, this.providerId, "createWorkspace")
+      : "";
     const suppliedAttemptId = optionalAttemptIdentity(
       input,
       this.providerId,
@@ -1267,16 +1270,20 @@ export class SupabaseTeamWorkspaceService extends TeamWorkspaceService {
     );
     const attemptKey = suppliedAttemptId
       ? `id:${suppliedAttemptId}`
-      : `intent:${canonicalStringify({ name: suppliedName })}`;
+      : `intent:${canonicalStringify({ name: suppliedName, templateId: suppliedTemplateId })}`;
     let attempt = this._createAttempts.get(attemptKey);
     if (!attempt) {
       attempt = {
         name: suppliedName,
+        templateId: suppliedTemplateId,
         mutationId: suppliedAttemptId || this._mutationId("createWorkspace")
       };
       this._createAttempts.set(attemptKey, attempt);
     }
-    const parameters = { p_name: attempt.name };
+    const parameters = {
+      p_name: attempt.name,
+      ...(attempt.templateId ? { p_template_id: attempt.templateId } : {})
+    };
     const identityKey = `createWorkspace:${attemptKey}`;
     const retainedMutationId = this._retryMutations.get(identityKey) || attempt.mutationId;
     this._retryMutations.set(identityKey, retainedMutationId);
@@ -1295,6 +1302,26 @@ export class SupabaseTeamWorkspaceService extends TeamWorkspaceService {
       }
       throw error;
     }
+  }
+  renameWorkspace(input = {}) {
+    const workspaceId = requiredIdentity(input.workspaceId, this.providerId, "renameWorkspace", "workspace");
+    const name = requiredText(input.name, this.providerId, "renameWorkspace", "workspace name", 160);
+    const expectedRevision = requireWorkspaceRevision(input.expectedRevision, this.providerId, "renameWorkspace");
+    return this._lifecycleMutation("renameWorkspace", "pm_rename_workspace", {
+      p_workspace_id: workspaceId,
+      p_name: name,
+      p_expected_revision: expectedRevision
+    }, input.mutationId);
+  }
+  deleteWorkspace(input = {}) {
+    const workspaceId = requiredIdentity(input.workspaceId, this.providerId, "deleteWorkspace", "workspace");
+    const expectedName = requiredText(input.expectedName, this.providerId, "deleteWorkspace", "expected workspace name", 160);
+    const expectedRevision = requireWorkspaceRevision(input.expectedRevision, this.providerId, "deleteWorkspace");
+    return this._lifecycleMutation("deleteWorkspace", "pm_delete_workspace", {
+      p_workspace_id: workspaceId,
+      p_expected_name: expectedName,
+      p_expected_revision: expectedRevision
+    }, input.mutationId);
   }
   listMembers(workspaceId) {
     return this._call("listMembers", "pm_list_members", {
@@ -1362,6 +1389,30 @@ export class SupabaseTeamWorkspaceService extends TeamWorkspaceService {
       throw error;
     }
     return immutableWorkspaceValue(data);
+  }
+
+  async _lifecycleMutation(operation, rpcName, parameters, suppliedMutationId) {
+    const requestedId = suppliedMutationId === undefined || suppliedMutationId === null
+      ? ""
+      : requiredIdentity(suppliedMutationId, this.providerId, operation, "mutation");
+    const intentKey = requestedId
+      ? `${operation}:id:${requestedId}`
+      : `${operation}:intent:${canonicalStringify(parameters)}`;
+    const mutationId = this._retryMutations.get(intentKey)
+      || requestedId
+      || this._mutationId(operation);
+    this._retryMutations.set(intentKey, mutationId);
+    try {
+      const result = await this._call(operation, rpcName, {
+        ...parameters,
+        p_mutation_id: mutationId
+      });
+      this._retryMutations.delete(intentKey);
+      return result;
+    } catch (error) {
+      if (!isAmbiguousRemoteError(error)) this._retryMutations.delete(intentKey);
+      throw error;
+    }
   }
 
   _reportOperationError(error) {
@@ -1654,6 +1705,22 @@ function requireInviteRole(value, providerId, operation) {
     throw invalidInput(providerId, operation, "Invite role must be editor or viewer.");
   }
   return role;
+}
+
+function requireWorkspaceTemplate(value, providerId, operation) {
+  const templateId = String(value || "").trim().toLowerCase();
+  if (!new Set(["focused", "full", "blank"]).has(templateId)) {
+    throw invalidInput(providerId, operation, "Workspace template must be focused, full, or blank.");
+  }
+  return templateId;
+}
+
+function requireWorkspaceRevision(value, providerId, operation) {
+  const revision = Number(value);
+  if (!Number.isSafeInteger(revision) || revision < 0) {
+    throw invalidInput(providerId, operation, "A valid expected workspace revision is required.");
+  }
+  return revision;
 }
 
 function assertPayloadSize(value, maxBytes, providerId, operation, label) {

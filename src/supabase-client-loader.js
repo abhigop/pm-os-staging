@@ -16,7 +16,10 @@ export function normalizeSupabasePublicConfig(input = {}) {
 
   const mode = ["personal-local", "lan", "remote"].includes(input.mode) ? input.mode : "remote";
   const authMode = mode === "personal-local" || mode === "lan" ? "password" : input.authMode === "password" ? "password" : "otp";
-  const persistSession = mode !== "remote" && input.persistSession !== false;
+  const persistSession = mode === "remote"
+    ? input.persistSession === true
+    : input.persistSession !== false;
+  const storageKey = normalizeAuthStorageKey(input.storageKey);
   if (!urlValue || urlValue.length > 2048 || !keyValue || keyValue.length > 8192) {
     throw configurationError("A valid Supabase project URL and public key are required.");
   }
@@ -37,7 +40,14 @@ export function normalizeSupabasePublicConfig(input = {}) {
     throw configurationError("A Supabase publishable or legacy anon key is required.");
   }
 
-  return Object.freeze({ url: url.origin, key: keyValue, mode, authMode, persistSession });
+  return Object.freeze({
+    url: url.origin,
+    key: keyValue,
+    mode,
+    authMode,
+    persistSession,
+    ...(storageKey ? { storageKey } : {})
+  });
 }
 
 /** Resolves a locally loaded Supabase global. This never imports from a CDN. */
@@ -61,11 +71,15 @@ export function createSupabaseClient(config, options = {}) {
     : resolveSupabaseClientFactory(options.globalObject || globalThis);
   let client;
   try {
+    const auth = {
+      persistSession: normalized.persistSession,
+      autoRefreshToken: true,
+      detectSessionInUrl: false,
+      ...(normalized.storageKey ? { storageKey: normalized.storageKey } : {})
+    };
     client = factory(normalized.url, normalized.key, {
       auth: {
-        persistSession: normalized.persistSession,
-        autoRefreshToken: true,
-        detectSessionInUrl: false
+        ...auth
       }
     });
   } catch {
@@ -149,6 +163,15 @@ export function createSupabaseAuthHelpers(client) {
 }
 
 const isBrowserSafeKey = isBrowserSafeSupabaseKey;
+
+function normalizeAuthStorageKey(value) {
+  const key = String(value || "").trim();
+  if (!key) return "";
+  if (!/^pm-os-staging\.supabase\.auth\.v1\.[a-z0-9][a-z0-9-]{0,79}$/.test(key)) {
+    throw configurationError("The Supabase authentication storage identity is invalid.");
+  }
+  return key;
+}
 
 function normalizeEmail(value, operation) {
   const email = String(value || "").trim().toLowerCase();

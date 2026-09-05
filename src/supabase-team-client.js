@@ -272,7 +272,8 @@ export class SupabaseTeamClient {
     const next = normalizeSupabasePublicConfig(input);
     if (this._config && this._config.url === next.url && this._config.key === next.key
       && this._config.mode === next.mode && this._config.authMode === next.authMode
-      && this._config.persistSession === next.persistSession) return;
+      && this._config.persistSession === next.persistSession
+      && this._config.storageKey === next.storageKey) return;
     if (this._client) {
       await this._disconnectRepositories();
       await this._discardClient(false);
@@ -478,7 +479,16 @@ function normalizeCapabilities(input) {
     optimisticConcurrency: true,
     roles: Array.isArray(source.roles)
       ? source.roles.filter((role) => ["owner", "editor", "viewer"].includes(role))
-      : ["owner", "editor", "viewer"]
+      : ["owner", "editor", "viewer"],
+    ...(typeof source.allowWorkspaceCreation === "boolean"
+      ? { allowWorkspaceCreation: source.allowWorkspaceCreation }
+      : {}),
+    ...(typeof source.workspaceLifecycle === "boolean"
+      ? { workspaceLifecycle: source.workspaceLifecycle }
+      : {}),
+    ...(Array.isArray(source.workspaceTemplates)
+      ? { workspaceTemplates: source.workspaceTemplates.filter((id) => ["focused", "full", "blank"].includes(id)) }
+      : {})
   });
 }
 

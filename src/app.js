@@ -97,11 +97,14 @@ import { createDemoCustomerDirectory } from "./demo-customers.js";
 import {
   advanceDriveBaseline,
   chooseDriveWorkspaceFile,
+  deletePreparedDriveWorkspace,
   driveConflictKind,
   driveFileFingerprint,
   driveFingerprintComplete,
   driveSourceReady,
+  driveWorkspaceFileId,
   inspectDriveWorkspace,
+  prepareDriveWorkspaceDeletion,
   readDriveWorkspace,
   requestDriveAccessToken,
   saveDriveConflictCopy,
@@ -284,17 +287,21 @@ import {
   createProject as createRegistryProject,
   forgetProject as forgetRegistryProject,
   normalizeProjectRegistry,
+  normalizeProjectLocation,
   projectById as registryProjectById,
   projectKeys,
+  projectsForConnector,
   readProjectBundle,
   renameProject as renameRegistryProject,
   setProjectArchived,
+  updateProjectMetadata,
   updateActiveProjectLocation,
   updateActiveProjectProvider
 } from "./projects.js";
 import {
   createProjectUiState,
   currentProjectDescriptor,
+  newProjectWizardState,
   projectSwitcherButtonMarkup,
   projectSwitcherMarkup
 } from "./project-switcher.js";
@@ -312,13 +319,42 @@ const urlParams = new URLSearchParams(location.search);
 const storedWorkspaceMode = loadWorkspaceModePreference();
 const explicitDemoMode = urlParams.get("demo") === "1";
 const demoMode = explicitDemoMode || (!urlParams.has("demo") && storedWorkspaceMode === "demo");
+const serverConnectorRuntime = demoMode ? null : await import("./server-connectors.js?v=1");
+const ServerConnectorClientPool = serverConnectorRuntime?.ServerConnectorClientPool;
+const serverConnectorClientConfig = serverConnectorRuntime?.serverConnectorClientConfig;
+const serverConnectorPool = demoMode ? null : new ServerConnectorClientPool({
+  storage: localStorage,
+  ...(typeof globalThis[teamFactoryHook] === "function" ? { createTeamClient: globalThis[teamFactoryHook] } : {})
+});
 const initialWorkspaceModeChoiceOpen = !storedWorkspaceMode
   && !urlParams.has("demo")
   && !urlParams.has("space")
   && !urlParams.has("view");
 const initialProjectBootstrap = demoMode ? null : bootstrapProjectRegistry(localStorage);
 let projectRegistry = initialProjectBootstrap?.registry || null;
-let activeProjectStorageKeys = initialProjectBootstrap?.keys || existingOperationalProjectKeys() || {
+const initialServerProjectId = !demoMode && registryProjectById(projectRegistry, urlParams.get("project"))?.provider === "server"
+  ? urlParams.get("project")
+  : activeRegistryProject(projectRegistry)?.provider === "server" ? projectRegistry.activeProjectId : "";
+if (initialServerProjectId && activeRegistryProject(projectRegistry)?.provider === "server") {
+  let fallback = projectRegistry.projects.find((entry) => !entry.archivedAt && entry.provider !== "server");
+  if (!fallback) {
+    const archivedFallback = projectRegistry.projects.find((entry) => entry.archivedAt && entry.provider !== "server");
+    if (archivedFallback) {
+      projectRegistry = setProjectArchived(localStorage, projectRegistry, archivedFallback.id, false);
+      fallback = registryProjectById(projectRegistry, archivedFallback.id);
+    }
+  }
+  if (!fallback) {
+    const empty = encodeWorkspaceDocument(createEmptyWorkspaceDocument());
+    const created = createRegistryProject(localStorage, projectRegistry, {
+      name: "My project", provider: "browser", location: { space: "today", mode: "focus" }
+    }, { workspace: empty, activity: JSON.stringify({ activity: [] }) });
+    projectRegistry = created.registry;
+    fallback = created.project;
+  }
+  projectRegistry = activateProjectRegistryEntry(localStorage, projectRegistry, fallback.id, activeRegistryProject(projectRegistry).location);
+}
+let activeProjectStorageKeys = (initialServerProjectId ? projectKeys(projectRegistry.activeProjectId) : initialProjectBootstrap?.keys) || existingOperationalProjectKeys() || {
   workspace: legacyStorageKey,
   activity: legacyActivityKey,
   source: "pm-os-staging.source.v2",
@@ -485,8 +521,8 @@ const state = {
   selectedView: initialSelectedView,
   selectedMode: initialSelectedMode,
   spaceModes: { [initialSelectedView]: initialSelectedMode },
-  selectedOrgUnitId: "",
-  selectedPersonId: "",
+  selectedOrgUnitId: urlParams.get("orgUnitId") || "",
+  selectedPersonId: urlParams.get("personId") || "",
   customerView: urlParams.get("customerView") || "accounts",
   selectedCustomerId: urlParams.get("customerId") || "",
   selectedSegmentId: urlParams.get("segmentId") || "",
@@ -510,7 +546,7 @@ const state = {
   usage: loadUsage(),
   selectedTemplate: "weekly-review",
   selectedMeeting: "weekly-review",
-  selectedSpecId: "",
+  selectedSpecId: urlParams.get("specId") || "",
   query: "",
   source: loadSource(),
   sourceSelection: "local",
@@ -552,7 +588,8 @@ const state = {
   },
   projects: demoMode ? null : createProjectUiState(projectRegistry, {
     persistent: initialProjectBootstrap?.persistent !== false,
-    warning: initialProjectBootstrap?.warning || ""
+    warning: [initialProjectBootstrap?.warning, serverConnectorPool?.warning].filter(Boolean).join(" "),
+    connectors: serverConnectorPool?.registry.connectors || []
   })
 };
 state.sourceSelection = sourceSelectionFor(state.source);
@@ -573,12 +610,21 @@ if (state.initiativeDetail.focusRecordId) {
 }
 
 const app = document.querySelector("#app");
+// Keep pending native confirmations alive when background updates redraw the workspace.
+document.body.insertAdjacentHTML("beforeend", confirmationDialogMarkup());
+if (state.projects && ((!urlParams.has("space") && !urlParams.has("view")) || (urlParams.get("project") && urlParams.get("project") !== state.projects.registry.activeProjectId))) restoreProjectLocation(activeRegistryProject(state.projects.registry)?.location);
+if (urlParams.has("insightId")) restoreInsightSelection(urlParams.get("insightId"));
+if (urlParams.has("insightStatus")) state.insightStatusFilter = validInsightStatus(urlParams.get("insightStatus"));
 app.addEventListener("click", handleDelegatedNavigation);
-if (!state.modeChoiceOpen && (!urlParams.get("space") || urlParams.get("view") || urlParams.has("experience"))) pushViewUrl(true);
+if (!state.modeChoiceOpen && (!state.projects || !urlParams.get("project") || urlParams.get("project") === state.projects.registry.activeProjectId)
+  && (!urlParams.get("space") || urlParams.get("view") || urlParams.has("experience") || (state.projects && !urlParams.get("project")))) pushViewUrl(true);
 if (!state.modeChoiceOpen) recordViewUsage(state.selectedView);
 render();
+if (!urlParams.get("project") || urlParams.get("project") === state.projects?.registry.activeProjectId) persistCurrentProjectLocation();
 void restoreLinkedWorkspaceHandle();
-if (state.projects && urlParams.get("project") && urlParams.get("project") !== state.projects.registry.activeProjectId) {
+if (state.projects && initialServerProjectId && !registryProjectById(projectRegistry, initialServerProjectId)?.archivedAt) {
+  queueMicrotask(() => { void stageServerProjectSwitch(initialServerProjectId, { replaceUrl: true }); });
+} else if (state.projects && urlParams.get("project") && urlParams.get("project") !== state.projects.registry.activeProjectId) {
   queueMicrotask(() => { void restoreViewFromLocation(); });
 }
 window.addEventListener("popstate", restoreViewFromLocation);
@@ -645,7 +691,6 @@ function render() {
     ${state.initiativeEditor.mode ? "" : initiativeDetailDialogMarkup()}
     ${initiativeEditorDialogMarkup()}
     ${insightEditorDialogMarkup()}
-    ${confirmationDialogMarkup()}
     ${workspaceModeChoiceMarkup()}
     ${initialStorageChoiceMarkup()}
     ${demoConversionDialogMarkup()}
@@ -772,6 +817,7 @@ function todaySpaceView({ filteredItems, health, followUps }) {
   return `${spaceModeMarkup([["focus", "Focus"], ["actions", "Actions"]])}
     <section class="welcome-band simple-welcome"><div><p class="eyebrow">${todayStamp()}</p><h3>Move the most important work forward.</h3><p>Capture the work, order priorities, make the next step clear, and share the week.</p></div><div class="focus-score"><span>Workspace health</span><strong>${health.score}</strong></div></section>
     <section class="metrics simple-metrics" aria-label="Workspace health">${metric("Active", health.active)}${metric("No next step", health.noNextStep)}</section>
+    ${!demoMode && !state.team?.active && !state.items.length ? `<section class="panel" aria-labelledby="emptyProjectStartTitle"><div class="panel-header"><div><p class="panel-kicker">Start here</p><h3 id="emptyProjectStartTitle">Choose how to start this project</h3></div></div><p>Create your first initiative below, bring in saved work, or choose the supporting workflows you need. You can change these choices later.</p><div class="data-actions"><button class="secondary" id="startProjectImport" type="button">Import saved work</button><button class="secondary" id="startProjectWorkflows" type="button">Choose workflows</button></div></section>` : ""}
     <section class="today-grid simple-today-grid">
       <section class="panel getting-started-card" aria-labelledby="gettingStartedTitle"><div class="panel-header"><div><p class="panel-kicker">First week</p><h3 id="gettingStartedTitle">Get your workspace moving</h3></div><span class="muted" id="gettingStartedProgress">${[state.items.length > 0, ordered, state.weeklyUpdateCopied].filter(Boolean).length} / 3</span></div><ol class="today-checklist"><li class="${state.items.length ? "complete" : ""}"><span>${state.items.length ? "✓" : "1"}</span><button id="checklistCreateInitiative" type="button">Create the first initiative</button></li><li class="${ordered ? "complete" : ""}"><span>${ordered ? "✓" : "2"}</span><button data-jump-space="initiatives" data-jump-mode="priorities" type="button">Order the most important work</button></li><li class="${state.weeklyUpdateCopied ? "complete" : ""}"><span>${state.weeklyUpdateCopied ? "✓" : "3"}</span><button id="checklistCopyUpdate" type="button">Copy the weekly update</button></li></ol></section>
       <section class="panel priority-panel"><div class="panel-header"><div><p class="panel-kicker">Now</p><h3>Top priorities</h3></div><span class="muted">${priorities.length} in focus</span></div><div class="item-list simple-item-list">${priorities.map(simpleItemCard).join("") || emptyState("Capture your first initiative to start the priority stack.")}</div></section>
@@ -1232,7 +1278,7 @@ function settingsSpaceView() {
 }
 
 function simpleItemCard(item) {
-  return `<article class="item-card simple-item-card"><div><span>${escapeHtml(initiativeStatusLabel(item))}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.nextStep || "Add the next step")}</p></div>${initiativeDetailButton(item, `simple-${elementIdToken(item.id)}`, "Open")}</article>`;
+  return `<article class="item-card simple-item-card"><div><span>${escapeHtml(initiativeStatusLabel(item))}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.nextStep || "Add the next step")}</p></div><div class="contextual-card-actions">${initiativeDetailButton(item, `simple-${elementIdToken(item.id)}`, "Open")}${initiativeContextualEditButton(item, `today-next-step-${elementIdToken(item.id)}`, "nextStep", item.nextStep.trim() ? "Update next step" : "Add next step")}</div></article>`;
 }
 
 function simpleWeeklyUpdate(items) {
@@ -1926,9 +1972,9 @@ function briefRiskCard(entry, index) { const status = briefValue(entry, ["status
 function briefDecisionCard(entry, index) { return `<article class="brief-card" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label neutral">Decision required</span></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.context}</b>${escapeHtml(briefValue(entry, ["context", "decision"], "Decision context unavailable."))}</p><p><b>${executiveBriefLabels.decisionAsk}</b>${escapeHtml(briefValue(entry, ["ask", "action", "decisionAsk"], "Confirm the path forward."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span><span><b>${executiveBriefLabels.dueDate}</b>${escapeHtml(briefValue(entry, ["dueDate"], "No date"))}</span></div>${briefCardActions(entry, `brief-decision-${index}`, "decision", "Record decision")}</article>`; }
 function briefRolloutGroup(label, entries = []) { return `<section class="brief-rollout-group" aria-label="${label} rollouts"><h4>${label}</h4><div class="brief-list">${entries.map((entry, index) => briefRolloutCard(entry, label, index)).join("") || `<p class="brief-group-empty">No ${label.toLowerCase()} rollouts.</p>`}</div></section>`; }
 function briefRolloutCard(entry, label, index) { return `<article class="brief-card ${label.toLowerCase()}" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label ${label.toLowerCase()}">${executiveBriefLabels.status}: ${label} | ${executiveBriefLabels.readiness}: ${escapeHtml(briefValue(entry, ["readiness"], "Not scored"))}${Number.isFinite(Number(entry.readiness)) ? "%" : ""}</span></div><h5>${escapeHtml(briefTitle(entry))}</h5><p><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.stage}</b>${escapeHtml(briefValue(entry, ["stage"], "No stage"))}</span><span><b>${executiveBriefLabels.audience}</b>${escapeHtml(briefValue(entry, ["audience"], "No audience"))}</span></div><p><b>${executiveBriefLabels.nextAction}</b>${escapeHtml(briefValue(entry, ["nextAction", "nextStep", "action"], "No next action"))}</p>${briefCardActions(entry, `brief-rollout-${label}-${index}`, "experiment", "Update readiness")}</article>`; }
-function briefMetricCard(entry, index) { return `<article class="brief-card watch" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label watch">Needs tracking | ${executiveBriefLabels.reviewDate}: ${escapeHtml(briefValue(entry, ["reviewDate"], "No date"))}</span></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.firstGap}</b>${escapeHtml(briefValue(entry, ["gap", "missingDetail"], Array.isArray(entry.gaps) ? entry.gaps[0] : "Measurement detail missing."))}</p><p><b>${executiveBriefLabels.instrumentationAction}</b>${escapeHtml(briefValue(entry, ["instrumentation", "action", "instrumentationAction"], "Define and instrument the missing measure."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span></div>${briefCardActions(entry, `brief-metric-${index}`, "experiment", "Add measurement")}</article>`; }
+function briefMetricCard(entry, index) { return `<article class="brief-card watch" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label watch">Needs tracking | ${executiveBriefLabels.reviewDate}: ${escapeHtml(briefValue(entry, ["reviewDate"], "No date"))}</span></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.firstGap}</b>${escapeHtml(briefValue(entry, ["gap", "missingDetail"], Array.isArray(entry.gaps) ? entry.gaps[0] : "Measurement detail missing."))}</p><p><b>${executiveBriefLabels.instrumentationAction}</b>${escapeHtml(briefValue(entry, ["instrumentation", "action", "instrumentationAction"], "Define and instrument the missing measure."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span></div>${briefCardActions(entry, `brief-metric-${index}`, entry.gapAction?.field || "experiment", entry.gapAction?.label || "Add measurement")}</article>`; }
 function briefThemeCard(entry, index) { return `<article class="brief-card"><div class="brief-card-heading"><span class="brief-label neutral">#${briefValue(entry, ["rank"], index + 1)} | ${briefValue(entry, ["signalCount", "count"], 0)} signals</span></div><h4>${escapeHtml(briefValue(entry, ["theme", "title"], "Customer theme"))}</h4><p><b>${executiveBriefLabels.supportingInitiatives}</b>${escapeHtml(briefList(briefValue(entry, ["initiatives", "supportingInitiatives"], [])) || "No initiatives listed")}</p><p><b>${executiveBriefLabels.supportingSegments}</b>${escapeHtml(briefList(briefValue(entry, ["segments", "supportingSegments"], [])) || "Unspecified segment")}</p>${briefThemeActions(entry, index)}</article>`; }
-function briefAskCard(entry, index) { const type = briefValue(entry, ["type"], "Leadership ask"); const action = type === "Risk" ? ["risk", "Update risk"] : type === "Decision" ? ["decision", "Record decision"] : ["experiment", "Add measurement"]; return `<article class="brief-card" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label neutral">#${index + 1} | ${escapeHtml(type)}</span></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.requestedAction}</b>${escapeHtml(briefValue(entry, ["action"], "Confirm the requested action."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span><span><b>${executiveBriefLabels.neededBy}</b>${escapeHtml(briefValue(entry, ["dueDate"], "No date"))}</span></div>${briefCardActions(entry, `brief-ask-${index}`, action[0], action[1])}</article>`; }
+function briefAskCard(entry, index) { const type = briefValue(entry, ["type"], "Leadership ask"); const action = type === "Risk" ? ["risk", "Update risk"] : type === "Decision" ? ["decision", "Record decision"] : [entry.gapAction?.field || "experiment", entry.gapAction?.label || "Add measurement"]; return `<article class="brief-card" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label neutral">#${index + 1} | ${escapeHtml(type)}</span></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.requestedAction}</b>${escapeHtml(briefValue(entry, ["action"], "Confirm the requested action."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span><span><b>${executiveBriefLabels.neededBy}</b>${escapeHtml(briefValue(entry, ["dueDate"], "No date"))}</span></div>${briefCardActions(entry, `brief-ask-${index}`, action[0], action[1])}</article>`; }
 function briefValue(entry, keys, fallback) { for (const key of keys) { if (entry?.[key] !== undefined && entry[key] !== null && entry[key] !== "") return entry[key]; } return fallback; }
 function briefTitle(entry) { return briefValue(entry, ["title"], entry?.item?.title || "Untitled initiative"); }
 function briefStatus(status) { return statusLabels[status] || status; }
@@ -3248,7 +3294,7 @@ function bindEvents() {
     button.addEventListener("click", () => selectOrganizationUnit(button.dataset.selectUnit));
     button.addEventListener("keydown", handleOrganizationTreeKeydown);
   });
-  document.querySelectorAll("[data-select-person]").forEach((button) => button.addEventListener("click", () => { state.selectedPersonId = button.dataset.selectPerson; renderAndFocus("viewTitle"); }));
+  document.querySelectorAll("[data-select-person]").forEach((button) => button.addEventListener("click", () => { state.selectedPersonId = button.dataset.selectPerson; pushViewUrl(true); renderAndFocus("viewTitle"); }));
   document.querySelector("#addPersonForm")?.addEventListener("submit", addOrganizationPerson);
   document.querySelector("#editPersonForm")?.addEventListener("submit", editOrganizationPerson);
   document.querySelector("#removePersonButton")?.addEventListener("click", removeOrganizationPerson);
@@ -3257,12 +3303,21 @@ function bindEvents() {
   document.querySelector("#removeUnitButton")?.addEventListener("click", removeOrganizationUnit);
   document.querySelector("#newInitiativeButton")?.addEventListener("click", (event) => openInitiativeEditor("new", event.currentTarget));
   document.querySelector("#checklistCreateInitiative")?.addEventListener("click", (event) => openInitiativeEditor("new", event.currentTarget));
+  document.querySelector("#startProjectImport")?.addEventListener("click", () => {
+    navigateToView("settings", "context", "data");
+    document.querySelector("#importButton")?.focus();
+  });
+  document.querySelector("#startProjectWorkflows")?.addEventListener("click", () => {
+    navigateToView("settings", "context", "setup");
+    document.querySelector("#workspaceSetupTitle")?.setAttribute("tabindex", "-1");
+    document.querySelector("#workspaceSetupTitle")?.focus();
+  });
   document.querySelector("#checklistCopyUpdate")?.addEventListener("click", (event) => copyDraft(event.currentTarget, "weeklyUpdateDraft"));
   document.querySelector("#editInitiativeButton")?.addEventListener("click", (event) => openInitiativeEditor("edit", event.currentTarget));
   document.querySelectorAll("[data-new-insight]").forEach((button) => button.addEventListener("click", (event) => openInsightEditor("new", event.currentTarget, "", event.currentTarget.dataset.newInsight)));
   document.querySelectorAll("[data-view-insight]").forEach((button) => button.addEventListener("click", (event) => openInsightEditor("view", event.currentTarget, event.currentTarget.dataset.viewInsight)));
   document.querySelectorAll("[data-edit-insight]").forEach((button) => button.addEventListener("click", (event) => openInsightEditor("edit", event.currentTarget, event.currentTarget.dataset.editInsight)));
-  document.querySelector("#insightStatusFilter")?.addEventListener("change", (event) => { state.insightStatusFilter = event.currentTarget.value; render(); document.querySelector("#insightStatusFilter")?.focus(); });
+  document.querySelector("#insightStatusFilter")?.addEventListener("change", (event) => { state.insightStatusFilter = event.currentTarget.value; pushViewUrl(true); render(); document.querySelector("#insightStatusFilter")?.focus(); });
   document.querySelector("#insightEditorForm")?.addEventListener("submit", saveInsightEditor);
   document.querySelector("#insightEditorForm")?.addEventListener("input", captureInsightEditorDraft);
   document.querySelector("#backToInsightButton")?.addEventListener("click", backToInsightRecord);
@@ -3319,7 +3374,7 @@ function bindEvents() {
   document.querySelector("#initiativeEditorDialog")?.addEventListener("close", finishInitiativeEditorClose);
   document.querySelectorAll("[data-template]").forEach((button) => button.addEventListener("click", () => { state.selectedTemplate = button.dataset.template; render(); }));
   document.querySelectorAll("[data-meeting]").forEach((button) => button.addEventListener("click", () => { state.selectedMeeting = button.dataset.meeting; render(); }));
-  document.querySelectorAll("[data-spec]").forEach((button) => button.addEventListener("click", () => { state.selectedSpecId = button.dataset.spec; render(); }));
+  document.querySelectorAll("[data-spec]").forEach((button) => button.addEventListener("click", () => { state.selectedSpecId = button.dataset.spec; pushViewUrl(true); render(); }));
   document.querySelector("#searchInput")?.addEventListener("input", updateSearch);
   document.querySelector("#exportButton")?.addEventListener("click", () => exportWorkspaceData("json"));
   document.querySelector("#exportCsvButton")?.addEventListener("click", () => exportWorkspaceData("csv"));
@@ -3440,8 +3495,10 @@ function bindProjectSwitcherEvents() {
   document.querySelector("#projectSwitcherButton")?.addEventListener("click", openProjectSwitcher);
   document.querySelector("#mobileProjectSwitcherButton")?.addEventListener("click", openProjectSwitcher);
   document.querySelector("#closeProjectSwitcherButton")?.addEventListener("click", closeProjectSwitcher);
+  document.querySelector("#restoreLinkedProjectButton")?.addEventListener("click", restoreLinkedProject);
   document.querySelector("#projectSwitcherSearch")?.addEventListener("input", updateProjectSearch);
   document.querySelectorAll("[data-switch-project]").forEach((button) => button.addEventListener("click", switchToLocalProject));
+  document.querySelectorAll("[data-switch-server-project]").forEach((button) => button.addEventListener("click", switchToServerProject));
   document.querySelectorAll("[data-switch-team-project]").forEach((button) => button.addEventListener("click", switchToTeamProject));
   document.querySelector("#newProjectButton")?.addEventListener("click", openProjectWizard);
   document.querySelector("#manageProjectsButton")?.addEventListener("click", () => showProjectSurface("manage", "backToProjectSwitcherButton"));
@@ -3453,6 +3510,18 @@ function bindProjectSwitcherEvents() {
     ui.wizard.error = "";
   });
   document.querySelectorAll('[name="provider"]').forEach((control) => control.addEventListener("change", updateProjectWizardChoice));
+  document.querySelectorAll('[name="serverAction"]').forEach((control) => control.addEventListener("change", updateProjectWizardChoice));
+  document.querySelectorAll('[name="sourceAction"]').forEach((control) => control.addEventListener("change", updateProjectWizardChoice));
+  for (const id of ["projectDriveClientId", "projectDriveFileLink", "projectDriveFolderName"]) {
+    document.querySelector(`#${id}`)?.addEventListener("input", captureServerWizardFields);
+  }
+  for (const id of ["serverConnectorChoice", "serverConnectorMode", "serverConnectorLabel", "serverConnectorUrl", "serverConnectorKey", "serverPersistSession", "serverWorkspaceChoice"]) {
+    document.querySelector(`#${id}`)?.addEventListener("change", () => {
+      captureServerWizardFields();
+      if (id === "serverConnectorChoice" || id === "serverConnectorMode") renderAndFocus(id);
+    });
+    document.querySelector(`#${id}`)?.addEventListener("input", captureServerWizardFields);
+  }
   document.querySelector("#projectWizardBackButton")?.addEventListener("click", stepBackProjectWizard);
   document.querySelector("#openTeamProjectSetupButton")?.addEventListener("click", openTeamProjectSetup);
   document.querySelectorAll("[data-rename-project]").forEach((button) => button.addEventListener("click", openRenameProject));
@@ -3463,10 +3532,15 @@ function bindProjectSwitcherEvents() {
   document.querySelector("#cancelProjectArchiveButton")?.addEventListener("click", cancelProjectArchive);
   document.querySelector("#confirmProjectArchiveButton")?.addEventListener("click", confirmProjectArchive);
   document.querySelectorAll("[data-forget-project]").forEach((button) => button.addEventListener("click", openForgetProject));
+  document.querySelectorAll("[data-delete-drive-project]").forEach((button) => button.addEventListener("click", openForgetProject));
   document.querySelector("#forgetProjectName")?.addEventListener("input", updateForgetProjectName);
   document.querySelector("#downloadProjectBackupButton")?.addEventListener("click", downloadProjectBackup);
   document.querySelector("#cancelForgetProjectButton")?.addEventListener("click", () => showProjectSurface("manage", "backToProjectSwitcherButton"));
   document.querySelector("#forgetProjectForm")?.addEventListener("submit", confirmForgetProject);
+  document.querySelector("#serverProjectAuthForm")?.addEventListener("submit", submitServerProjectAuth);
+  document.querySelector("#cancelServerProjectAuthButton")?.addEventListener("click", cancelServerProjectAuth);
+  document.querySelectorAll("[data-signout-connector]").forEach((button) => button.addEventListener("click", signOutServerConnector));
+  document.querySelectorAll("[data-remove-connector]").forEach((button) => button.addEventListener("click", removeServerConnectorFromUi));
 
   const dialog = document.querySelector("#projectSwitcherDialog, #projectArchiveDialog");
   dialog?.addEventListener("cancel", (event) => {
@@ -3480,8 +3554,10 @@ function bindProjectSwitcherEvents() {
     dialog.showModal();
     const selector = ui.surface === "switcher" ? "#projectSwitcherSearch"
       : ui.surface === "wizard" ? ui.wizard.step === 1 ? "#projectName" : '[name="provider"]:checked'
+        : ui.surface === "archived-link" ? "#closeProjectSwitcherButton"
+        : ui.surface === "server-auth" ? "#serverProjectEmail"
         : ui.surface === "rename" ? "#renameProjectName"
-          : ui.surface === "delete" ? "#downloadProjectBackupButton"
+          : ui.surface === "delete" ? ui.backupDownloaded ? "#forgetProjectName" : "#downloadProjectBackupButton"
             : ui.surface === "confirm-archive" ? "#projectArchiveTitle" : "#backToProjectSwitcherButton";
     document.querySelector(selector)?.focus();
   });
@@ -3499,17 +3575,25 @@ function openProjectSwitcher(event) {
 
 function closeProjectSwitcher() {
   const ui = state.projects;
-  if (!ui) return;
+  if (!ui || ui.busy) return;
+  ui.driveDeleteToken = "";
+  ui.driveDeleteTicket = null;
   const focusId = ui.returnFocusId || "projectSwitcherButton";
   ui.surface = "closed";
   ui.error = "";
   ui.pendingProjectId = "";
+  ui.archivedLinkId = "";
+  ui.archivedLinkSearch = "";
   render();
   document.querySelector(`#${cssEscape(focusId)}`)?.focus();
 }
 
 function showProjectSurface(surface, focusId = "") {
-  if (!state.projects) return;
+  if (!state.projects || state.projects.busy) return;
+  if (surface !== "delete") {
+    state.projects.driveDeleteToken = "";
+    state.projects.driveDeleteTicket = null;
+  }
   state.projects.surface = surface;
   state.projects.error = "";
   render();
@@ -3531,14 +3615,115 @@ async function switchToLocalProject(event) {
   await stageLocalProjectSwitch(event.currentTarget.dataset.switchProject, { trigger: event.currentTarget });
 }
 
+async function chooseProjectDeparture({ title, description, confirmLabel, secondaryLabel }) {
+  const ui = state.projects;
+  ui.surface = "closed";
+  render();
+  // Editor dialogs open in render's microtask; the decision must be the top modal.
+  await Promise.resolve();
+  let secondary = false;
+  const confirmed = await requestDataConfirmation({
+    title, description, confirmLabel, secondaryLabel,
+    trigger: document.querySelector(`#${cssEscape(ui.returnFocusId || "projectSwitcherButton")}`),
+    onSecondary: () => {
+      secondary = true;
+      document.querySelector("#confirmationDialog")?.close("secondary");
+    }
+  });
+  return confirmed ? "confirm" : secondary ? "secondary" : "cancel";
+}
+
+function showProjectSyncReview() {
+  state.projects.surface = "closed";
+  state.selectedView = "settings";
+  state.selectedMode = "data";
+  state.spaceModes.settings = "data";
+  pushViewUrl(true);
+  render();
+  document.querySelector(state.source.type === "local-file" ? ".linked-file-conflicts button, #syncStatus" : "#syncStatus")?.focus();
+}
+
+async function approveProjectDeparture({ replaceUrl = false } = {}) {
+  const ui = state.projects;
+  if (ui.departurePending) return false;
+  if (state.dataBusy || state.team.mutationBusy) {
+    ui.error = "Wait for the current save or sync to finish before switching projects.";
+    ui.surface = "switcher";
+    if (replaceUrl) pushViewUrl(true);
+    render();
+    return false;
+  }
+  const source = state.source;
+  const workspace = state.team.workspace;
+  const projectId = ui.registry.activeProjectId;
+  const stillCurrent = () => state.source === source && state.team.workspace === workspace && ui.registry.activeProjectId === projectId;
+  const cancel = () => {
+    ui.surface = state.initiativeEditor.mode || state.insightEditor.mode ? "closed" : "switcher";
+    if (replaceUrl) pushViewUrl(true);
+    render();
+    return false;
+  };
+  ui.departurePending = true;
+  try {
+    if (state.initiativeEditor.mode || (state.insightEditor.mode && state.insightEditor.mode !== "view")) {
+      const choice = await chooseProjectDeparture({
+        title: "Save your draft before switching?", description: "Save this draft in the current project, discard it, or cancel to keep editing.",
+        confirmLabel: "Save and switch", secondaryLabel: "Discard and switch"
+      });
+      if (!stillCurrent() || choice === "cancel") return cancel();
+      if (choice === "confirm") {
+        const initiative = Boolean(state.initiativeEditor.mode);
+        const form = document.querySelector(initiative ? "#initiativeEditorForm" : "#insightEditorForm");
+        if (!form) return cancel();
+        await (initiative ? saveInitiativeEditor : saveInsightEditor)({ preventDefault() {}, currentTarget: form });
+        if (!stillCurrent() || state.initiativeEditor.mode || state.insightEditor.mode) return cancel();
+      } else {
+        state.pendingInsightPromotionId = "";
+        state.initiativeEditor = createInitiativeEditorState();
+        state.insightEditor = createInsightEditorState();
+      }
+    }
+    if (state.team.active && state.team.conflict) {
+      const choice = await chooseProjectDeparture({
+        title: "Review your unsaved team draft?", description: "The server version changed. Review your draft or discard it before leaving this project.",
+        confirmLabel: "Discard draft and switch", secondaryLabel: "Review conflict"
+      });
+      if (!stillCurrent() || choice === "cancel") return cancel();
+      if (choice === "secondary") { reviewTeamConflict(); pushViewUrl(true); return false; }
+      discardTeamDraft();
+    }
+    if (!state.team.active && (state.sync.localPending || state.sync.fileConflicts.length || state.driveReview || state.sync.conflict)) {
+      const conflict = Boolean(state.sync.fileConflicts.length || state.driveReview || state.sync.conflict);
+      const choice = await chooseProjectDeparture({
+        title: conflict ? "Switch with unresolved conflicts?" : "Switch with unsynced changes?",
+        description: conflict ? "Resolve the conflict now, or keep it in this project's browser copy and return later. Neither external copy will be overwritten." : "Sync before leaving, or keep changes saved in this project's browser copy and return to sync later.",
+        confirmLabel: conflict ? "Keep conflict and switch" : "Keep changes and switch",
+        secondaryLabel: conflict ? "Resolve now" : "Sync and switch"
+      });
+      if (!stillCurrent() || choice === "cancel") return cancel();
+      if (choice === "secondary") {
+        if (conflict) { showProjectSyncReview(); return false; }
+        if (state.source.type === "google-drive") await syncDriveNow();
+        else if (state.source.type === "local-file") {
+          // Inspect remote changes before writing so switching cannot overwrite a concurrent edit.
+          const inspected = await inspectLinkedWorkspaceOnFocus({ forSwitch: true });
+          if (inspected && stillCurrent() && !state.sync.fileConflicts.length && state.sync.localPending) await saveLinkedWorkspaceNow();
+        }
+        if (!stillCurrent()) return cancel();
+        if (state.sync.localPending || state.sync.fileConflicts.length || state.driveReview || state.sync.conflict) {
+          showProjectSyncReview();
+          return false;
+        }
+      }
+    }
+    return stillCurrent();
+  } finally { ui.departurePending = false; }
+}
+
 async function stageLocalProjectSwitch(projectId, { trigger = null, replaceUrl = false, prefix = "Opened" } = {}) {
   const ui = state.projects;
   const target = registryProjectById(ui?.registry, projectId);
-  if (!ui || !target || target.archivedAt || ui.busy) return false;
-  if (state.initiativeEditor.mode || state.insightEditor.mode) {
-    if (replaceUrl) pushViewUrl(true);
-    return false;
-  }
+  if (!ui || !target || target.provider === "server" || target.archivedAt || ui.busy) return false;
   if (state.dataBusy || state.team.mutationBusy) {
     ui.error = "Wait for the current save or sync to finish before switching projects.";
     ui.surface = "switcher";
@@ -3550,22 +3735,7 @@ async function stageLocalProjectSwitch(projectId, { trigger = null, replaceUrl =
     closeProjectSwitcher();
     return true;
   }
-  if (!state.team.active && (state.sync.localPending || state.sync.fileConflicts.length || state.driveReview)) {
-    ui.surface = "closed";
-    render();
-    const confirmed = await requestDataConfirmation({
-      title: "Switch with unsynced changes?",
-      description: "Your changes and any conflicts will stay saved in this project's browser copy. They have not all reached its external source. You can return here to finish syncing.",
-      confirmLabel: "Keep changes and switch",
-      trigger: document.querySelector(`#${cssEscape(ui.returnFocusId || "projectSwitcherButton")}`)
-    });
-    if (!confirmed) {
-      ui.surface = "switcher";
-      if (replaceUrl) pushViewUrl(true);
-      render();
-      return false;
-    }
-  }
+  if (!await approveProjectDeparture({ replaceUrl })) return false;
   let prepared;
   ui.busy = true;
   render();
@@ -3610,9 +3780,9 @@ async function stageLocalProjectSwitch(projectId, { trigger = null, replaceUrl =
         localStorage.setItem(prepared.keys.sync, serializeSync(prepared.sync));
         prepared.recovery = loadWorkspaceSnapshots(localStorage, prepared.keys.backups);
       }
-      return activateProjectRegistryEntry(localStorage, ui.registry, target.id, { space: state.selectedView, mode: state.selectedMode });
+      return activateProjectRegistryEntry(localStorage, ui.registry, target.id, captureRegisteredProjectLocation());
     });
-    if (state.team.active) await closeTeamWorkspace("Closed the Team project. Its data was not copied.");
+    if (state.team.active) await closeTeamWorkspace("Closed the Team project. Its data was not copied.", { forProjectSwitch: true });
     ui.registry = projectRegistry;
     applyPreparedLocalProject(prepared, target);
     ui.pendingProjectId = "";
@@ -3634,6 +3804,73 @@ async function stageLocalProjectSwitch(projectId, { trigger = null, replaceUrl =
     if (replaceUrl) pushViewUrl(true);
     render();
     document.querySelector(`[data-switch-project="${cssEscape(target.id)}"]`)?.focus();
+    return false;
+  }
+}
+
+async function switchToServerProject(event) {
+  await stageServerProjectSwitch(event.currentTarget.dataset.switchServerProject, { trigger: event.currentTarget });
+}
+
+async function stageServerProjectSwitch(projectId, { trigger = null, replaceUrl = false } = {}) {
+  const ui = state.projects;
+  const project = registryProjectById(ui?.registry, projectId);
+  if (!ui || !project || project.provider !== "server" || project.archivedAt || ui.busy) return false;
+  if (state.team.active && state.team.projectId === project.id) { closeProjectSwitcher(); return true; }
+  if (!await approveProjectDeparture({ replaceUrl })) return false;
+  const connector = serverConnectorPool?.connector(project.connectorId);
+  if (!connector) {
+    markConnectorProjects(project.connectorId, "sign-in-required");
+    ui.error = "This project's server connection is not available on this device.";
+    ui.surface = "switcher";
+    if (replaceUrl) pushViewUrl(true);
+    render();
+    return false;
+  }
+  ui.busy = true;
+  ui.pendingProjectId = project.id;
+  ui.error = "";
+  ui.status = `Checking ${project.name}…`;
+  render();
+  try {
+    const client = serverConnectorPool.clientFor(connector.id);
+    const config = serverConnectorClientConfig(connector);
+    const capabilities = await client.checkCapabilities(config);
+    const auth = await client.getAuthState();
+    if (auth?.status !== "authenticated" || !auth.user) {
+      markConnectorProjects(connector.id, "sign-in-required");
+      ui.busy = false;
+      ui.pendingProjectId = "";
+      ui.serverGate = {
+        intent: "switch", projectId: project.id, projectName: project.name, connectorId: connector.id,
+        connectorLabel: connector.label, authMode: connector.authMode, allowLocalAccount: connector.mode === "personal-local", codeSent: false, email: ""
+      };
+      ui.surface = "server-auth";
+      ui.status = "";
+      if (replaceUrl) pushViewUrl(true);
+      render();
+      return false;
+    }
+    const listed = await client.teamService.listWorkspaces();
+    const workspaces = collectionFrom(listed, "workspaces").map(normalizeTeamWorkspace);
+    const workspace = workspaces.find((entry) => entry.id === project.workspaceId);
+    if (!workspace) throw new Error("Your account is not authorized for this workspace.");
+    const opened = await openTeamWorkspaceById(workspace.id, trigger, {
+      skipConfirmation: true, departureChecked: true, client, connector, capabilities, workspace, serverProject: project, replaceUrl
+    });
+    ui.busy = false;
+    ui.pendingProjectId = "";
+    if (!opened) throw new Error(state.team.status || "The server project could not be opened.");
+    render();
+    return true;
+  } catch (error) {
+    ui.busy = false;
+    ui.pendingProjectId = "";
+    ui.error = safeTeamError(error, error?.message || "The server project could not be opened.");
+    ui.surface = "switcher";
+    ui.status = "";
+    if (replaceUrl) pushViewUrl(true);
+    render();
     return false;
   }
 }
@@ -3694,9 +3931,7 @@ function applyPreparedLocalProject(prepared, target) {
   state.linkedFile = prepared.linkedFile;
   state.driveToken = "";
   state.driveReview = null;
-  state.selectedView = target.location.space;
-  state.selectedMode = target.location.mode || defaultSpaceMode(target.location.space);
-  state.spaceModes[state.selectedView] = state.selectedMode;
+  restoreProjectLocation(target.location);
   state.syncStatus = target.provider === "google-drive"
     ? "Reconnect Google Drive for this session; the cached project is open."
     : target.provider === "local-file" ? `Linked ${prepared.linkedFile.name}.` : "Browser storage is active.";
@@ -3716,16 +3951,38 @@ function openProjectWizard() {
   const ui = state.projects;
   if (!ui?.persistent) return;
   ui.surface = "wizard";
-  ui.wizard = { step: 1, name: "", provider: "browser", error: "" };
+  const drive = normalizeDriveRuntimeConfig(globalThis.PM_OS_DRIVE_CONFIG);
+  ui.wizard = newProjectWizardState({
+    driveClientId: drive?.clientId || (state.source.type === "google-drive" ? state.source.clientId : ""),
+    drivePickerAvailable: Boolean(drive?.pickerApiKey && drive?.appId)
+  });
   render();
 }
 
 function updateProjectWizardChoice(event) {
   const ui = state.projects;
   if (!ui) return;
+  captureServerWizardFields();
   ui.wizard[event.currentTarget.name] = event.currentTarget.value;
   render();
   document.querySelector(`[name="${cssEscape(event.currentTarget.name)}"][value="${cssEscape(event.currentTarget.value)}"]`)?.focus();
+}
+
+function captureServerWizardFields() {
+  const wizard = state.projects?.wizard;
+  if (!wizard) return;
+  const value = (id, fallback = "") => document.querySelector(`#${id}`)?.value ?? fallback;
+  wizard.connectorId = value("serverConnectorChoice", wizard.connectorId);
+  wizard.connectorMode = value("serverConnectorMode", wizard.connectorMode);
+  wizard.connectorLabel = value("serverConnectorLabel", wizard.connectorLabel);
+  wizard.connectorUrl = value("serverConnectorUrl", wizard.connectorUrl);
+  wizard.connectorKey = value("serverConnectorKey", wizard.connectorKey);
+  wizard.serverWorkspaceId = value("serverWorkspaceChoice", wizard.serverWorkspaceId);
+  const persist = document.querySelector("#serverPersistSession");
+  if (persist) wizard.persistSession = persist.checked;
+  wizard.driveClientId = value("projectDriveClientId", wizard.driveClientId);
+  wizard.driveFileLink = value("projectDriveFileLink", wizard.driveFileLink);
+  wizard.driveFolderName = value("projectDriveFolderName", wizard.driveFolderName);
 }
 
 async function advanceProjectWizard(event) {
@@ -3751,7 +4008,7 @@ async function advanceProjectWizard(event) {
 
 function stepBackProjectWizard() {
   const ui = state.projects;
-  if (!ui) return;
+  if (!ui || ui.busy) return;
   if (ui.wizard.step === 1) ui.surface = "switcher";
   else ui.wizard.step -= 1;
   ui.wizard.error = "";
@@ -3761,48 +4018,303 @@ function stepBackProjectWizard() {
 async function createProductionProject() {
   const ui = state.projects;
   const wizard = ui.wizard;
+  captureServerWizardFields();
+  if (wizard.provider === "server") {
+    await createServerProjectFromWizard();
+    return;
+  }
   const projectId = `project-${globalThis.crypto?.randomUUID?.().toLowerCase() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`}`.slice(0, 80);
-  const document = createEmptyWorkspaceDocument();
-  const workspaceRaw = encodeWorkspaceDocument(document);
-  const source = sourceForProjectProvider(wizard.provider);
-  const bundle = {
-    workspace: workspaceRaw,
-    activity: JSON.stringify({ activity: [] }),
-    source: JSON.stringify(normalizeWorkspaceSource(source)),
-    sync: serializeSync(defaultSyncState()),
-    backups: JSON.stringify([])
-  };
+  let workspaceDocument = createEmptyWorkspaceDocument();
+  let workspaceRaw = encodeWorkspaceDocument(workspaceDocument);
+  let source = sourceForProjectProvider(wizard.provider);
+  let sync = defaultSyncState();
   let handle = null;
+  let driveToken = "";
+  let externalReady = false;
+  let registered = false;
   ui.busy = true;
-  ui.wizard.error = "";
+  wizard.error = "";
   render();
   try {
+    if (!wizard.name.trim() || wizard.name.length > 160) throw new Error("Enter a project name between 1 and 160 characters.");
     if (wizard.provider === "local-file") {
-      handle = await createLinkedWorkspaceFile(globalThis, `${safeFileName(wizard.name)}.json`);
-      await writeLinkedWorkspaceFile(handle, workspaceRaw);
-      await storeLinkedFileHandle(projectId, handle);
+      handle = wizard.sourceAction === "existing"
+        ? await openLinkedWorkspaceFile(globalThis, { storeHandle: false })
+        : await createLinkedWorkspaceFile(globalThis, `${safeFileName(wizard.name)}.json`, { storeHandle: false });
+      if (wizard.sourceAction === "existing") {
+        let permission = await queryLinkedFilePermission(handle);
+        if (permission === "prompt") permission = await requestLinkedFilePermission(handle);
+        if (permission !== "granted") throw new Error("Allow access to the selected file before opening this project.");
+      } else await writeLinkedWorkspaceFile(handle, workspaceRaw);
       const file = await readLinkedWorkspaceFile(handle);
-      bundle.source = JSON.stringify(normalizeWorkspaceSource({ type: "local-file", fileName: file.name }));
+      workspaceDocument = decodeWorkspaceDocument(JSON.parse(file.text));
+      workspaceRaw = encodeWorkspaceDocument(workspaceDocument);
+      source = { ...source, type: "local-file", fileName: file.name };
+      sync = { ...sync, fileLastModified: file.lastModified, fileBaselineDocument: mergeReadyDocument(JSON.parse(workspaceRaw)) };
+      externalReady = true;
+      await storeLinkedFileHandle(projectId, handle);
+    } else if (wizard.provider === "google-drive") {
+      const clientId = wizard.driveClientId.trim();
+      if (!clientId) throw new Error("Configure the Google client ID in connection settings before connecting this project.");
+      const fileId = wizard.sourceAction === "existing" && wizard.driveFileLink.trim() ? driveWorkspaceFileId(wizard.driveFileLink) : "";
+      const runtime = normalizeDriveRuntimeConfig(globalThis.PM_OS_DRIVE_CONFIG);
+      if (wizard.sourceAction === "existing" && !fileId && !wizard.drivePickerAvailable) throw new Error("Paste the Drive workspace file link before continuing.");
+      if (wizard.sourceAction === "create" && !wizard.driveFolderName.trim()) throw new Error("Enter the Drive folder for the new workspace file.");
+      driveToken = await requestDriveAccessToken(clientId);
+      source = { ...source, type: "google-drive", clientId, folderName: wizard.driveFolderName.trim(), fileName: `${safeFileName(wizard.name)}.json`, fileId };
+      if (wizard.sourceAction === "existing" && !fileId) {
+        const selected = await chooseDriveWorkspaceFile({ ...runtime, clientId }, driveToken);
+        if (!selected) throw new DOMException("File selection cancelled.", "AbortError");
+        source.fileId = selected.id;
+        source.fileName = selected.name;
+      } else if (wizard.sourceAction === "create") {
+        const saved = await saveDriveWorkspace(source, driveToken, workspaceRaw);
+        source.fileId = saved.id;
+        wizard.driveFileLink = saved.id;
+        externalReady = true;
+      }
+      const remote = await readDriveWorkspace(source, driveToken);
+      if (!remote?.file?.id) throw new Error("The selected Drive workspace file was not returned.");
+      workspaceDocument = decodeWorkspaceDocument(JSON.parse(remote.content));
+      workspaceRaw = encodeWorkspaceDocument(workspaceDocument);
+      source = { ...source, fileId: remote.file.id, fileName: remote.file.name || source.fileName };
+      wizard.driveFileLink = source.fileId;
+      sync = { ...advanceDriveBaseline(sync, remote.file, "pull"), baseDocument: mergeReadyDocument(JSON.parse(workspaceRaw)) };
+      externalReady = true;
     }
+    const bundle = {
+      workspace: workspaceRaw,
+      activity: JSON.stringify({ activity: workspaceDocument.activity || [] }),
+      source: JSON.stringify(normalizeWorkspaceSource(source)),
+      sync: serializeSync(sync),
+      backups: JSON.stringify([])
+    };
     const created = createRegistryProject(localStorage, ui.registry, {
-      id: projectId,
-      name: wizard.name,
-      provider: wizard.provider,
+      id: projectId, name: wizard.name, provider: wizard.provider,
       location: { space: "today", mode: "focus" }
     }, bundle);
+    registered = true;
     projectRegistry = created.registry;
     ui.registry = created.registry;
     ui.busy = false;
     ui.surface = "switcher";
-    await stageLocalProjectSwitch(created.project.id, { prefix: "Created and opened" });
+    const opened = await stageLocalProjectSwitch(created.project.id, { prefix: "Created and opened" });
+    if (opened && wizard.provider === "google-drive" && ui.registry.activeProjectId === created.project.id) {
+      state.driveToken = driveToken;
+      state.syncStatus = "Connected to Google Drive for this session. The workspace file is ready.";
+      render();
+    }
   } catch (error) {
-    if (handle) await clearLinkedFileHandle(projectId).catch(() => undefined);
+    if (handle && !registered) await clearLinkedFileHandle(projectId).catch(() => undefined);
     ui.busy = false;
     ui.surface = "wizard";
-    ui.wizard.error = error?.name === "AbortError" ? "File creation was cancelled. Nothing was added." : error?.message || "The project could not be created.";
+    if (!registered && externalReady) {
+      wizard.sourceAction = "existing";
+      wizard.error = `The source file is ready, but the project could not be added. Open that existing file to retry. ${error?.message || ""}`;
+    } else if (wizard.provider === "google-drive" && wizard.sourceAction === "create" && error?.code === "DRIVE_CONFLICT" && error.remote?.id) {
+      wizard.driveFileLink = error.remote.id;
+      wizard.error = "A workspace file with this name already exists. Choose Open existing file to use it, or change the project name. Its contents were not changed.";
+    } else wizard.error = error?.name === "AbortError" ? "File selection was cancelled. No project was added." : error?.message || "The project could not be created.";
     render();
     document.querySelector("#projectWizardContinueButton")?.focus();
   }
+}
+
+async function createServerProjectFromWizard() {
+  const ui = state.projects;
+  const wizard = ui.wizard;
+  ui.busy = true;
+  ui.wizard.error = "";
+  render();
+  try {
+    let connector = wizard.connectorId ? serverConnectorPool.connector(wizard.connectorId) : null;
+    if (!connector) {
+      connector = serverConnectorPool.register({
+        id: `server-${globalThis.crypto?.randomUUID?.().toLowerCase() || Date.now().toString(36)}`.slice(0, 80),
+        label: wizard.connectorLabel, mode: wizard.connectorMode, url: wizard.connectorUrl,
+        publishableKey: wizard.connectorKey, persistSession: wizard.persistSession,
+        authMode: wizard.connectorMode === "remote" ? "otp" : "password", allowWorkspaceCreation: true
+      });
+      wizard.connectorId = connector.id;
+      ui.connectors = serverConnectorPool.registry.connectors;
+    }
+    const client = serverConnectorPool.clientFor(connector.id);
+    const capabilities = await client.checkCapabilities(serverConnectorClientConfig(connector));
+    const auth = await client.getAuthState();
+    if (auth?.status !== "authenticated" || !auth.user) {
+      ui.busy = false;
+      ui.serverGate = {
+        intent: "create", projectName: wizard.name, connectorId: connector.id, connectorLabel: connector.label,
+        authMode: connector.authMode, allowLocalAccount: connector.mode === "personal-local", codeSent: false, email: ""
+      };
+      ui.surface = "server-auth";
+      render();
+      return;
+    }
+    const listed = collectionFrom(await client.teamService.listWorkspaces(), "workspaces").map(normalizeTeamWorkspace);
+    let workspace;
+    if (wizard.serverAction === "existing") {
+      wizard.serverWorkspaces = listed;
+      workspace = listed.find((entry) => entry.id === wizard.serverWorkspaceId);
+      if (!workspace) {
+        ui.busy = false;
+        ui.surface = "wizard";
+        wizard.error = listed.length ? "Choose a workspace to continue." : "No authorized workspaces are available on this connection.";
+        render();
+        return;
+      }
+    } else {
+      if (capabilities?.workspaceLifecycle !== true || capabilities?.allowWorkspaceCreation === false || connector.allowWorkspaceCreation === false) {
+        throw new Error("This server does not allow workspace creation.");
+      }
+      if (!wizard.createAttemptId) wizard.createAttemptId = teamCreateAttemptId("project");
+      try {
+        const result = await client.teamService.createWorkspace({
+          name: wizard.name, templateId: "focused", createAttemptId: wizard.createAttemptId
+        });
+        const response = result?.workspace || result;
+        workspace = normalizeTeamWorkspace({
+          ...response,
+          id: response?.id || response?.workspaceId || response?.workspace_id,
+          name: response?.name || wizard.name,
+          role: response?.role || "owner",
+          revision: response?.revision
+        });
+        if (!workspace.id) {
+          const refreshed = collectionFrom(await client.teamService.listWorkspaces(), "workspaces").map(normalizeTeamWorkspace);
+          workspace = refreshed.find((entry) => entry.name === wizard.name);
+        }
+        wizard.createAttemptId = "";
+      } catch (error) {
+        if (!isAmbiguousTeamError(error)) wizard.createAttemptId = "";
+        throw error;
+      }
+    }
+    if (!workspace?.id) throw new Error("The server workspace was not returned.");
+    const projectId = `project-${globalThis.crypto?.randomUUID?.().toLowerCase() || Date.now().toString(36)}`.slice(0, 80);
+    const created = createRegistryProject(localStorage, ui.registry, {
+      id: projectId, name: workspace.name || wizard.name, provider: "server",
+      connectorId: connector.id, workspaceId: workspace.id, serverRole: workspace.role || "viewer",
+      serverRevision: workspace.revision || 0, serverStatus: "available", location: { space: "today", mode: "focus" }
+    }, {});
+    projectRegistry = created.registry;
+    ui.registry = created.registry;
+    ui.busy = false;
+    ui.surface = "switcher";
+    await stageServerProjectSwitch(created.project.id);
+  } catch (error) {
+    ui.busy = false;
+    ui.surface = "wizard";
+    wizard.error = safeTeamError(error, error?.message || "The server project could not be created.");
+    render();
+  }
+}
+
+async function submitServerProjectAuth(event) {
+  event.preventDefault();
+  const ui = state.projects;
+  const gate = ui?.serverGate;
+  const connector = gate && serverConnectorPool?.connector(gate.connectorId);
+  if (!ui || !gate || !connector || ui.busy) return;
+  const form = new FormData(event.currentTarget);
+  const createAccount = event.submitter?.value === "create-local-account";
+  const email = String(form.get("email") || gate.email || "").trim();
+  if (!email) return;
+  gate.email = email;
+  ui.busy = true;
+  ui.error = "";
+  render();
+  try {
+    const client = serverConnectorPool.clientFor(connector.id);
+    if (gate.authMode === "password") {
+      if (createAccount && connector.mode !== "personal-local") throw new Error("Account creation is available only on your local server.");
+      const password = String(form.get("password") || "");
+      if (!email.includes("@") || password.length < 8) throw new Error("Enter an email address and a password of at least eight characters.");
+      const auth = createAccount
+        ? await client.signUpWithPassword(email, password)
+        : await client.signInWithPassword(email, password);
+      if (auth?.status !== "authenticated" && !auth?.user) throw { code: "AUTH_REQUIRED" };
+    } else if (!gate.codeSent) {
+      await client.sendOtp(email);
+      gate.codeSent = true;
+      ui.busy = false;
+      ui.surface = "server-auth";
+      render();
+      return;
+    } else {
+      const code = String(form.get("code") || "").trim();
+      if (!/^[0-9]{6}$/.test(code)) throw new Error("Enter the six-digit sign-in code.");
+      const auth = await client.verifyOtp(email, code);
+      if (auth?.status !== "authenticated" && !auth?.user) throw { code: "AUTH_REQUIRED" };
+    }
+    markConnectorProjects(connector.id, "available");
+    ui.busy = false;
+    ui.serverGate = null;
+    if (gate.intent === "create") {
+      ui.surface = "wizard";
+      await createServerProjectFromWizard();
+    } else {
+      ui.surface = "switcher";
+      await stageServerProjectSwitch(gate.projectId, { replaceUrl: true });
+    }
+  } catch (error) {
+    ui.busy = false;
+    ui.error = safeTeamError(error, error?.message || "Sign-in could not be completed.");
+    ui.surface = "server-auth";
+    render();
+  }
+}
+
+function cancelServerProjectAuth() {
+  const ui = state.projects;
+  if (!ui) return;
+  const creating = ui.serverGate?.intent === "create";
+  ui.serverGate = null;
+  ui.error = "";
+  ui.surface = creating ? "wizard" : "switcher";
+  render();
+}
+
+async function signOutServerConnector(event) {
+  await changeServerConnectorSession(event.currentTarget.dataset.signoutConnector, false);
+}
+
+async function removeServerConnectorFromUi(event) {
+  await changeServerConnectorSession(event.currentTarget.dataset.removeConnector, true);
+}
+
+async function changeServerConnectorSession(connectorId, remove) {
+  const ui = state.projects;
+  if (!ui || ui.connectorBusyId) return;
+  ui.connectorBusyId = connectorId;
+  ui.error = "";
+  render();
+  try {
+    if (state.team.active && state.team.connectorId === connectorId) {
+      await closeTeamWorkspace("The server project was closed. Your saved browser project is open.");
+    }
+    if (remove) await serverConnectorPool.remove(connectorId);
+    else await serverConnectorPool.signOut(connectorId);
+    markConnectorProjects(connectorId, "sign-in-required");
+    ui.connectors = serverConnectorPool.registry.connectors;
+    ui.status = remove ? "Removed the server connection from this device." : "Signed out of that server connection.";
+  } catch (error) {
+    ui.error = error?.message || "The server connection could not be updated.";
+  }
+  ui.connectorBusyId = "";
+  ui.surface = "manage";
+  render();
+}
+
+function markConnectorProjects(connectorId, serverStatus) {
+  const ui = state.projects;
+  if (!ui) return;
+  let next = ui.registry;
+  for (const project of projectsForConnector(next, connectorId)) {
+    next = updateProjectMetadata(localStorage, next, project.id, { serverStatus });
+  }
+  projectRegistry = next;
+  ui.registry = next;
 }
 
 function safeFileName(value) {
@@ -3823,11 +4335,53 @@ function openRenameProject(event) {
   render();
 }
 
-function submitRenameProject(event) {
+async function submitRenameProject(event) {
   event.preventDefault();
   const ui = state.projects;
+  if (!ui || ui.busy) return;
+  const project = registryProjectById(ui.registry, ui.renameProjectId);
   try {
-    projectRegistry = renameRegistryProject(localStorage, ui.registry, ui.renameProjectId, new FormData(event.currentTarget).get("name"));
+    const name = String(new FormData(event.currentTarget).get("name") || "").trim();
+    if (project?.provider === "server") {
+      if (project.serverRole !== "owner") throw new Error("Only an owner can rename this server project.");
+      const connector = serverConnectorPool.connector(project.connectorId);
+      if (!connector) throw new Error("Reconnect this server project before renaming it.");
+      const client = serverConnectorPool.clientFor(connector.id);
+      const auth = await client.getAuthState();
+      if (auth?.status !== "authenticated" || !auth.user) throw new Error("Sign in to this connection before renaming the project.");
+      const capabilities = await client.checkCapabilities(serverConnectorClientConfig(connector));
+      if (capabilities?.workspaceLifecycle !== true) throw new Error("This server does not support project rename.");
+      if (!ui.renameMutationId) ui.renameMutationId = teamCreateAttemptId("rename");
+      ui.busy = true;
+      render();
+      try {
+        const result = await client.teamService.renameWorkspace({
+          workspaceId: project.workspaceId, name, expectedRevision: project.serverRevision, mutationId: ui.renameMutationId
+        });
+        const response = result?.workspace || result;
+        const renamed = normalizeTeamWorkspace({
+          ...response,
+          id: response?.id || response?.workspaceId || project.workspaceId,
+          name: response?.name || name,
+          role: response?.role || project.serverRole,
+          revision: response?.revision
+        });
+        projectRegistry = updateProjectMetadata(localStorage, ui.registry, project.id, {
+          name: renamed.name || name, serverRevision: renamed.revision || project.serverRevision + 1, serverStatus: "available"
+        });
+        ui.renameMutationId = "";
+        if (state.team.projectId === project.id) {
+          state.team.workspace = { ...state.team.workspace, name: renamed.name || name, revision: renamed.revision || project.serverRevision + 1 };
+        }
+      } catch (error) {
+        if (!isAmbiguousTeamError(error)) ui.renameMutationId = "";
+        throw error;
+      } finally {
+        ui.busy = false;
+      }
+    } else {
+      projectRegistry = renameRegistryProject(localStorage, ui.registry, ui.renameProjectId, name);
+    }
     ui.registry = projectRegistry;
     ui.status = `Renamed the project to ${registryProjectById(projectRegistry, ui.renameProjectId).name}.`;
     ui.surface = "manage";
@@ -3856,10 +4410,19 @@ function cancelProjectArchive() {
   document.querySelector(`[data-archive-project="${cssEscape(projectId)}"]`)?.focus();
 }
 
-function confirmProjectArchive() {
+async function confirmProjectArchive() {
   const ui = state.projects;
   try {
     const project = registryProjectById(ui.registry, ui.archiveProjectId);
+    if (project.id === ui.registry.activeProjectId) {
+      const fallback = ui.registry.projects.find((entry) => !entry.archivedAt && entry.id !== project.id && entry.provider !== "server");
+      if (!fallback) throw new Error("Create another browser project before archiving the current project.");
+      if (state.team.active && state.team.projectId === project.id) {
+        await closeTeamWorkspace("Returned to the saved browser project.");
+      } else if (!await stageLocalProjectSwitch(fallback.id)) {
+        throw new Error("Another project could not be opened before archiving.");
+      }
+    }
     projectRegistry = setProjectArchived(localStorage, ui.registry, ui.archiveProjectId, true);
     ui.registry = projectRegistry;
     ui.status = `${project.name} is hidden on this device. Its source was not deleted.`;
@@ -3887,9 +4450,15 @@ function unarchiveProject(event) {
 
 function openForgetProject(event) {
   const ui = state.projects;
-  ui.deleteProjectId = event.currentTarget.dataset.forgetProject;
+  if (!ui || ui.busy) return;
+  ui.deleteRemoteDrive = Boolean(event.currentTarget.dataset.deleteDriveProject);
+  ui.deleteProjectId = event.currentTarget.dataset.deleteDriveProject || event.currentTarget.dataset.forgetProject;
+  ui.driveDeleteTicket = null;
+  ui.driveDeleteToken = "";
   ui.deleteName = "";
   ui.backupDownloaded = false;
+  ui.deleteRevision = 0;
+  ui.deleteMutationId = "";
   ui.error = "";
   ui.surface = "delete";
   render();
@@ -3905,9 +4474,85 @@ function updateForgetProjectName(event) {
   if (input && Number.isInteger(cursor)) input.setSelectionRange(cursor, cursor);
 }
 
-function downloadProjectBackup() {
+async function downloadProjectBackup() {
   const ui = state.projects;
+  if (!ui || ui.busy) return;
   const project = registryProjectById(ui.registry, ui.deleteProjectId);
+  if (!project?.archivedAt) return;
+  if (ui.deleteRemoteDrive && project.provider === "google-drive") {
+    ui.busy = true;
+    ui.error = "";
+    ui.backupDownloaded = false;
+    ui.driveDeleteTicket = null;
+    ui.driveDeleteToken = "";
+    render();
+    try {
+      const bundle = readProjectBundle(localStorage, project.id);
+      const source = bundle.source ? loadSourceFromKey(bundle.keys.source) : null;
+      if (!source?.fileId) throw new Error("This project has no saved Drive file ID. Reopen it and choose its Drive file before deleting.");
+      const clientId = source.clientId || normalizeDriveRuntimeConfig(globalThis.PM_OS_DRIVE_CONFIG)?.clientId || "";
+      // Use a fresh authorization for this archived source; never reuse the active project's token.
+      ui.driveDeleteToken = await requestDriveAccessToken(clientId);
+      ui.driveDeleteTicket = await prepareDriveWorkspaceDeletion(source, ui.driveDeleteToken, {
+        projectName: project.name,
+        startBackup(content, name) {
+          downloadFile(content, "application/json", `${safeFileName(name)}-backup-${todayStamp()}.json`);
+          return true;
+        }
+      });
+      ui.backupDownloaded = true;
+      ui.status = `Downloaded a fresh backup of ${project.name} from Drive.`;
+    } catch (error) {
+      ui.error = error?.message || "A fresh Drive backup could not be downloaded.";
+      ui.driveDeleteToken = "";
+    } finally {
+      ui.busy = false;
+      render();
+      document.querySelector(ui.backupDownloaded ? "#forgetProjectName" : "#downloadProjectBackupButton")?.focus();
+    }
+    return;
+  }
+  if (project?.provider === "server") {
+    ui.busy = true;
+    ui.error = "";
+    render();
+    let repository;
+    try {
+      const connector = serverConnectorPool.connector(project.connectorId);
+      if (!connector) throw new Error("Reconnect this server before deleting its project.");
+      const client = serverConnectorPool.clientFor(connector.id);
+      const auth = await client.getAuthState();
+      if (auth?.status !== "authenticated" || !auth.user) throw new Error("Sign in to download a fresh authorized backup.");
+      const capabilities = await client.checkCapabilities(serverConnectorClientConfig(connector));
+      if (capabilities?.workspaceLifecycle !== true) throw new Error("This server does not support project deletion.");
+      const workspace = collectionFrom(await client.teamService.listWorkspaces(), "workspaces").map(normalizeTeamWorkspace)
+        .find((entry) => entry.id === project.workspaceId);
+      if (!workspace) throw new Error("Your account is not authorized for this workspace.");
+      if (workspace.role !== "owner") throw new Error("Only an owner can delete this server project.");
+      repository = client.repositoryFor(project.workspaceId);
+      const opened = await repository.open();
+      const revision = Number(opened?.revision ?? opened?.snapshot?.revision ?? workspace.revision ?? project.serverRevision);
+      if (!Number.isSafeInteger(revision) || revision < 0) throw new Error("The current server revision could not be verified.");
+      const content = encodeWorkspaceDocument(opened.snapshot);
+      downloadFile(content, "application/json", `${safeFileName(workspace.name)}-backup-${todayStamp()}.json`);
+      projectRegistry = updateProjectMetadata(localStorage, ui.registry, project.id, {
+        name: workspace.name, serverRole: workspace.role, serverRevision: revision, serverStatus: "available"
+      });
+      ui.registry = projectRegistry;
+      ui.deleteRevision = revision;
+      ui.backupDownloaded = true;
+      ui.status = `Downloaded a fresh authorized backup of ${workspace.name}.`;
+    } catch (error) {
+      ui.error = safeTeamError(error, error?.message || "A fresh server backup could not be downloaded.");
+      ui.backupDownloaded = false;
+    } finally {
+      try { await repository?.disconnect?.(); } catch { /* The deletion gate remains closed on cleanup failure. */ }
+      ui.busy = false;
+      render();
+      document.querySelector(ui.backupDownloaded ? "#forgetProjectName" : "#downloadProjectBackupButton")?.focus();
+    }
+    return;
+  }
   const bundle = readProjectBundle(localStorage, project.id);
   const content = bundle.workspace || encodeWorkspaceDocument(createEmptyWorkspaceDocument());
   downloadFile(content, "application/json", `${safeFileName(project.name)}-backup-${todayStamp()}.json`);
@@ -3920,19 +4565,59 @@ function downloadProjectBackup() {
 async function confirmForgetProject(event) {
   event.preventDefault();
   const ui = state.projects;
+  if (!ui || ui.busy) return;
   const project = registryProjectById(ui.registry, ui.deleteProjectId);
-  if (!project || ui.deleteName !== project.name || !ui.backupDownloaded) return;
+  if (!project?.archivedAt || ui.deleteName !== project.name || !ui.backupDownloaded) return;
   try {
+    if (ui.deleteRemoteDrive && project.provider === "google-drive") {
+      ui.busy = true;
+      ui.error = "";
+      render();
+      try {
+        await deletePreparedDriveWorkspace(ui.driveDeleteTicket, ui.driveDeleteToken, ui.deleteName);
+      } finally {
+        ui.busy = false;
+      }
+    }
+    if (project.provider === "server") {
+      const connector = serverConnectorPool.connector(project.connectorId);
+      if (!connector) throw new Error("Reconnect this server before deleting its project.");
+      const client = serverConnectorPool.clientFor(connector.id);
+      const auth = await client.getAuthState();
+      if (auth?.status !== "authenticated" || !auth.user) throw new Error("Sign in again before deleting this server project.");
+      if (!ui.deleteMutationId) ui.deleteMutationId = teamCreateAttemptId("delete");
+      ui.busy = true;
+      render();
+      try {
+        await client.teamService.deleteWorkspace({
+          workspaceId: project.workspaceId, expectedName: project.name,
+          expectedRevision: ui.deleteRevision, mutationId: ui.deleteMutationId
+        });
+        ui.deleteMutationId = "";
+      } catch (error) {
+        if (!isAmbiguousTeamError(error)) ui.deleteMutationId = "";
+        throw error;
+      } finally {
+        ui.busy = false;
+      }
+    }
     projectRegistry = forgetRegistryProject(localStorage, ui.registry, project.id);
     ui.registry = projectRegistry;
     await clearLinkedFileHandle(project.id).catch(() => undefined);
-    ui.status = `Forgot local data for ${project.name}. No external source was deleted.`;
+    ui.status = project.provider === "server" ? `Deleted ${project.name} from the server and removed it from this device.`
+      : ui.deleteRemoteDrive ? `Deleted ${project.name} from Drive and removed it from this device.`
+        : project.provider === "local-file" ? `Forgot local data for ${project.name}. Its linked file remains on disk; delete that original file in your operating system if needed.`
+          : `Forgot local data for ${project.name}. No external source was deleted.`;
+    ui.driveDeleteTicket = null;
+    ui.driveDeleteToken = "";
     ui.deleteProjectId = "";
     ui.surface = "manage";
     render();
     document.querySelector("#backToProjectSwitcherButton")?.focus();
   } catch (error) {
-    ui.error = error.message;
+    ui.error = project?.provider === "server"
+      ? safeTeamError(error, error?.message || "The server project was not deleted. Its saved project entry remains available.")
+      : error.message;
     render();
   }
 }
@@ -4064,6 +4749,7 @@ function openNewCustomer() {
 
 function selectCustomerAccount(id) {
   state.selectedCustomerId = id;
+  pushViewUrl(true);
   render();
   document.querySelector(".customer-inspector h3")?.focus?.();
 }
@@ -4177,7 +4863,7 @@ function openNewSegment() {
   document.querySelector('#customerSegmentForm [name="name"]')?.focus();
 }
 
-function selectCustomerSegment(id) { state.selectedSegmentId = id; state.customerSegmentDraft = null; render(); }
+function selectCustomerSegment(id) { state.selectedSegmentId = id; state.customerSegmentDraft = null; pushViewUrl(true); render(); }
 
 function segmentDraftFromForm(form) {
   const data = new FormData(form);
@@ -4306,6 +4992,7 @@ function toggleTheme() {
 
 function selectOrganizationUnit(unitId) {
   state.selectedOrgUnitId = unitId;
+  pushViewUrl(true);
   render();
   requestAnimationFrame(() => {
     [...document.querySelectorAll("[data-select-unit]")]
@@ -4523,6 +5210,8 @@ function createTeamState(overrides = {}) {
     managedConfig: null,
     config: null,
     client: null,
+    connectorId: "",
+    projectId: "",
     capabilities: null,
     connection: "idle",
     status: "",
@@ -4714,9 +5403,11 @@ async function saveInitiativeRecord(event) {
   if (editor.convertFromRiskId) patch.risks = item.risks.filter((entry) => entry.id !== editor.convertFromRiskId);
   const verb = editor.convertFromRiskId ? "Converted" : existing ? "Updated" : "Added";
   const actionContext = editor.actionContext;
-  state.initiativeDetail.recordEditor = { kind: "", recordId: "", convertFromRiskId: "", returnFocusId: "", focusField: "", actionContext: null, draft: null, error: "" };
-  state.initiativeDetail.focusRecordId = record.id;
-  await commitInitiativeRecordPatch(item, patch, initiativeRecordAnnouncement(verb, editor.kind, record.description), editor.kind, actionContext);
+  if (state.team.active) {
+    state.initiativeDetail.recordEditor = { kind: "", recordId: "", convertFromRiskId: "", returnFocusId: "", focusField: "", actionContext: null, draft: null, error: "" };
+    state.initiativeDetail.focusRecordId = record.id;
+  }
+  await commitInitiativeRecordPatch(item, patch, initiativeRecordAnnouncement(verb, editor.kind, record.description), editor.kind, actionContext, { editor, recordId: record.id });
 }
 
 function failInitiativeRecord(message, selector = "[name=description]") {
@@ -4756,7 +5447,7 @@ async function deleteInitiativeRecord(kind, recordId, trigger) {
   await commitInitiativeRecordPatch(item, { [field]: item[field].filter((entry) => entry.id !== recordId) }, initiativeRecordAnnouncement("Deleted", kind, record.description), kind);
 }
 
-async function commitInitiativeRecordPatch(item, patch, announcement, kind, actionContext = null) {
+async function commitInitiativeRecordPatch(item, patch, announcement, kind, actionContext = null, savedRecord = null) {
   const change = {};
   for (const field of ["risks", "dependencies"]) {
     if (!Array.isArray(patch[field]) || JSON.stringify(item[field]) === JSON.stringify(patch[field])) continue;
@@ -4770,9 +5461,38 @@ async function commitInitiativeRecordPatch(item, patch, announcement, kind, acti
     change[field] = { from: `${before.length} ${field}`, to: `${after.length} ${field}; added ${added}; updated ${updated}; removed ${removed}` };
   }
   if (!state.team.active) {
-    state.items = updateItem(state.items, item.id, patch);
-    logActivity(`${kind}-updated`, item, change);
-    persist();
+    try {
+      commitLocalInitiativeUpdate(updateItem(state.items, item.id, patch), createActivityEntry(`${kind}-updated`, item, change));
+    } catch (error) {
+      const message = localInitiativeSaveError(error, Boolean(savedRecord));
+      if (savedRecord) {
+        savedRecord.editor.error = message;
+        const errorNode = document.querySelector("#initiativeRecordError");
+        if (errorNode) {
+          errorNode.textContent = message;
+          errorNode.tabIndex = -1;
+          errorNode.focus();
+        }
+      } else {
+        state.editorAnnouncement = message;
+        render();
+        const dialog = document.querySelector("#initiativeDetailDialog");
+        if (dialog) {
+          const errorNode = document.createElement("p");
+          errorNode.className = "initiative-editor-error";
+          errorNode.setAttribute("role", "alert");
+          errorNode.tabIndex = -1;
+          errorNode.textContent = message;
+          (dialog.querySelector(".initiative-detail-body") || dialog).prepend(errorNode);
+          queueMicrotask(() => errorNode.focus());
+        }
+      }
+      return;
+    }
+    if (savedRecord) {
+      state.initiativeDetail.recordEditor = { kind: "", recordId: "", convertFromRiskId: "", returnFocusId: "", focusField: "", actionContext: null, draft: null, error: "" };
+      state.initiativeDetail.focusRecordId = savedRecord.recordId;
+    }
     if (actionContext) finishActionMutation(actionContext, announcement);
     else {
       state.editorAnnouncement = announcement;
@@ -4998,6 +5718,7 @@ function openInitiativeDetail(itemId, trigger, { replaceDetail = false } = {}) {
   if (focusRecordId) url.searchParams.set("record", focusRecordId); else url.searchParams.delete("record");
   if (demoMode) url.searchParams.set("demo", "1");
   history[replaceDetail ? "replaceState" : "pushState"]({ view: state.selectedView, initiative: itemId, detailOpenedFromUi: historyOwned, detailTriggerId: triggerId }, "", url);
+  persistCurrentProjectLocation();
   render();
 }
 
@@ -5042,11 +5763,13 @@ function navigateFromInitiativeDetail(deepLink) {
 }
 
 function clearInitiativeDetailUrl() {
+  state.initiativeDetail = createInitiativeDetailState();
   const url = new URL(location.href);
   url.searchParams.delete("initiative");
   url.searchParams.delete("section");
   url.searchParams.delete("record");
   history.replaceState({ view: state.selectedView }, "", url);
+  persistCurrentProjectLocation();
 }
 
 function focusAfterRender(id = "") {
@@ -5169,6 +5892,7 @@ function openInsightEditor(mode, trigger, selectedId = "", type = state.selected
   const navigating = mode === "view" && previous.mode === "view";
   const backStack = navigating ? [...previous.backStack, { id: previous.selectedId, focusId: trigger?.id || "closeInsightEditorButton" }] : [];
   state.insightEditor = createInsightEditorState({ mode, type: resolvedType, selectedId: record?.id || "", triggerId: navigating ? previous.triggerId : trigger?.id || "viewTitle", backStack });
+  if (mode === "view" || previous.mode === "view") pushViewUrl(true);
   render();
 }
 
@@ -5245,6 +5969,7 @@ async function saveTeamInsightEditor(values) {
 
 function completeInsightEditorSave(message, triggerId) {
   state.insightEditor = createInsightEditorState();
+  pushViewUrl(true);
   state.editorAnnouncement = message;
   render();
   (document.getElementById(triggerId) || document.querySelector("#viewTitle"))?.focus();
@@ -5253,6 +5978,7 @@ function completeInsightEditorSave(message, triggerId) {
 function closeInsightEditor() {
   const triggerId = state.insightEditor.triggerId;
   state.insightEditor = createInsightEditorState();
+  pushViewUrl(true);
   render();
   queueMicrotask(() => (document.getElementById(triggerId) || document.querySelector(state.initiativeDetail.selectedId ? "#initiativeDetailTitle" : "#viewTitle"))?.focus());
 }
@@ -5265,6 +5991,7 @@ function backToInsightRecord() {
   const record = state.insightRecords.find((entry) => entry.id === previous.id);
   if (!record) { closeInsightEditor(); return; }
   state.insightEditor = createInsightEditorState({ mode: "view", selectedId: record.id, type: record.type, triggerId: editor.triggerId, backStack });
+  pushViewUrl(true);
   render();
   queueMicrotask(() => (document.getElementById(previous.focusId) || document.querySelector("#closeInsightEditorButton"))?.focus());
 }
@@ -5809,12 +6536,45 @@ function saveBrowserInitiativeEditor(values) {
       return;
     }
     const changes = initiativeChanges(item, values);
-    state.items = updateItem(state.items, item.id, values);
-    logActivity("updated", item, changes);
-    persist();
+    try {
+      commitLocalInitiativeUpdate(updateItem(state.items, item.id, values), createActivityEntry("updated", item, changes));
+    } catch (error) {
+      editor.error = localInitiativeSaveError(error);
+      const errorNode = document.querySelector("#initiativeEditorError");
+      if (errorNode) errorNode.textContent = editor.error;
+      errorNode?.focus();
+      return;
+    }
     announcement = `Updated ${values.title}.`;
   }
   completeInitiativeEditorSave(announcement, editor.triggerId, editor.actionContext);
+}
+
+function commitLocalInitiativeUpdate(items, activityEntry) {
+  const activity = [activityEntry, ...state.activity].slice(0, 250);
+  const sync = ["local-file", "google-drive"].includes(state.source.type) ? { ...state.sync, localPending: true } : state.sync;
+  if (!demoMode) {
+    // Commit every local representation before publishing the change in memory
+    // or allowing an external writer to observe it.
+    const payload = exportPortableWorkspace(items, activity);
+    runStorageTransaction(localStorage, [storageKey, activityKey, syncKey], () => {
+      localStorage.setItem(storageKey, payload);
+      localStorage.setItem(activityKey, JSON.stringify({ activity }));
+      if (sync !== state.sync) localStorage.setItem(syncKey, serializeSync(sync));
+    });
+  }
+  state.items = items;
+  state.activity = activity;
+  if (!demoMode) {
+    state.sync = sync;
+    markExternalSourcePending();
+  }
+}
+
+function localInitiativeSaveError(error, hasDraft = true) {
+  return error instanceof AggregateError
+    ? `The change could not be saved and browser recovery was incomplete. ${hasDraft ? "Your draft is still open. Preserve it before reloading." : "Preserve your workspace before reloading."}`
+    : `The change could not be saved in this browser. ${hasDraft ? "Your draft is still open. Try saving again." : "Try the change again."}`;
 }
 
 async function saveTeamInitiativeEditor(values) {
@@ -5909,7 +6669,7 @@ function completeInitiativeEditorSave(announcement, triggerId, actionContext = n
   }
   state.editorAnnouncement = announcement;
   render();
-  document.getElementById(triggerId)?.focus();
+  (document.getElementById(triggerId) || document.querySelector("#viewTitle"))?.focus();
 }
 
 function finishActionMutation(actionContext, fallbackAnnouncement) {
@@ -6137,7 +6897,8 @@ async function preserveTeamConflict(draft, { refresh = true } = {}) {
 
 function reviewTeamConflict() {
   if (!state.team.conflict) return;
-  state.selectedView = "command";
+  state.selectedView = "initiatives";
+  state.selectedMode = "list";
   state.query = "";
   render();
   document.querySelector(`[data-item-id="${cssEscape(state.team.conflict.itemId)}"]`)?.scrollIntoView({ block: "center" });
@@ -6436,7 +7197,9 @@ async function disposeTeamClient() {
   try { team.unsubscribeRepository?.(); } catch { /* Local cleanup continues. */ }
   try { team.unsubscribeConnection?.(); } catch { /* Local cleanup continues. */ }
   try { await team.repository?.disconnect?.(); } catch { /* Local cleanup continues. */ }
-  try { await team.client?.dispose?.(); } catch { /* Local cleanup continues. */ }
+  if (!team.connectorId) {
+    try { await team.client?.dispose?.(); } catch { /* Local cleanup continues. */ }
+  }
 }
 
 async function loadTeamWorkspaces() {
@@ -6449,6 +7212,7 @@ function normalizeTeamWorkspace(input = {}) {
     id: String(input.id || input.workspaceId || input.workspace_id || "").trim(),
     name: String(input.name || input.workspaceName || input.workspace_name || "Team workspace").trim() || "Team workspace",
     role: String(input.role || "viewer").trim().toLowerCase(),
+    revision: Number.isSafeInteger(Number(input.revision ?? input.workspaceRevision ?? input.workspace_revision)) ? Number(input.revision ?? input.workspaceRevision ?? input.workspace_revision) : 0,
     updatedAt: input.updatedAt || input.updated_at || ""
   };
 }
@@ -6555,8 +7319,8 @@ async function openTeamWorkspace(event) {
   await openTeamWorkspaceById(workspaceId, event.currentTarget);
 }
 
-async function openTeamWorkspaceById(workspaceId, trigger) {
-  const workspace = state.team.workspaces.find((entry) => entry.id === workspaceId);
+async function openTeamWorkspaceById(workspaceId, trigger, options = {}) {
+  const workspace = options.workspace || state.team.workspaces.find((entry) => entry.id === workspaceId);
   if (!workspace || state.dataBusy) return;
   const switching = state.team.active;
   if (switching && state.team.workspace?.id === workspace.id) {
@@ -6565,11 +7329,12 @@ async function openTeamWorkspaceById(workspaceId, trigger) {
     renderAndFocus("teamStatus");
     return;
   }
+  if (state.projects && !options.departureChecked && !await approveProjectDeparture({ replaceUrl: options.replaceUrl })) return false;
   const title = switching ? "Switch team workspace?" : "Open team workspace?";
   const description = switching
     ? `PM OS will open ${workspace.name} before closing ${state.team.workspace?.name || "the current team workspace"}.`
     : `Your browser workspace will stay saved here. PM OS will create a recovery snapshot, then open ${workspace.name}. Team changes are shared with its members.`;
-  const confirmed = await requestDataConfirmation({
+  const confirmed = options.skipConfirmation || await requestDataConfirmation({
     title,
     description,
     confirmLabel: switching ? "Switch Workspace" : "Open Team Workspace",
@@ -6580,13 +7345,15 @@ async function openTeamWorkspaceById(workspaceId, trigger) {
     (document.querySelector(`[data-open-team-workspace="${cssEscape(workspaceId)}"]`) || document.querySelector("#projectSwitcherButton"))?.focus();
     return;
   }
-  await runTeamAction(async () => {
+  const action = await runTeamAction(async () => {
+    const previousLocation = captureRegisteredProjectLocation();
     const returnState = switching ? state.team.returnState : captureBrowserReturnState();
     const backup = switching ? null : createTeamSwitchBackup();
+    const client = options.client || state.team.client;
     let repository;
     let unsubscribe;
     try {
-      repository = state.team.client.repositoryFor(workspace.id);
+      repository = client.repositoryFor(workspace.id);
       const opened = await repository.open();
       let stagedSnapshot = opened.snapshot;
       unsubscribe = repository.subscribe((snapshot) => {
@@ -6597,16 +7364,25 @@ async function openTeamWorkspaceById(workspaceId, trigger) {
           void refreshActiveTeamMetadata(repository);
         }
       });
-      const members = await membersForWorkspace(workspace.id).catch(() => []);
+      const members = await membersForWorkspace(workspace.id, client).catch(() => []);
       const oldRepository = switching ? state.team.repository : null;
       const oldUnsubscribe = switching ? state.team.unsubscribeRepository : null;
+      const oldConnectionUnsubscribe = switching ? state.team.unsubscribeConnection : null;
+      const oldClient = switching ? state.team.client : null;
+      const oldConnectorId = switching ? state.team.connectorId : "";
       state.team.active = true;
       state.team.mode = "live";
       state.team.workspace = { ...workspace, role: opened.role || workspace.role };
       state.team.role = String(opened.role || workspace.role || "viewer").toLowerCase();
+      state.team.client = client;
+      state.team.connectorId = options.connector?.id || state.team.connectorId;
+      state.team.projectId = options.serverProject?.id || "";
+      state.team.capabilities = options.capabilities || state.team.capabilities;
+      state.team.backendMode = options.connector?.mode || state.team.backendMode;
       state.team.repository = repository;
       state.team.openResult = opened;
       state.team.unsubscribeRepository = unsubscribe;
+      state.team.unsubscribeConnection = client.subscribeConnection?.((status) => handleTeamConnection(status, client)) || null;
       state.team.members = members;
       state.team.returnState = returnState;
       state.team.showWorkspaceList = false;
@@ -6619,7 +7395,26 @@ async function openTeamWorkspaceById(workspaceId, trigger) {
       applyTeamSnapshot(stagedSnapshot);
       if (switching) {
         try { oldUnsubscribe?.(); } catch { /* The staged workspace is already active. */ }
+        try { oldConnectionUnsubscribe?.(); } catch { /* The staged workspace owns the connection listener. */ }
         try { await oldRepository?.disconnect?.(); } catch { /* The staged workspace remains active. */ }
+        if (oldClient && oldClient !== client && !oldConnectorId) {
+          try { await oldClient.dispose?.(); } catch { /* The new workspace remains active. */ }
+        }
+      }
+      if (options.serverProject) {
+        projectRegistry = activateProjectRegistryEntry(localStorage, state.projects.registry, options.serverProject.id, previousLocation);
+        projectRegistry = updateProjectMetadata(localStorage, projectRegistry, options.serverProject.id, {
+          name: workspace.name,
+          serverRole: state.team.role,
+          serverRevision: Number(opened?.revision ?? opened?.snapshot?.revision ?? workspace.revision ?? options.serverProject.serverRevision),
+          serverStatus: "available"
+        });
+        state.projects.registry = projectRegistry;
+        resetWorkspaceUiState();
+        restoreProjectLocation(options.serverProject.location);
+        state.projects.surface = "closed";
+        state.projects.status = `Opened ${workspace.name}.`;
+        pushViewUrl(Boolean(options.replaceUrl));
       }
       state.dataStatus = "Browser recovery remains separate from Team workspace data.";
     } catch (error) {
@@ -6629,6 +7424,8 @@ async function openTeamWorkspaceById(workspaceId, trigger) {
       throw error;
     }
   }, { pendingStatus: switching ? "Opening the new team workspace..." : "Backing up Browser memory and opening Team workspace...", focusId: "teamStatus" });
+  if (options.serverProject && action.error) throw action.error;
+  return !action.error;
 }
 
 async function refreshActiveTeamMetadata(repository) {
@@ -6638,6 +7435,15 @@ async function refreshActiveTeamMetadata(repository) {
     state.team.openResult = opened;
     state.team.role = String(opened.role || state.team.role || "viewer").toLowerCase();
     state.team.workspace = { ...state.team.workspace, role: state.team.role };
+    if (state.team.projectId) {
+      projectRegistry = updateProjectMetadata(localStorage, state.projects.registry, state.team.projectId, {
+        name: state.team.workspace.name,
+        serverRole: state.team.role,
+        serverRevision: Number(opened?.revision ?? opened?.snapshot?.revision ?? state.team.workspace.revision ?? 0),
+        serverStatus: "available"
+      });
+      state.projects.registry = projectRegistry;
+    }
     render();
   } catch (error) {
     if (isTeamAccessLoss(error)) await exitTeamForBoundary(teamAccessLossMessage(error));
@@ -6646,6 +7452,8 @@ async function refreshActiveTeamMetadata(repository) {
 
 function captureBrowserReturnState() {
   return {
+    location: captureProjectLocation(),
+    projectId: state.projects?.registry.activeProjectId || "",
     items: state.items,
     insightRecords: state.insightRecords,
     codeRepositories: state.codeRepositories,
@@ -6685,8 +7493,8 @@ function createTeamSwitchBackup() {
   };
 }
 
-async function membersForWorkspace(workspaceId) {
-  const result = await state.team.client.teamService.listMembers(workspaceId);
+async function membersForWorkspace(workspaceId, client = state.team.client) {
+  const result = await client.teamService.listMembers(workspaceId);
   return collectionFrom(result, "members").map(normalizeTeamMember).filter((entry) => entry.userId).sort((left, right) => {
     if (left.role === "owner" && right.role !== "owner") return -1;
     if (right.role === "owner" && left.role !== "owner") return 1;
@@ -6764,12 +7572,15 @@ async function leaveTeamWorkspace(event) {
 async function signOutTeamWorkspace() {
   await runTeamAction(async () => {
     state.team.intentionalClose = true;
+    const connectorId = state.team.connectorId;
     let confirmed = true;
     try {
-      await state.team.client.signOut();
+      if (connectorId) await serverConnectorPool.signOut(connectorId);
+      else await state.team.client.signOut();
     } catch {
       confirmed = false;
     }
+    if (connectorId) markConnectorProjects(connectorId, "sign-in-required");
     await closeTeamWorkspace(confirmed
       ? "Signed out. Your saved browser workspace is open."
       : "Team data was cleared locally. Supabase could not confirm the remote sign-out.");
@@ -6785,8 +7596,9 @@ async function exitTeamForBoundary(message) {
   return team.boundaryPromise;
 }
 
-async function closeTeamWorkspace(message) {
+async function closeTeamWorkspace(message, { forProjectSwitch = false } = {}) {
   const team = state.team;
+  const previousLocation = captureRegisteredProjectLocation();
   const returning = team.returnState;
   team.intentionalClose = true;
   await disposeTeamClient();
@@ -6806,6 +7618,10 @@ async function closeTeamWorkspace(message) {
     state.sync = returning.sync;
     state.driveReview = returning.driveReview;
     state.syncStatus = returning.syncStatus;
+    if (!forProjectSwitch && returning.projectId && registryProjectById(state.projects?.registry, returning.projectId)) {
+      projectRegistry = activateProjectRegistryEntry(localStorage, state.projects.registry, returning.projectId, previousLocation);
+      state.projects.registry = projectRegistry;
+    }
   } else {
     state.items = loadItems();
     state.insightRecords = loadInsightRecords();
@@ -6827,7 +7643,13 @@ async function closeTeamWorkspace(message) {
   state.initiativeEditor = createInitiativeEditorState();
   state.sourceSelection = sourceSelectionFor(state.source);
   state.dataStatus = message;
-  render();
+  if (!forProjectSwitch) {
+    resetWorkspaceUiState();
+    state.driveReview = returning?.driveReview || null;
+    restoreProjectLocation(returning?.location || activeRegistryProject(state.projects?.registry)?.location);
+    if (state.projects) pushViewUrl(true);
+    render();
+  }
 }
 
 async function exportWorkspaceData(format) {
@@ -7385,15 +8207,20 @@ async function restoreLinkedWorkspaceHandle() {
   }
 }
 
-async function inspectLinkedWorkspaceOnFocus() {
-  if (demoMode || state.dataBusy || state.projects?.busy || state.source.type !== "local-file" || !state.linkedFile.handle) return;
+async function inspectLinkedWorkspaceOnFocus({ forSwitch = false } = {}) {
+  if (demoMode || state.dataBusy || state.projects?.busy || (state.projects?.departurePending && !forSwitch) || state.source.type !== "local-file" || !state.linkedFile.handle) return false;
   state.dataBusy = true;
   try {
     const permission = await queryLinkedFilePermission(state.linkedFile.handle);
     state.linkedFile.permission = permission;
-    if (permission !== "granted") return;
+    if (permission !== "granted") {
+      if (forSwitch) state.syncStatus = "Linked file write permission is required. Your changes remain in this browser.";
+      return false;
+    }
     const file = await readLinkedWorkspaceFile(state.linkedFile.handle);
-    if (!state.sync.fileLastModified || file.lastModified === state.sync.fileLastModified) return;
+    if (file.lastModified === state.sync.fileLastModified) return true;
+    if (!state.sync.fileLastModified && forSwitch) throw new Error("A trusted linked-file baseline is required before syncing. Reopen the file to review it.");
+    if (!state.sync.fileLastModified) return false;
     const remoteDocument = mergeReadyDocument(JSON.parse(file.text));
     const localDocument = mergeReadyDocument(JSON.parse(exportPortableWorkspace()));
     const baseDocument = state.sync.fileBaselineDocument || localDocument;
@@ -7403,7 +8230,7 @@ async function inspectLinkedWorkspaceOnFocus() {
       persistSync();
       state.syncStatus = `${result.conflicts.length} linked-file conflict${result.conflicts.length === 1 ? "" : "s"} need review. The external file was not overwritten.`;
       render();
-      return;
+      return false;
     }
     const workspace = importPortableWorkspace(JSON.stringify(result.merged));
     const nextContent = JSON.stringify(result.merged, null, 2);
@@ -7417,9 +8244,11 @@ async function inspectLinkedWorkspaceOnFocus() {
     persistSync();
     state.syncStatus = writeRemote ? "Merged browser and external file changes." : "Loaded changes from the linked workspace file.";
     render();
+    return true;
   } catch (error) {
     state.syncStatus = `Linked file check stopped. ${error.message}`;
     render();
+    return false;
   } finally {
     state.dataBusy = false;
     render();
@@ -7460,7 +8289,7 @@ function scheduleLinkedWorkspaceWrite() {
   window.clearTimeout(linkedFileWriteTimer);
   const projectId = state.projects?.registry.activeProjectId || PRIMARY_PROJECT_ID;
   linkedFileWriteTimer = window.setTimeout(() => {
-    if ((state.projects?.registry.activeProjectId || PRIMARY_PROJECT_ID) !== projectId || state.team.active || state.projects?.busy) return;
+    if ((state.projects?.registry.activeProjectId || PRIMARY_PROJECT_ID) !== projectId || state.team.active || state.projects?.busy || state.projects?.departurePending) return;
     void runLinkedFileAction(writeCurrentLinkedWorkspace);
   }, 500);
 }
@@ -7812,6 +8641,7 @@ function downloadBeforeClearBackup() {
 
 function resetWorkspaceUiState() {
   state.weeklyUpdateCopied = false;
+  state.spaceModes = {};
   state.query = "";
   state.periodSelection = normalizePeriodSelection({ kind: "all" }, state.planningCalendar);
   state.periodAnnouncement = "";
@@ -7961,7 +8791,7 @@ function markExternalSourcePending() {
 let automaticDriveTimer = 0;
 function scheduleAutomaticDriveSync() {
   window.clearTimeout(automaticDriveTimer);
-  automaticDriveTimer = window.setTimeout(() => { if (!state.dataBusy && navigator.onLine) void syncDriveNow(); }, 1800);
+  automaticDriveTimer = window.setTimeout(() => { if (!state.dataBusy && !state.projects?.departurePending && navigator.onLine) void syncDriveNow(); }, 1800);
 }
 function logActivity(action, item, changes) { if (state.team.active) return; state.activity = [createActivityEntry(action, item, changes), ...state.activity].slice(0, 250); persistActivity(); }
 function formatActivityChanges(changes) { return describeActivityChanges(changes); }
@@ -8097,6 +8927,69 @@ function initialMode() {
   return params.get("mode") || LEGACY_VIEW_REDIRECTS[params.get("view")]?.[1] || (!params.has("space") && !params.has("view") ? activeRegistryProject(projectRegistry)?.location.mode : "") || ({ today: "focus", initiatives: "list", insights: "discovery", planning: "quarter", delivery: "board", briefings: "executive", team: "organization", settings: "setup" })[initialSpace] || "focus";
 }
 function initialInitiative() { return new URLSearchParams(location.search).get("initiative")?.trim() || ""; }
+function captureProjectLocation() {
+  const period = normalizePeriodSelection(state.periodSelection, state.planningCalendar);
+  return normalizeProjectLocation({
+    space: state.selectedView, mode: state.selectedMode, period: period.kind, periodStart: period.startDate,
+    boardTeam: state.boardTeamId, boardStage: state.mobileBoardStatusId,
+    customerView: state.customerView, customerId: state.selectedCustomerId, segmentId: state.selectedSegmentId,
+    initiative: state.initiativeDetail.selectedId, section: state.initiativeDetail.focusSection, record: state.initiativeDetail.focusRecordId,
+    insightId: state.insightEditor.mode === "view" ? state.insightEditor.selectedId : "", insightStatus: state.insightStatusFilter,
+    orgUnitId: state.selectedOrgUnitId, personId: state.selectedPersonId, specId: state.selectedSpecId
+  });
+}
+
+function persistCurrentProjectLocation() {
+  if (!state.projects?.persistent || (state.team.active && !state.team.projectId)) return;
+  try {
+    projectRegistry = updateActiveProjectLocation(localStorage, state.projects.registry, captureProjectLocation());
+    state.projects.registry = projectRegistry;
+  } catch { /* Navigation remains usable when location metadata cannot be saved. */ }
+}
+
+function captureRegisteredProjectLocation() {
+  return state.team.active && !state.team.projectId ? state.team.returnState?.location || activeRegistryProject(state.projects?.registry)?.location : captureProjectLocation();
+}
+
+function restoreProjectLocation(value) {
+  const saved = normalizeProjectLocation(value);
+  state.selectedView = visibleViewDefinition(saved.space) ? saved.space : "today";
+  state.selectedMode = allowedModes(state.selectedView).includes(saved.mode) ? saved.mode : defaultSpaceMode(state.selectedView);
+  state.spaceModes[state.selectedView] = state.selectedMode;
+  state.periodSelection = normalizePeriodSelection({ kind: saved.period, startDate: saved.periodStart }, state.planningCalendar);
+  state.boardTeamId = ["all", "unassigned"].includes(saved.boardTeam) || state.organization.units.some(({ id }) => id === saved.boardTeam) ? saved.boardTeam : "all";
+  state.mobileBoardStatusId = state.workflow.statuses.some(({ id }) => id === saved.boardStage) ? saved.boardStage : "";
+  state.customerView = saved.customerView || "accounts";
+  state.selectedCustomerId = state.customerDirectory.accounts.some(({ id }) => id === saved.customerId) ? saved.customerId : "";
+  state.selectedSegmentId = state.customerDirectory.segments.some(({ id }) => id === saved.segmentId) ? saved.segmentId : "";
+  state.selectedOrgUnitId = state.organization.units.some(({ id }) => id === saved.orgUnitId) ? saved.orgUnitId : "";
+  state.selectedPersonId = state.organization.people.some(({ id }) => id === saved.personId) ? saved.personId : "";
+  state.selectedSpecId = state.items.some(({ id }) => id === saved.specId) ? saved.specId : "";
+  state.insightStatusFilter = validInsightStatus(saved.insightStatus);
+  const item = state.items.find(({ id }) => id === saved.initiative);
+  state.initiativeDetail = item ? revealFocusedInitiativeRecord(createInitiativeDetailState({
+    selectedId: item.id, focusSection: saved.section || "", focusRecordId: saved.record || ""
+  }), item) : createInitiativeDetailState();
+  const insight = restoreInsightSelection(saved.insightId);
+  const missingNestedRecord = saved.record && ![...(item?.risks || []), ...(item?.dependencies || [])].some(({ id }) => id === saved.record);
+  if ((saved.initiative && !item) || (saved.insightId && !insight) || missingNestedRecord) {
+    state.initiativeDetail = createInitiativeDetailState();
+    state.insightEditor = createInsightEditorState();
+    state.selectedView = "today"; state.selectedMode = "focus";
+    state.routeAnnouncement = "The saved record is no longer available. Showing Today.";
+  }
+}
+
+function validInsightStatus(value) {
+  return Object.values(INSIGHT_STATUSES).some((statuses) => statuses.includes(value)) ? value : "";
+}
+
+function restoreInsightSelection(id) {
+  const record = state.insightRecords.find((entry) => entry.id === id);
+  state.insightEditor = record ? createInsightEditorState({ mode: "view", selectedId: record.id, type: record.type }) : createInsightEditorState();
+  return record;
+}
+
 function pushViewUrl(replace = false) {
   const url = new URL(location.href);
   const activeProjectId = state.projects?.registry.activeProjectId || "";
@@ -8129,12 +9022,13 @@ function pushViewUrl(replace = false) {
     url.searchParams.delete("boardStage");
   }
   if (demoMode) url.searchParams.set("demo", "1");
-  if (state.projects?.persistent && !state.team.active) {
-    try {
-      projectRegistry = updateActiveProjectLocation(localStorage, state.projects.registry, { space: state.selectedView, mode: state.selectedMode });
-      state.projects.registry = projectRegistry;
-    } catch { /* A navigation remains usable when location metadata cannot be saved. */ }
+  for (const [key, value] of Object.entries({ initiative: state.initiativeDetail.selectedId, section: state.initiativeDetail.focusSection, record: state.initiativeDetail.focusRecordId,
+    insightId: state.insightEditor.mode === "view" ? state.insightEditor.selectedId : "", insightStatus: state.selectedView === "insights" ? state.insightStatusFilter : "",
+    orgUnitId: state.selectedView === "team" ? state.selectedOrgUnitId : "", personId: state.selectedView === "team" ? state.selectedPersonId : "",
+    specId: state.selectedMode === "specs" ? state.selectedSpecId : "" })) {
+    if (value) url.searchParams.set(key, value); else url.searchParams.delete(key);
   }
+  persistCurrentProjectLocation();
   history[replace ? "replaceState" : "pushState"]({ space: state.selectedView, mode: state.selectedMode, project: activeProjectId }, "", url);
 }
 function selectedViewDefinition() { return visibleViewDefinition(state.selectedView) || viewByDeepLink.get("today"); }
@@ -8193,14 +9087,53 @@ function navigateToView(deepLink, origin, requestedMode = "") {
     : document.querySelector("#viewTitle");
   focusTarget?.focus();
 }
+async function restoreLinkedProject() {
+  const ui = state.projects;
+  if (!ui || ui.busy || !ui.archivedLinkId) return;
+  const projectId = ui.archivedLinkId;
+  const search = ui.archivedLinkSearch;
+  try {
+    projectRegistry = setProjectArchived(localStorage, ui.registry, projectId, false);
+    ui.registry = projectRegistry;
+    const target = registryProjectById(projectRegistry, projectId);
+    const opened = target.provider === "server"
+      ? await stageServerProjectSwitch(projectId, { replaceUrl: true })
+      : await stageLocalProjectSwitch(projectId, { replaceUrl: true });
+    if (!opened) return;
+    ui.archivedLinkId = "";
+    ui.archivedLinkSearch = "";
+    const linkedParams = new URLSearchParams(search);
+    if (!linkedParams.has("space") && !linkedParams.has("view")) return;
+    history.replaceState(history.state, "", `${location.pathname}?${search}`);
+    await restoreViewFromLocation();
+  } catch (error) {
+    ui.error = error.message || "The project could not be restored. Your current project remains open.";
+    render();
+  }
+}
+
 async function restoreViewFromLocation() {
   const params = new URLSearchParams(location.search);
   const projectId = params.get("project")?.trim() || "";
   const switchingProject = state.projects && projectId && projectId !== state.projects.registry.activeProjectId;
   if (switchingProject) {
     const target = registryProjectById(state.projects.registry, projectId);
-    if (!target || target.archivedAt) { pushViewUrl(true); return; }
-    if (!await stageLocalProjectSwitch(projectId, { replaceUrl: true })) { pushViewUrl(true); return; }
+    if (!target || target.archivedAt) {
+      if (target?.archivedAt) {
+        state.projects.archivedLinkId = target.id;
+        state.projects.archivedLinkSearch = params.toString();
+        state.projects.surface = "archived-link";
+        state.projects.error = "";
+      } else state.projects.status = "This project link is unavailable on this device. Your current project remains open.";
+      pushViewUrl(true);
+      render();
+      return;
+    }
+    const opened = target.provider === "server"
+      ? await stageServerProjectSwitch(projectId, { replaceUrl: true })
+      : await stageLocalProjectSwitch(projectId, { replaceUrl: true });
+    if (!opened) { pushViewUrl(true); return; }
+    if (!params.has("space") && !params.has("view")) return;
   }
   const legacy = LEGACY_VIEW_REDIRECTS[params.get("view")];
   const nextView = viewByDeepLink.get(params.get("space")) || viewByDeepLink.get(legacy?.[0]) || viewByDeepLink.get("today");
@@ -8217,6 +9150,11 @@ async function restoreViewFromLocation() {
   state.customerView = params.get("customerView") || state.customerView || "accounts";
   state.selectedCustomerId = params.get("customerId") || "";
   state.selectedSegmentId = params.get("segmentId") || "";
+  state.selectedOrgUnitId = params.get("orgUnitId") || "";
+  state.selectedPersonId = params.get("personId") || "";
+  state.selectedSpecId = params.get("specId") || "";
+  state.insightStatusFilter = validInsightStatus(params.get("insightStatus"));
+  if (!state.insightEditor.mode || state.insightEditor.mode === "view") restoreInsightSelection(params.get("insightId"));
   state.boardTeamId = params.get("boardTeam") || "all";
   state.mobileBoardStatusId = params.get("boardStage") || state.mobileBoardStatusId;
   state.initiativeDetail = revealFocusedInitiativeRecord(createInitiativeDetailState({
@@ -8227,6 +9165,7 @@ async function restoreViewFromLocation() {
     historyOwned: Boolean(selectedId && history.state?.detailOpenedFromUi)
   }), state.items.find((item) => item.id === selectedId));
   if (switchingProject) pushViewUrl(true);
+  else persistCurrentProjectLocation();
   if (changed) {
     state.query = "";
     recordViewUsage(nextView.deepLink);
@@ -8334,7 +9273,6 @@ function emptyState(text) { return `<p class="empty">${text}</p>`; }
 function todayStamp() { return new Date().toISOString().slice(0, 10); }
 function cssEscape(value) { return globalThis.CSS?.escape ? globalThis.CSS.escape(String(value)) : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&"); }
 function escapeHtml(value) { return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;"); }
-
 
 
 

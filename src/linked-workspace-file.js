@@ -8,23 +8,23 @@ export function linkedFileSupported(globalObject = globalThis) {
     && typeof globalObject.indexedDB?.open === "function";
 }
 
-export async function openLinkedWorkspaceFile(globalObject = globalThis) {
+export async function openLinkedWorkspaceFile(globalObject = globalThis, { storeHandle = true } = {}) {
   requireSupported(globalObject);
   const [handle] = await globalObject.showOpenFilePicker({
     multiple: false,
     types: [{ description: "PM OS workspace", accept: { "application/json": [".json"] } }]
   });
-  await storeLinkedFileHandle(handle, globalObject.indexedDB);
+  if (storeHandle) await storeLinkedFileHandle(handle, globalObject.indexedDB);
   return handle;
 }
 
-export async function createLinkedWorkspaceFile(globalObject = globalThis, suggestedName = "pm-os-workspace.json") {
+export async function createLinkedWorkspaceFile(globalObject = globalThis, suggestedName = "pm-os-workspace.json", { storeHandle = true } = {}) {
   requireSupported(globalObject);
   const handle = await globalObject.showSaveFilePicker({
     suggestedName,
     types: [{ description: "PM OS workspace", accept: { "application/json": [".json"] } }]
   });
-  await storeLinkedFileHandle(handle, globalObject.indexedDB);
+  if (storeHandle) await storeLinkedFileHandle(handle, globalObject.indexedDB);
   return handle;
 }
 

@@ -246,6 +246,8 @@ export class TeamWorkspaceService {
 
   listWorkspaces() { throw unsupported(this.providerId, "listWorkspaces"); }
   createWorkspace(input) { void input; throw unsupported(this.providerId, "createWorkspace"); }
+  renameWorkspace(input) { void input; throw unsupported(this.providerId, "renameWorkspace"); }
+  deleteWorkspace(input) { void input; throw unsupported(this.providerId, "deleteWorkspace"); }
   listMembers(workspaceId) { void workspaceId; throw unsupported(this.providerId, "listMembers"); }
   createInvite(input) { void input; throw unsupported(this.providerId, "createInvite"); }
   acceptInvite(input) { void input; throw unsupported(this.providerId, "acceptInvite"); }

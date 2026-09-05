@@ -1,8 +1,11 @@
+import { decodeWorkspaceDocument } from "./workspace-document.js";
+
 const driveScope = "https://www.googleapis.com/auth/drive.file";
 const driveBase = "https://www.googleapis.com/drive/v3/files";
 const driveUploadBase = "https://www.googleapis.com/upload/drive/v3/files";
 const driveFileFields = "id,name,version,modifiedTime,md5Checksum";
 const fingerprintFields = ["id", "version", "modifiedTime", "md5Checksum"];
+const preparedDeletions = new WeakMap();
 
 export class DriveConflictError extends Error {
   constructor(kind, remote) {
@@ -121,9 +124,17 @@ export async function requestDriveAccessToken(clientId, doc = document) {
     const tokenClient = globalThis.google.accounts.oauth2.initTokenClient({
       client_id: clientId,
       scope: driveScope,
-      callback: (response) => {
+      callback: (response = {}) => {
         if (response.error) reject(new Error(response.error_description || response.error));
+        else if (!response.access_token) reject(new Error("Google did not return a Drive connection. Try connecting again."));
         else resolve(response.access_token);
+      },
+      error_callback: (error = {}) => {
+        reject(new Error(error.type === "popup_closed"
+          ? "The Google connection window was closed. No connection was made."
+          : error.type === "popup_failed_to_open"
+            ? "The Google connection window could not open. Allow popups for PM OS and try again."
+            : "The Google connection could not be completed. Try connecting again."));
       }
     });
     tokenClient.requestAccessToken({ prompt: "consent" });
@@ -190,6 +201,72 @@ export async function saveDriveConflictCopy(source, accessToken, content, now = 
   const fileName = buildConflictCopyName(source.fileName, now);
   const file = await uploadDriveFile(folderId, fileName, "", content, accessToken, fetchImpl);
   return { file, fileName };
+}
+
+export function driveWorkspaceFileId(value) {
+  const text = String(value || "").trim();
+  if (/^[A-Za-z0-9_-]+$/.test(text)) return text;
+  try {
+    const url = new URL(text);
+    if (url.protocol !== "https:" || url.hostname !== "drive.google.com" || url.username || url.password) throw new Error();
+    const id = url.pathname.match(/^\/file\/d\/([A-Za-z0-9_-]+)(?:\/|$)/)?.[1]
+      || (url.pathname === "/open" ? url.searchParams.get("id") : "");
+    if (/^[A-Za-z0-9_-]+$/.test(id || "")) return id;
+  } catch { /* Surface one actionable input error without following the supplied URL. */ }
+  throw new Error("Enter a Google Drive file link or file ID.");
+}
+
+/** Prepare only a stable, valid portable workspace whose backup download has started. */
+export async function prepareDriveWorkspaceDeletion(source, accessToken, { projectName, startBackup } = {}, fetchImpl = fetch) {
+  const fileId = String(source?.fileId || "").trim();
+  const name = String(projectName || "").trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(fileId) || !name || typeof startBackup !== "function") throw new Error("Drive deletion requires a saved file ID, project name, and backup download.");
+  const workspace = await readDriveWorkspace({ fileId }, accessToken, fetchImpl);
+  if (workspace.file.id !== fileId) throw new DriveConflictError("unknown", workspace.file);
+  const parsed = JSON.parse(workspace.content);
+  if (!/^pm-os\.workspace\.v\d+$/.test(parsed?.schema || "")) throw new Error("The Drive file is not a portable PM OS workspace.");
+  decodeWorkspaceDocument(parsed);
+  if (await startBackup(workspace.content, name) !== true) throw new Error("Start the workspace backup download before deleting its Drive file.");
+  const ticket = Object.freeze({ fileId, projectName: name, remote: Object.freeze(driveFileFingerprint(workspace.file)) });
+  preparedDeletions.set(ticket, { attempted: false, inFlight: false, deleted: false });
+  return ticket;
+}
+
+/** Reinspect the backed-up version immediately before deleting that exact file. */
+export async function deletePreparedDriveWorkspace(ticket, accessToken, confirmedName, fetchImpl = fetch) {
+  const prepared = preparedDeletions.get(ticket);
+  if (!prepared) throw new Error("Prepare a fresh Drive workspace backup before deleting.");
+  if (confirmedName !== ticket.projectName) throw new Error("Type the exact project name to delete its Drive file.");
+  if (prepared.inFlight) throw new Error("This Drive deletion is already in progress.");
+  if (prepared.deleted) return { deleted: true, fileId: ticket.fileId };
+  prepared.inFlight = true;
+  const finish = () => {
+    prepared.deleted = true;
+    return { deleted: true, fileId: ticket.fileId };
+  };
+  try {
+    const current = await getFile(ticket.fileId, accessToken, fetchImpl);
+    if (!current && prepared.attempted) return finish();
+    const comparison = compareDriveFingerprints(ticket.remote, current);
+    if (comparison !== "match") throw new DriveConflictError(comparison, current);
+    prepared.attempted = true;
+    let response;
+    try {
+      response = await fetchImpl(`${driveBase}/${encodeURIComponent(ticket.fileId)}`, {
+        method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` }
+      });
+    } catch (error) {
+      if (!await getFile(ticket.fileId, accessToken, fetchImpl)) return finish();
+      throw error;
+    }
+    if (response.ok) return finish();
+    // A lost response or concurrent deletion is complete only after a confirming read.
+    if ((response.status === 404 || response.status >= 500) && !await getFile(ticket.fileId, accessToken, fetchImpl)) return finish();
+    if (response.status < 500 && response.status !== 404) prepared.attempted = false;
+    throw new Error(`Drive deletion failed with ${response.status}. The archived project was retained.`);
+  } finally {
+    prepared.inFlight = false;
+  }
 }
 
 async function uploadDriveFile(folderId, fileName, fileId, content, accessToken, fetchImpl) {

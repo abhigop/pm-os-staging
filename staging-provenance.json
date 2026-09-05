@@ -1,7 +1,7 @@
 {
   "schema": "pm-os.github-staging.v1",
-  "sourceCommit": "5d8f6d0ba84594e4aeef038d7b5387ab0f0f65fb",
-  "artifactHash": "a27efba075dd32dbc942d2984e1addf86c60b5218470e961169a251e3f75df30",
+  "sourceCommit": "1f0e1183b89c77940dabae276dc02914a0dcc15c",
+  "artifactHash": "24ca625e666a6129a6e1292083328776218a1cb57153d4c4896f16dbb23a6a45",
   "hashAlgorithm": "sha256",
   "artifactHashInput": "JSON.stringify(files); provenance excluded",
   "basePath": "/pm-os-staging/",
@@ -40,8 +40,8 @@
     },
     {
       "path": "src/app.js",
-      "sha256": "404ee3f22afc1f0845ca0d22d129c595dee2c47cb1db741c99fcfc445b8518c8",
-      "bytes": 604230
+      "sha256": "0472fd9c811cb7c116918c5584a557f62dbf2cd2fd24f3734cc3afc35639ddb4",
+      "bytes": 665931
     },
     {
       "path": "src/backups.js",
@@ -65,13 +65,13 @@
     },
     {
       "path": "src/domain.js",
-      "sha256": "901970a5880509d05477b49b6950f62dd73e595a9e4117eb50d41b65caa08288",
-      "bytes": 145401
+      "sha256": "721a748f44f69b0bdfdf2b3c0fa1ae7cc77a08facc4e687c2aa907751e83ce18",
+      "bytes": 145787
     },
     {
       "path": "src/drive.js",
-      "sha256": "c8fb6823f01b13c21171ef01ea631f1d404cb58592a61c861074dd588b090b79",
-      "bytes": 14656
+      "sha256": "7ed25e65d99ea85560c55d53c7135dc8613c597e541c70a1ab141a7dfdc7b81f",
+      "bytes": 19251
     },
     {
       "path": "src/experience.js",
@@ -85,8 +85,8 @@
     },
     {
       "path": "src/linked-workspace-file.js",
-      "sha256": "c11bde1c758891f166b941ed04d9329e86401d134ad99b5a9e546ab8f843573b",
-      "bytes": 5492
+      "sha256": "ab55411f7c57603188c974b58d2b4880dc9687aff1866297df3ef085d7393a3f",
+      "bytes": 5584
     },
     {
       "path": "src/organization.js",
@@ -105,13 +105,18 @@
     },
     {
       "path": "src/project-switcher.js",
-      "sha256": "f65d3a978c1c1dcf96731f9e226617fdc3239a3ca18dd213a6c2c1055d9ea195",
-      "bytes": 16245
+      "sha256": "67680cf58d3801618a4c188ee54b8d848aa0f518bd3028f62a14a0986a937595",
+      "bytes": 26677
     },
     {
       "path": "src/projects.js",
-      "sha256": "8008e8b94e1e9d21a382af56dcea2452cf918f387e0f0d0f2575df09d563f290",
-      "bytes": 15054
+      "sha256": "fc840c4699b11b6001f2e5136b5147e74a31327748d3e1f5ba67e025a42fc8fc",
+      "bytes": 18259
+    },
+    {
+      "path": "src/server-connectors.js",
+      "sha256": "453327bb66b3921780e88aeb3ab5f6c23b21e43a8618a10806221efd3b01c9e8",
+      "bytes": 11267
     },
     {
       "path": "src/service-worker-update.js",
@@ -130,23 +135,23 @@
     },
     {
       "path": "src/styles.css",
-      "sha256": "46055555836d8259fbee7200e0b696f7eb943b6b4d046f8ec96ca990dc39f747",
-      "bytes": 168013
+      "sha256": "542e2c9d76fb1e8aaba199b31addcc2ae43ea92567f66926029543a41edf876d",
+      "bytes": 169185
     },
     {
       "path": "src/supabase-client-loader.js",
-      "sha256": "54d66ecc92af689809cf250b64de82d88481e698e1a2c9a255d1e2f8be36f161",
-      "bytes": 8498
+      "sha256": "34d5e04834c218fe86c5679d42fb973f65a73d30a808deb9e42d1b80a7918235",
+      "bytes": 9105
     },
     {
       "path": "src/supabase-team-client.js",
-      "sha256": "4d8d7e3cdaec3a180222897dde7e0e6b92c45d58496352eab7a118bede426add",
-      "bytes": 20628
+      "sha256": "58443a6972a1cd607ee40264f8d5795accc0d9ff5a35e3f664d1a73963fc274a",
+      "bytes": 21133
     },
     {
       "path": "src/supabase-workspace-repository.js",
-      "sha256": "eb1989adf2077ac0390c881752bbb4b4dc649cd7f618d56f63dde8c86587f29c",
-      "bytes": 66244
+      "sha256": "bf8d2d0d7487544be4b045255dd43dc81f50f754dd8f3486f2a35b716efe22d3",
+      "bytes": 69431
     },
     {
       "path": "src/tutorial.js",
@@ -165,8 +170,8 @@
     },
     {
       "path": "src/workspace-contract.js",
-      "sha256": "f32a3a61b79890d938d90acbd14d6cd04798ac4fe4ee46f67b4432b08c4e16b0",
-      "bytes": 13043
+      "sha256": "5fb331bb78d000b71882dd7feebb691e8395fa2576d76ba2f73f0088cc052b6f",
+      "bytes": 13237
     },
     {
       "path": "src/workspace-document.js",
@@ -180,8 +185,8 @@
     },
     {
       "path": "sw.js",
-      "sha256": "9bd62df6ac7288a8894c8026368d32609751c9c0f8067c673def93f2061c434a",
-      "bytes": 3162
+      "sha256": "be305893df8e70b0283c57c45110f4b936c56cbc2330d13f1b325fb60ba6920d",
+      "bytes": 3195
     },
     {
       "path": "vendor/supabase-2.110.0.js",

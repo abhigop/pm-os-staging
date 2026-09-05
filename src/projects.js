@@ -12,7 +12,9 @@ export const LEGACY_PROJECT_KEYS = Object.freeze({
   backups: "pm-os-staging.backups.v1"
 });
 
-const providers = new Set(["browser", "local-file", "google-drive"]);
+const providers = new Set(["browser", "local-file", "google-drive", "server"]);
+const serverRoles = new Set(["owner", "editor", "viewer"]);
+const serverStatuses = new Set(["available", "sign-in-required"]);
 const secondaryLegacyKeys = Object.freeze({ source: "pm-os-staging.source.v1", sync: "pm-os-staging.sync.v1" });
 const spaces = new Set(["today", "initiatives", "insights", "planning", "delivery", "briefings", "team", "settings"]);
 const projectIdPattern = /^[a-z0-9][a-z0-9-]{0,79}$/;
@@ -30,9 +32,19 @@ export function projectKeys(projectId) {
 }
 
 export function normalizeProjectLocation(input = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) input = {};
   const space = spaces.has(input.space) ? input.space : "today";
   const mode = String(input.mode || "").trim().replace(/[^a-z0-9-]/g, "").slice(0, 48);
-  return Object.freeze({ space, mode });
+  const location = { space, mode };
+  if (["all", "unscheduled", "sprint", "month", "quarter", "year"].includes(input.period)) location.period = input.period;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(input.periodStart || "")) location.periodStart = input.periodStart;
+  if (["accounts", "segments", "fields"].includes(input.customerView)) location.customerView = input.customerView;
+  if (["risks", "dependencies"].includes(input.section)) location.section = input.section;
+  for (const key of ["boardTeam", "boardStage", "customerId", "segmentId", "initiative", "record", "insightId", "insightStatus", "orgUnitId", "personId", "specId"]) {
+    const value = typeof input[key] === "string" ? input[key] : "";
+    if (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(value)) location[key] = value;
+  }
+  return Object.freeze(location);
 }
 
 export function normalizeProjectRegistry(input) {
@@ -162,6 +174,25 @@ export function renameProject(storage, registry, projectId, name, { now = () => 
   return next;
 }
 
+export function updateProjectMetadata(storage, registry, projectId, patch = {}, { now = () => new Date().toISOString() } = {}) {
+  registry = currentRegistryForMutation(storage, registry);
+  const target = projectById(registry, projectId);
+  if (!target) throw new Error("That project is not available.");
+  const allowed = new Set(["name", "serverRole", "serverRevision", "serverStatus", "location", "lastOpenedAt"]);
+  if (Object.keys(patch).some((key) => !allowed.has(key))) throw new Error("The project metadata update is invalid.");
+  const updated = normalizeProject({ ...target, ...patch, updatedAt: now() });
+  if (!updated) throw new Error("The project metadata update is invalid.");
+  const projects = registry.projects.map((entry) => entry.id === target.id ? updated : entry);
+  const next = normalizeProjectRegistry({ ...registry, projects });
+  persistRegistry(storage, next);
+  return next;
+}
+
+export function projectsForConnector(registry, connectorId) {
+  const id = String(connectorId || "").trim().toLowerCase();
+  return Object.freeze((registry?.projects || []).filter((entry) => entry.provider === "server" && entry.connectorId === id));
+}
+
 export function setProjectArchived(storage, registry, projectId, archived, { now = () => new Date().toISOString() } = {}) {
   registry = currentRegistryForMutation(storage, registry);
   const target = projectById(registry, projectId);
@@ -218,7 +249,7 @@ export function readProjectBundle(storage, projectId) {
 }
 
 export function projectProviderLabel(provider) {
-  return ({ browser: "Browser", "local-file": "Linked file", "google-drive": "Google Drive" })[provider] || "Browser";
+  return ({ browser: "Browser", "local-file": "Linked file", "google-drive": "Google Drive", server: "Server" })[provider] || "Browser";
 }
 
 export function normalizeProjectName(value) {
@@ -233,10 +264,21 @@ function normalizeProject(input) {
   let name;
   try { id = normalizeProjectId(input.id); name = normalizeProjectName(input.name); }
   catch { return null; }
+  const provider = normalizeProvider(input.provider);
+  const connectorId = provider === "server" ? normalizeOptionalReference(input.connectorId) : "";
+  const workspaceId = provider === "server" ? normalizeOptionalReference(input.workspaceId, 160) : "";
+  if (provider === "server" && (!connectorId || !workspaceId)) return null;
   return Object.freeze({
     id,
     name,
-    provider: normalizeProvider(input.provider),
+    provider,
+    ...(provider === "server" ? {
+      connectorId,
+      workspaceId,
+      serverRole: serverRoles.has(input.serverRole) ? input.serverRole : "viewer",
+      serverRevision: Number.isSafeInteger(Number(input.serverRevision)) && Number(input.serverRevision) >= 0 ? Number(input.serverRevision) : 0,
+      serverStatus: serverStatuses.has(input.serverStatus) ? input.serverStatus : "available"
+    } : {}),
     createdAt: safeTimestamp(input.createdAt) || new Date(0).toISOString(),
     updatedAt: safeTimestamp(input.updatedAt) || safeTimestamp(input.createdAt) || new Date(0).toISOString(),
     lastOpenedAt: safeTimestamp(input.lastOpenedAt),
@@ -277,6 +319,11 @@ function normalizeProjectId(value) {
   const id = String(value || "").trim().toLowerCase();
   if (!projectIdPattern.test(id)) throw new Error("The project identifier is invalid.");
   return id;
+}
+
+function normalizeOptionalReference(value, maxLength = 80) {
+  const reference = String(value || "").trim().toLowerCase();
+  return reference && reference.length <= maxLength && /^[a-z0-9][a-z0-9:_-]*$/i.test(reference) ? reference : "";
 }
 
 function safeTimestamp(value) {
