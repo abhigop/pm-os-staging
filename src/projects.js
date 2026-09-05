@@ -118,7 +118,7 @@ export function projectById(registry, projectId) {
 }
 
 export function createProject(storage, registry, input, bundle = {}, { now = () => new Date().toISOString(), idFactory = defaultProjectId } = {}) {
-  requirePersistentRegistry(registry);
+  registry = currentRegistryForMutation(storage, registry);
   const timestamp = now();
   const id = normalizeProjectId(input.id || idFactory());
   if (projectById(registry, id)) throw new Error("A project with that identifier already exists.");
@@ -137,6 +137,7 @@ export function createProject(storage, registry, input, bundle = {}, { now = () 
 }
 
 export function activateProject(storage, registry, projectId, previousLocation, { now = () => new Date().toISOString() } = {}) {
+  registry = currentRegistryForMutation(storage, registry);
   const target = projectById(registry, projectId);
   if (!target || target.archivedAt) throw new Error("That project is not available.");
   const timestamp = now();
@@ -151,9 +152,10 @@ export function activateProject(storage, registry, projectId, previousLocation, 
 }
 
 export function renameProject(storage, registry, projectId, name, { now = () => new Date().toISOString() } = {}) {
+  registry = currentRegistryForMutation(storage, registry);
   const normalizedName = normalizeProjectName(name);
   const target = projectById(registry, projectId);
-  if (!target) throw new Error("That project is not available.");
+  if (!target || target.archivedAt) throw new Error("That project is not available.");
   const projects = registry.projects.map((entry) => entry.id === target.id ? normalizeProject({ ...entry, name: normalizedName, updatedAt: now() }) : entry);
   const next = normalizeProjectRegistry({ ...registry, projects });
   persistRegistry(storage, next);
@@ -161,8 +163,9 @@ export function renameProject(storage, registry, projectId, name, { now = () => 
 }
 
 export function setProjectArchived(storage, registry, projectId, archived, { now = () => new Date().toISOString() } = {}) {
+  registry = currentRegistryForMutation(storage, registry);
   const target = projectById(registry, projectId);
-  if (!target) throw new Error("That project is not available.");
+  if (!target || (archived && target.archivedAt)) throw new Error("That project is not available.");
   if (archived && target.id === registry.activeProjectId) throw new Error("Switch projects before archiving the current project.");
   const timestamp = now();
   const projects = registry.projects.map((entry) => entry.id === target.id
@@ -174,6 +177,7 @@ export function setProjectArchived(storage, registry, projectId, archived, { now
 }
 
 export function forgetProject(storage, registry, projectId) {
+  registry = currentRegistryForMutation(storage, registry);
   const target = projectById(registry, projectId);
   if (!target?.archivedAt) throw new Error("Archive the project before forgetting its local data.");
   if (target.id === registry.activeProjectId) throw new Error("The current project cannot be forgotten.");
@@ -188,6 +192,7 @@ export function forgetProject(storage, registry, projectId) {
 }
 
 export function updateActiveProjectProvider(storage, registry, provider, { now = () => new Date().toISOString() } = {}) {
+  registry = currentRegistryForMutation(storage, registry);
   const normalizedProvider = normalizeProvider(provider);
   const projects = registry.projects.map((entry) => entry.id === registry.activeProjectId
     ? normalizeProject({ ...entry, provider: normalizedProvider, updatedAt: now() })
@@ -198,6 +203,7 @@ export function updateActiveProjectProvider(storage, registry, provider, { now =
 }
 
 export function updateActiveProjectLocation(storage, registry, location, { now = () => new Date().toISOString() } = {}) {
+  registry = currentRegistryForMutation(storage, registry);
   const projects = registry.projects.map((entry) => entry.id === registry.activeProjectId
     ? normalizeProject({ ...entry, location: normalizeProjectLocation(location), updatedAt: now() })
     : entry);
@@ -288,6 +294,26 @@ function defaultProjectId() {
   return `project-${random}`.slice(0, 80);
 }
 
-function requirePersistentRegistry(registry) {
-  if (!normalizeProjectRegistry(registry)) throw new Error("The project catalog is unavailable.");
+function currentRegistryForMutation(storage, callerRegistry) {
+  // Rebase sequential stale-tab operations on the latest catalog. This is not a
+  // cross-tab lock: localStorage offers no atomic read-modify-write transaction.
+  let current;
+  try {
+    const stored = JSON.parse(storage.getItem(PROJECT_REGISTRY_KEY));
+    current = normalizeProjectRegistry(stored);
+    if (!current || current.projects.length !== stored.projects.length
+      || !stored.projects.some((entry) => entry.id === stored.activeProjectId && !entry.archivedAt)) {
+      throw new Error("INVALID_PROJECT_REGISTRY");
+    }
+  } catch {
+    throw new Error("The project catalog is unavailable or unreadable. Reload before changing projects.");
+  }
+  // The persisted active project belongs to the most recent writer. Returning
+  // it would relabel this tab while its workspace storage keys still point at
+  // the caller's project, so retain the caller's context until an explicit switch.
+  const callerActive = projectById(current, callerRegistry?.activeProjectId);
+  if (!callerActive || callerActive.archivedAt) {
+    throw new Error("The current project is no longer available. Reload before changing projects.");
+  }
+  return normalizeProjectRegistry({ ...current, activeProjectId: callerActive.id });
 }

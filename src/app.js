@@ -4489,10 +4489,11 @@ async function copyDraft(button, draftId) {
   const liveRegion = document.querySelector(draftId === "executiveBriefMemoDraft" ? "#executiveBriefCopyStatus" : "#copyStatus");
   if (!button || !draft || !liveRegion) return;
   const originalLabel = button.textContent;
+  const copiedWorkspace = state.items;
   try {
     if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
     await navigator.clipboard.writeText(draft.value);
-    if (draftId === "weeklyUpdateDraft") {
+    if (draftId === "weeklyUpdateDraft" && state.items === copiedWorkspace) {
       state.weeklyUpdateCopied = true;
       const step = document.querySelector("#checklistCopyUpdate")?.closest("li");
       step?.classList.add("complete");
@@ -7810,6 +7811,7 @@ function downloadBeforeClearBackup() {
 }
 
 function resetWorkspaceUiState() {
+  state.weeklyUpdateCopied = false;
   state.query = "";
   state.periodSelection = normalizePeriodSelection({ kind: "all" }, state.planningCalendar);
   state.periodAnnouncement = "";
@@ -8332,7 +8334,6 @@ function emptyState(text) { return `<p class="empty">${text}</p>`; }
 function todayStamp() { return new Date().toISOString().slice(0, 10); }
 function cssEscape(value) { return globalThis.CSS?.escape ? globalThis.CSS.escape(String(value)) : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&"); }
 function escapeHtml(value) { return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;"); }
-
 
 
 

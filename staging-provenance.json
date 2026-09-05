@@ -1,7 +1,7 @@
 {
   "schema": "pm-os.github-staging.v1",
-  "sourceCommit": "b3431b7ec93402df043c1bcc0a2784c77ca6edcb",
-  "artifactHash": "7e326c9aa1cc487956b7c21107e091df66ff3e22e66df5b1ec7a0fe0b893a6c8",
+  "sourceCommit": "5d8f6d0ba84594e4aeef038d7b5387ab0f0f65fb",
+  "artifactHash": "a27efba075dd32dbc942d2984e1addf86c60b5218470e961169a251e3f75df30",
   "hashAlgorithm": "sha256",
   "artifactHashInput": "JSON.stringify(files); provenance excluded",
   "basePath": "/pm-os-staging/",
@@ -40,8 +40,8 @@
     },
     {
       "path": "src/app.js",
-      "sha256": "0cc23537785ec1edb04f750949de31f5b9c269ff9f48dbc971df1ca340c1a1c0",
-      "bytes": 604121
+      "sha256": "404ee3f22afc1f0845ca0d22d129c595dee2c47cb1db741c99fcfc445b8518c8",
+      "bytes": 604230
     },
     {
       "path": "src/backups.js",
@@ -110,8 +110,8 @@
     },
     {
       "path": "src/projects.js",
-      "sha256": "533904e7f94b24557fbd609cc0b3410b10ea6eb5e5d13991abeb9542b10e705a",
-      "bytes": 13496
+      "sha256": "8008e8b94e1e9d21a382af56dcea2452cf918f387e0f0d0f2575df09d563f290",
+      "bytes": 15054
     },
     {
       "path": "src/service-worker-update.js",
@@ -180,7 +180,7 @@
     },
     {
       "path": "sw.js",
-      "sha256": "5ff9d581050842719280bfb6cef963d89d6048c0c55e3cd491f359fc7c7c0e48",
+      "sha256": "9bd62df6ac7288a8894c8026368d32609751c9c0f8067c673def93f2061c434a",
       "bytes": 3162
     },
     {
