@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="PM OS">
+  <rect width="128" height="128" rx="24" fill="#10222e"/>
+  <path d="M27 35h74v12H27zM27 58h50v12H27zM27 81h64v12H27z" fill="#7fd2d9"/>
+  <circle cx="96" cy="64" r="14" fill="#4e7a32"/>
+</svg>

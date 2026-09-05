@@ -1,0 +1,192 @@
+{
+  "schema": "pm-os.github-staging.v1",
+  "sourceCommit": "23f882afd427599b9675d01a8b6188df9250a383",
+  "artifactHash": "7e326c9aa1cc487956b7c21107e091df66ff3e22e66df5b1ec7a0fe0b893a6c8",
+  "hashAlgorithm": "sha256",
+  "artifactHashInput": "JSON.stringify(files); provenance excluded",
+  "basePath": "/pm-os-staging/",
+  "storagePrefix": "pm-os-staging.",
+  "indexedDbName": "pm-os-staging-linked-file",
+  "files": [
+    {
+      "path": ".nojekyll",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "c827ecf076db5651246b79dde38eb839775b8dcf94b390dd517a1f1a8fece252",
+      "bytes": 1096
+    },
+    {
+      "path": "icons/icon.svg",
+      "sha256": "ece1c4449150ca392102d8b7982e212dafdc200849a46efa0fdff97149028f00",
+      "bytes": 291
+    },
+    {
+      "path": "index.html",
+      "sha256": "92e076617cc38392c65a839a04193f688667ed6d59525cf54484c0c1a0618c54",
+      "bytes": 1107
+    },
+    {
+      "path": "manifest.webmanifest",
+      "sha256": "1ade4806308f75167fb859cefc087a1e0f2bc8b962ffa2a2262db145de4d79d2",
+      "bytes": 355
+    },
+    {
+      "path": "runtime-config.js",
+      "sha256": "7e317ce6ffb71fc693166ec2fafbfaf2d6cdcf4f109c29f5fd215c762726d4a0",
+      "bytes": 73
+    },
+    {
+      "path": "src/app.js",
+      "sha256": "0cc23537785ec1edb04f750949de31f5b9c269ff9f48dbc971df1ca340c1a1c0",
+      "bytes": 604121
+    },
+    {
+      "path": "src/backups.js",
+      "sha256": "b42363a1b3cc3db2f217ba0275861d87014637ff85ae3e63a85ba8e4cf48f738",
+      "bytes": 8063
+    },
+    {
+      "path": "src/customers.js",
+      "sha256": "6a1d4df454e911d312793643de4f2d93de1f2ca000a7deed10d90ddfba33389f",
+      "bytes": 29190
+    },
+    {
+      "path": "src/data.js",
+      "sha256": "f02a61cf2db90ea2c9a2b98086e7f34d4d6f36d96f3f7c630c651c54c61357d7",
+      "bytes": 2933
+    },
+    {
+      "path": "src/demo-customers.js",
+      "sha256": "1950eb9a80df522102a5022051e6a090f92f9d12ad34fa372405fab10558146c",
+      "bytes": 3950
+    },
+    {
+      "path": "src/domain.js",
+      "sha256": "901970a5880509d05477b49b6950f62dd73e595a9e4117eb50d41b65caa08288",
+      "bytes": 145401
+    },
+    {
+      "path": "src/drive.js",
+      "sha256": "c8fb6823f01b13c21171ef01ea631f1d404cb58592a61c861074dd588b090b79",
+      "bytes": 14656
+    },
+    {
+      "path": "src/experience.js",
+      "sha256": "5958c86109fdb7cffcbe47a61bc9e2a080ce3059712c062511c0a692490cadb1",
+      "bytes": 7619
+    },
+    {
+      "path": "src/insights.js",
+      "sha256": "595c4c2d020733402cf2761286c1d8ebaf9cd0d7e81681c495bab8e73805605c",
+      "bytes": 22344
+    },
+    {
+      "path": "src/linked-workspace-file.js",
+      "sha256": "c11bde1c758891f166b941ed04d9329e86401d134ad99b5a9e546ab8f843573b",
+      "bytes": 5492
+    },
+    {
+      "path": "src/organization.js",
+      "sha256": "961f7dedff55fa008f3519f8c749e3a6af85fba4a4b71c77f222bbf5920883f0",
+      "bytes": 16235
+    },
+    {
+      "path": "src/planning-calendar.js",
+      "sha256": "7ff2f7966dc255454bcca59cdc273ccd66952ae0f09ee5415e50529010a00841",
+      "bytes": 12561
+    },
+    {
+      "path": "src/prioritization.js",
+      "sha256": "a6f570a510d88a0d60b57ee37684de39b6b6660854ba15b0f65bd08d54a43740",
+      "bytes": 30056
+    },
+    {
+      "path": "src/project-switcher.js",
+      "sha256": "f65d3a978c1c1dcf96731f9e226617fdc3239a3ca18dd213a6c2c1055d9ea195",
+      "bytes": 16245
+    },
+    {
+      "path": "src/projects.js",
+      "sha256": "533904e7f94b24557fbd609cc0b3410b10ea6eb5e5d13991abeb9542b10e705a",
+      "bytes": 13496
+    },
+    {
+      "path": "src/service-worker-update.js",
+      "sha256": "d1761966c5855c0825b292ad74f192e70f9fefcb8ee35d2b2503235e19d17816",
+      "bytes": 7562
+    },
+    {
+      "path": "src/source-config.js",
+      "sha256": "6bbd2191d16481e344991c8a7f387720ab884111e1ceee6e64558bcc3c6f1402",
+      "bytes": 4510
+    },
+    {
+      "path": "src/storage.js",
+      "sha256": "4a84f173c3bcfb4ec28c422b4c6cb41a6036eecd1761fa54e9b4e4fbd06e65ed",
+      "bytes": 1052
+    },
+    {
+      "path": "src/styles.css",
+      "sha256": "46055555836d8259fbee7200e0b696f7eb943b6b4d046f8ec96ca990dc39f747",
+      "bytes": 168013
+    },
+    {
+      "path": "src/supabase-client-loader.js",
+      "sha256": "54d66ecc92af689809cf250b64de82d88481e698e1a2c9a255d1e2f8be36f161",
+      "bytes": 8498
+    },
+    {
+      "path": "src/supabase-team-client.js",
+      "sha256": "4d8d7e3cdaec3a180222897dde7e0e6b92c45d58496352eab7a118bede426add",
+      "bytes": 20628
+    },
+    {
+      "path": "src/supabase-workspace-repository.js",
+      "sha256": "eb1989adf2077ac0390c881752bbb4b4dc649cd7f618d56f63dde8c86587f29c",
+      "bytes": 66244
+    },
+    {
+      "path": "src/tutorial.js",
+      "sha256": "d2dfa7b67e914d1f3d255eaab71db24cbde0c3e8b539a2029f65a22f60642a86",
+      "bytes": 18232
+    },
+    {
+      "path": "src/view-policy.js",
+      "sha256": "62a828990633ca80cf84e77f7f964067e42a4dc5502a0bd4421f6ea7f71bf8e6",
+      "bytes": 4401
+    },
+    {
+      "path": "src/workflow.js",
+      "sha256": "240a89279c4698a13623656fe5d1a2bd7d923c7047c84182e3713d202cfa85ab",
+      "bytes": 7628
+    },
+    {
+      "path": "src/workspace-contract.js",
+      "sha256": "f32a3a61b79890d938d90acbd14d6cd04798ac4fe4ee46f67b4432b08c4e16b0",
+      "bytes": 13043
+    },
+    {
+      "path": "src/workspace-document.js",
+      "sha256": "350c8cc0e7ce8e1e67bef66430bf9a4aafd94e9f08cbb82fdf551362a007bd4b",
+      "bytes": 41983
+    },
+    {
+      "path": "src/workspace-merge.js",
+      "sha256": "d425d379c5d143d835cdc34c611c691cd24f2516eb0dd705cb680674ba192645",
+      "bytes": 5750
+    },
+    {
+      "path": "sw.js",
+      "sha256": "5ff9d581050842719280bfb6cef963d89d6048c0c55e3cd491f359fc7c7c0e48",
+      "bytes": 3162
+    },
+    {
+      "path": "vendor/supabase-2.110.0.js",
+      "sha256": "72d116ce075dfa5099a7bdd63cb8a9b9d5ed38a2333337e7514191649ecdb98f",
+      "bytes": 205896
+    }
+  ]
+}
