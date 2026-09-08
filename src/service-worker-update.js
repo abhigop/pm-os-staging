@@ -1,13 +1,20 @@
 const noticeId = "pm-os-update-notice";
 const noticeStyleId = "pm-os-update-notice-styles";
 const updateMessage = Object.freeze({ type: "SKIP_WAITING" });
+const deferredKey = "pm-os-staging.update-deferred.v1";
+let currentUpdateState = { available: false, busy: false };
+
+export function serviceWorkerUpdateSettingsMarkup(state = currentUpdateState) {
+  if (!state.available) return "";
+  return `<section class="panel" aria-labelledby="settingsUpdateTitle"><div class="panel-header"><h3 id="settingsUpdateTitle">App update available</h3><button class="secondary" data-app-update type="button" ${state.busy ? "disabled" : ""}>${state.busy ? "Updating…" : "Update and reload"}</button></div><p>Save any open form before updating. Updating reloads this page; saved project data stays intact.</p><p role="status">${state.busy ? "Applying the update…" : "You can keep working and update when you are ready."}</p></section>`;
+}
 
 function noticeMarkup() {
   return `
     <section id="${noticeId}" class="pm-os-update-notice" role="region" aria-labelledby="pm-os-update-title" aria-describedby="pm-os-update-description" hidden>
       <div class="pm-os-update-copy">
         <strong id="pm-os-update-title">Update available</strong>
-        <p id="pm-os-update-description">A newer version of PM OS is ready. Updating reloads this page, so unsaved form entries will be lost. If a Team workspace is open, PM OS will return to the saved Browser or Drive workspace after reload.</p>
+        <p id="pm-os-update-description">A newer version of PM OS is ready. Updating reloads this page, so unsaved form entries will be lost. Save any open form first. Choose Later to keep working; the update will remain available in Settings.</p>
         <p id="pm-os-update-status" class="pm-os-update-status" role="status" aria-live="polite" aria-atomic="true">PM OS will not reload until you choose to update.</p>
       </div>
       <div class="pm-os-update-actions">
@@ -90,10 +97,24 @@ export function createServiceWorkerUpdateCoordinator({
   let registration = null;
   let reloadRequested = false;
   let activated = false;
+  let available = false;
+  let deferred = false;
+  let session = null;
+  try {
+    session = rootDocument?.defaultView?.sessionStorage;
+    deferred = session?.getItem(deferredKey) === "1";
+  } catch { /* In-memory dismissal still works when storage is unavailable. */ }
   const notice = ensureNotice(rootDocument);
   const laterButton = rootDocument?.getElementById("pm-os-update-later");
   const reloadButton = rootDocument?.getElementById("pm-os-update-reload");
   const status = rootDocument?.getElementById("pm-os-update-status");
+
+  function publish() {
+    const state = { available, busy: reloadRequested };
+    if (rootDocument === globalThis.document) currentUpdateState = state;
+    const slot = rootDocument?.getElementById("pm-os-update-settings");
+    if (slot) slot.innerHTML = serviceWorkerUpdateSettingsMarkup(state);
+  }
 
   function setBusy(isBusy) {
     if (laterButton) laterButton.disabled = isBusy;
@@ -102,8 +123,10 @@ export function createServiceWorkerUpdateCoordinator({
 
   function show(nextRegistration) {
     registration = nextRegistration || registration;
+    available = true;
+    publish();
     if (!notice) return;
-    notice.hidden = false;
+    notice.hidden = deferred;
     if (!reloadRequested && status) {
       status.textContent = activated
         ? "The update is installed and will load when you choose to reload."
@@ -112,13 +135,20 @@ export function createServiceWorkerUpdateCoordinator({
   }
 
   function defer() {
-    if (status) status.textContent = "Update deferred. PM OS will not reload automatically; update when you are ready.";
+    deferred = true;
+    try { session?.setItem(deferredKey, "1"); } catch { /* Keep dismissal in memory. */ }
+    if (notice) notice.hidden = true;
+    if (status) status.textContent = "Update deferred. You can update from Settings when ready.";
+    if (rootDocument?.activeElement === laterButton) rootDocument.getElementById("viewTitle")?.focus();
+    publish();
   }
 
   function requestReload() {
     if (reloadRequested) return;
     reloadRequested = true;
+    try { session?.removeItem(deferredKey); } catch { /* Updating does not depend on storage. */ }
     setBusy(true);
+    publish();
     if (status) status.textContent = activated ? "Reloading with the update…" : "Applying the update, then reloading…";
     const waiting = registration?.waiting;
     if (waiting) waiting.postMessage(updateMessage);
@@ -136,6 +166,9 @@ export function createServiceWorkerUpdateCoordinator({
 
   laterButton?.addEventListener("click", defer);
   reloadButton?.addEventListener("click", requestReload);
+  rootDocument?.addEventListener("click", (event) => {
+    if (event.target.closest?.("[data-app-update]") && available) requestReload();
+  });
 
   return Object.freeze({ controllerChanged, requestReload, show });
 }

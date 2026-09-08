@@ -1415,6 +1415,8 @@ body:has(dialog[open]) #pm-os-update-notice { display:none !important; }
 .initiative-more-details > .initiative-form-grid { border-top:1px solid var(--line); padding:14px; }
 .simple-initiative-form > .initiative-editor-error { grid-column:1/-1; }
 .simple-today-grid { grid-template-columns:minmax(260px,.75fr) minmax(0,1.25fr); }
+.simple-today-grid > .priority-panel { grid-row:auto; }
+.simple-today-grid > .priority-panel:first-child { grid-column:1/-1; }
 .today-weekly-update { grid-column:1/-1; }
 .today-weekly-update textarea { min-height:180px; }
 .today-checklist { display:grid; gap:10px; margin:0; padding:0; list-style:none; }
@@ -1422,8 +1424,9 @@ body:has(dialog[open]) #pm-os-update-notice { display:none !important; }
 .today-checklist li > span { width:26px; height:26px; display:grid; place-items:center; border:1px solid var(--line); border-radius:50%; color:var(--muted); font-size:.72rem; font-weight:900; }
 .today-checklist li.complete > span { border-color:transparent; color:#fff; background:#20a77b; }
 .today-checklist button { min-height:38px; border:0; padding:0; color:var(--ink); background:transparent; text-align:left; font-weight:750; }
-.simple-item-card { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.simple-item-card { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; }
 .simple-item-card > div { min-width:0; }
+.simple-item-card > div:first-child { flex:1 1 220px; }
 .simple-item-card > .contextual-card-actions { flex-shrink:0; }
 .simple-item-card span { color:var(--muted); font-size:.7rem; font-weight:800; text-transform:uppercase; }
 .simple-item-card h4 { margin:4px 0; }
@@ -1438,6 +1441,7 @@ body:has(dialog[open]) #pm-os-update-notice { display:none !important; }
 
 @media (max-width:800px) {
   .simple-item-card { align-items:flex-start; flex-direction:column; }
+  .simple-item-card > div:first-child { flex:auto; }
   .bundle-grid,.core-capability-grid,.simple-today-grid { grid-template-columns:1fr; }
   .workspace-setup-hero { display:grid; }
 }

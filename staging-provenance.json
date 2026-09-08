@@ -1,7 +1,7 @@
 {
   "schema": "pm-os.github-staging.v1",
-  "sourceCommit": "1f0e1183b89c77940dabae276dc02914a0dcc15c",
-  "artifactHash": "24ca625e666a6129a6e1292083328776218a1cb57153d4c4896f16dbb23a6a45",
+  "sourceCommit": "b12979bd483a482f7db0484b6489854fa522def3",
+  "artifactHash": "3f01eddc1376d5aeb44be2e14d6d750d5a1fd5adcadb39dfd2c850b0b6fd9003",
   "hashAlgorithm": "sha256",
   "artifactHashInput": "JSON.stringify(files); provenance excluded",
   "basePath": "/pm-os-staging/",
@@ -40,8 +40,8 @@
     },
     {
       "path": "src/app.js",
-      "sha256": "0472fd9c811cb7c116918c5584a557f62dbf2cd2fd24f3734cc3afc35639ddb4",
-      "bytes": 665931
+      "sha256": "463fa7c02aaf577430f9506668caccf461493496e97af1af9498f8a967d8edea",
+      "bytes": 667997
     },
     {
       "path": "src/backups.js",
@@ -105,13 +105,13 @@
     },
     {
       "path": "src/project-switcher.js",
-      "sha256": "67680cf58d3801618a4c188ee54b8d848aa0f518bd3028f62a14a0986a937595",
-      "bytes": 26677
+      "sha256": "8f99632b76d24888f6bcad9d2482d1d00732be001fa0480d56386f06b3635468",
+      "bytes": 26572
     },
     {
       "path": "src/projects.js",
-      "sha256": "fc840c4699b11b6001f2e5136b5147e74a31327748d3e1f5ba67e025a42fc8fc",
-      "bytes": 18259
+      "sha256": "4655a229ec594cdc8cbc45923e92eedefb9c8368f1caa8583b6690179bc15733",
+      "bytes": 18624
     },
     {
       "path": "src/server-connectors.js",
@@ -120,8 +120,8 @@
     },
     {
       "path": "src/service-worker-update.js",
-      "sha256": "d1761966c5855c0825b292ad74f192e70f9fefcb8ee35d2b2503235e19d17816",
-      "bytes": 7562
+      "sha256": "d0d34be38284aa791a65d33722820d1c01dd5c5cfcd5e348ba100e216130f2fc",
+      "bytes": 9485
     },
     {
       "path": "src/source-config.js",
@@ -135,8 +135,8 @@
     },
     {
       "path": "src/styles.css",
-      "sha256": "542e2c9d76fb1e8aaba199b31addcc2ae43ea92567f66926029543a41edf876d",
-      "bytes": 169185
+      "sha256": "22124ce310b650c9fdd067ee40569d6d036d204a07b4122637937785034e8b6a",
+      "bytes": 169445
     },
     {
       "path": "src/supabase-client-loader.js",
@@ -185,7 +185,7 @@
     },
     {
       "path": "sw.js",
-      "sha256": "be305893df8e70b0283c57c45110f4b936c56cbc2330d13f1b325fb60ba6920d",
+      "sha256": "4f0fd7e8abead45ba67f2521803257712a6d3fe08109a0baf2256b12f00546d0",
       "bytes": 3195
     },
     {

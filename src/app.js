@@ -1,3 +1,4 @@
+import { serviceWorkerUpdateSettingsMarkup } from "./service-worker-update.js?v=26";
 import {
   CAPACITY_BENCHMARKS,
   buildActionMemo,
@@ -292,6 +293,7 @@ import {
   projectKeys,
   projectsForConnector,
   readProjectBundle,
+  recentProjects,
   renameProject as renameRegistryProject,
   setProjectArchived,
   updateProjectMetadata,
@@ -338,17 +340,7 @@ const initialServerProjectId = !demoMode && registryProjectById(projectRegistry,
 if (initialServerProjectId && activeRegistryProject(projectRegistry)?.provider === "server") {
   let fallback = projectRegistry.projects.find((entry) => !entry.archivedAt && entry.provider !== "server");
   if (!fallback) {
-    const archivedFallback = projectRegistry.projects.find((entry) => entry.archivedAt && entry.provider !== "server");
-    if (archivedFallback) {
-      projectRegistry = setProjectArchived(localStorage, projectRegistry, archivedFallback.id, false);
-      fallback = registryProjectById(projectRegistry, archivedFallback.id);
-    }
-  }
-  if (!fallback) {
-    const empty = encodeWorkspaceDocument(createEmptyWorkspaceDocument());
-    const created = createRegistryProject(localStorage, projectRegistry, {
-      name: "My project", provider: "browser", location: { space: "today", mode: "focus" }
-    }, { workspace: empty, activity: JSON.stringify({ activity: [] }) });
+    const created = createBlankBrowserProject(projectRegistry);
     projectRegistry = created.registry;
     fallback = created.project;
   }
@@ -622,8 +614,8 @@ if (!state.modeChoiceOpen) recordViewUsage(state.selectedView);
 render();
 if (!urlParams.get("project") || urlParams.get("project") === state.projects?.registry.activeProjectId) persistCurrentProjectLocation();
 void restoreLinkedWorkspaceHandle();
-if (state.projects && initialServerProjectId && !registryProjectById(projectRegistry, initialServerProjectId)?.archivedAt) {
-  queueMicrotask(() => { void stageServerProjectSwitch(initialServerProjectId, { replaceUrl: true }); });
+if (state.projects && initialServerProjectId) {
+  queueMicrotask(() => { void restoreViewFromLocation(); });
 } else if (state.projects && urlParams.get("project") && urlParams.get("project") !== state.projects.registry.activeProjectId) {
   queueMicrotask(() => { void restoreViewFromLocation(); });
 }
@@ -814,12 +806,13 @@ function todaySpaceView({ filteredItems, health, followUps }) {
   const priorities = prioritizeItems(filteredItems, state.prioritization).slice(0, 5);
   const weeklyUpdate = simpleWeeklyUpdate(filteredItems);
   const ordered = state.prioritization.manualOrder.length > 0;
+  const showGettingStarted = (state.team.active && !state.team.projectId) || activeRegistryProject(state.projects?.registry)?.onboarding !== "blank";
   return `${spaceModeMarkup([["focus", "Focus"], ["actions", "Actions"]])}
     <section class="welcome-band simple-welcome"><div><p class="eyebrow">${todayStamp()}</p><h3>Move the most important work forward.</h3><p>Capture the work, order priorities, make the next step clear, and share the week.</p></div><div class="focus-score"><span>Workspace health</span><strong>${health.score}</strong></div></section>
     <section class="metrics simple-metrics" aria-label="Workspace health">${metric("Active", health.active)}${metric("No next step", health.noNextStep)}</section>
-    ${!demoMode && !state.team?.active && !state.items.length ? `<section class="panel" aria-labelledby="emptyProjectStartTitle"><div class="panel-header"><div><p class="panel-kicker">Start here</p><h3 id="emptyProjectStartTitle">Choose how to start this project</h3></div></div><p>Create your first initiative below, bring in saved work, or choose the supporting workflows you need. You can change these choices later.</p><div class="data-actions"><button class="secondary" id="startProjectImport" type="button">Import saved work</button><button class="secondary" id="startProjectWorkflows" type="button">Choose workflows</button></div></section>` : ""}
+    ${!demoMode && showGettingStarted && !state.team?.active && !state.items.length ? `<section class="panel" aria-labelledby="emptyProjectStartTitle"><div class="panel-header"><div><p class="panel-kicker">Start here</p><h3 id="emptyProjectStartTitle">Choose how to start this project</h3></div></div><p>Create your first initiative below, bring in saved work, or choose the supporting workflows you need. You can change these choices later.</p><div class="data-actions"><button class="secondary" id="startProjectImport" type="button">Import saved work</button><button class="secondary" id="startProjectWorkflows" type="button">Choose workflows</button></div></section>` : ""}
     <section class="today-grid simple-today-grid">
-      <section class="panel getting-started-card" aria-labelledby="gettingStartedTitle"><div class="panel-header"><div><p class="panel-kicker">First week</p><h3 id="gettingStartedTitle">Get your workspace moving</h3></div><span class="muted" id="gettingStartedProgress">${[state.items.length > 0, ordered, state.weeklyUpdateCopied].filter(Boolean).length} / 3</span></div><ol class="today-checklist"><li class="${state.items.length ? "complete" : ""}"><span>${state.items.length ? "✓" : "1"}</span><button id="checklistCreateInitiative" type="button">Create the first initiative</button></li><li class="${ordered ? "complete" : ""}"><span>${ordered ? "✓" : "2"}</span><button data-jump-space="initiatives" data-jump-mode="priorities" type="button">Order the most important work</button></li><li class="${state.weeklyUpdateCopied ? "complete" : ""}"><span>${state.weeklyUpdateCopied ? "✓" : "3"}</span><button id="checklistCopyUpdate" type="button">Copy the weekly update</button></li></ol></section>
+      ${showGettingStarted ? `<section class="panel getting-started-card" aria-labelledby="gettingStartedTitle"><div class="panel-header"><div><p class="panel-kicker">First week</p><h3 id="gettingStartedTitle">Get your workspace moving</h3></div><span class="muted" id="gettingStartedProgress">${[state.items.length > 0, ordered, state.weeklyUpdateCopied].filter(Boolean).length} / 3</span></div><ol class="today-checklist"><li class="${state.items.length ? "complete" : ""}"><span>${state.items.length ? "✓" : "1"}</span><button id="checklistCreateInitiative" type="button">Create the first initiative</button></li><li class="${ordered ? "complete" : ""}"><span>${ordered ? "✓" : "2"}</span><button data-jump-space="initiatives" data-jump-mode="priorities" type="button">Order the most important work</button></li><li class="${state.weeklyUpdateCopied ? "complete" : ""}"><span>${state.weeklyUpdateCopied ? "✓" : "3"}</span><button id="checklistCopyUpdate" type="button">Copy the weekly update</button></li></ol></section>` : ""}
       <section class="panel priority-panel"><div class="panel-header"><div><p class="panel-kicker">Now</p><h3>Top priorities</h3></div><span class="muted">${priorities.length} in focus</span></div><div class="item-list simple-item-list">${priorities.map(simpleItemCard).join("") || emptyState("Capture your first initiative to start the priority stack.")}</div></section>
       <section class="panel today-weekly-update"><div class="panel-header"><div><p class="panel-kicker">Share</p><h3>Weekly update</h3></div><button class="secondary" id="copyWeeklyUpdateButton" type="button">Copy update</button></div><textarea id="weeklyUpdateDraft" readonly>${escapeHtml(weeklyUpdate)}</textarea></section>
     </section>`;
@@ -1274,7 +1267,7 @@ function briefingsSpaceView({ items }) {
 function settingsSpaceView() {
   const modes = [["setup", "Workspace setup"], ["data", "Data & backup"], ...(experienceHas("custom-workflow") ? [["workflow", "Workflow"]] : []), ...(experienceHas("timeline-planning") ? [["calendar", "Planning calendar"]] : []), ...(experienceHas("advanced-prioritization") ? [["prioritization", "Prioritization"]] : []), ...(experienceHas("activity-history") ? [["activity", "Activity"]] : [])];
   const renderers = { setup: workspaceSetupView, data: dataView, workflow: workflowSettingsView, calendar: planningCalendarView, prioritization: prioritizationSettingsView, activity: activityView };
-  return `${spaceModeMarkup(modes)}${(renderers[state.selectedMode] || workspaceSetupView)()}`;
+  return `${spaceModeMarkup(modes)}<div id="pm-os-update-settings">${serviceWorkerUpdateSettingsMarkup()}</div>${(renderers[state.selectedMode] || workspaceSetupView)()}`;
 }
 
 function simpleItemCard(item) {
@@ -3495,7 +3488,6 @@ function bindProjectSwitcherEvents() {
   document.querySelector("#projectSwitcherButton")?.addEventListener("click", openProjectSwitcher);
   document.querySelector("#mobileProjectSwitcherButton")?.addEventListener("click", openProjectSwitcher);
   document.querySelector("#closeProjectSwitcherButton")?.addEventListener("click", closeProjectSwitcher);
-  document.querySelector("#restoreLinkedProjectButton")?.addEventListener("click", restoreLinkedProject);
   document.querySelector("#projectSwitcherSearch")?.addEventListener("input", updateProjectSearch);
   document.querySelectorAll("[data-switch-project]").forEach((button) => button.addEventListener("click", switchToLocalProject));
   document.querySelectorAll("[data-switch-server-project]").forEach((button) => button.addEventListener("click", switchToServerProject));
@@ -3510,6 +3502,7 @@ function bindProjectSwitcherEvents() {
     ui.wizard.error = "";
   });
   document.querySelectorAll('[name="provider"]').forEach((control) => control.addEventListener("change", updateProjectWizardChoice));
+  document.querySelectorAll('[name="onboarding"]').forEach((control) => control.addEventListener("change", updateProjectWizardChoice));
   document.querySelectorAll('[name="serverAction"]').forEach((control) => control.addEventListener("change", updateProjectWizardChoice));
   document.querySelectorAll('[name="sourceAction"]').forEach((control) => control.addEventListener("change", updateProjectWizardChoice));
   for (const id of ["projectDriveClientId", "projectDriveFileLink", "projectDriveFolderName"]) {
@@ -3554,7 +3547,6 @@ function bindProjectSwitcherEvents() {
     dialog.showModal();
     const selector = ui.surface === "switcher" ? "#projectSwitcherSearch"
       : ui.surface === "wizard" ? ui.wizard.step === 1 ? "#projectName" : '[name="provider"]:checked'
-        : ui.surface === "archived-link" ? "#closeProjectSwitcherButton"
         : ui.surface === "server-auth" ? "#serverProjectEmail"
         : ui.surface === "rename" ? "#renameProjectName"
           : ui.surface === "delete" ? ui.backupDownloaded ? "#forgetProjectName" : "#downloadProjectBackupButton"
@@ -3582,8 +3574,6 @@ function closeProjectSwitcher() {
   ui.surface = "closed";
   ui.error = "";
   ui.pendingProjectId = "";
-  ui.archivedLinkId = "";
-  ui.archivedLinkSearch = "";
   render();
   document.querySelector(`#${cssEscape(focusId)}`)?.focus();
 }
@@ -3720,7 +3710,7 @@ async function approveProjectDeparture({ replaceUrl = false } = {}) {
   } finally { ui.departurePending = false; }
 }
 
-async function stageLocalProjectSwitch(projectId, { trigger = null, replaceUrl = false, prefix = "Opened" } = {}) {
+async function stageLocalProjectSwitch(projectId, { trigger = null, replaceUrl = false, prefix = "Opened", confirmTeamExit = true, departureApproved = false, preparedProject = null } = {}) {
   const ui = state.projects;
   const target = registryProjectById(ui?.registry, projectId);
   if (!ui || !target || target.provider === "server" || target.archivedAt || ui.busy) return false;
@@ -3735,11 +3725,11 @@ async function stageLocalProjectSwitch(projectId, { trigger = null, replaceUrl =
     closeProjectSwitcher();
     return true;
   }
-  if (!await approveProjectDeparture({ replaceUrl })) return false;
+  if (!departureApproved && !await approveProjectDeparture({ replaceUrl })) return false;
   let prepared;
   ui.busy = true;
   render();
-  try { prepared = await prepareLocalProject(target); }
+  try { prepared = preparedProject || await prepareLocalProject(target); }
   catch (error) {
     ui.busy = false;
     ui.error = `${target.name} could not be opened. ${error.message}`;
@@ -3749,7 +3739,7 @@ async function stageLocalProjectSwitch(projectId, { trigger = null, replaceUrl =
     return false;
   }
   ui.busy = false;
-  if (state.team.active) {
+  if (state.team.active && confirmTeamExit) {
     const returnFocusId = ui.returnFocusId || "projectSwitcherButton";
     ui.surface = "closed";
     render();
@@ -3784,7 +3774,7 @@ async function stageLocalProjectSwitch(projectId, { trigger = null, replaceUrl =
     });
     if (state.team.active) await closeTeamWorkspace("Closed the Team project. Its data was not copied.", { forProjectSwitch: true });
     ui.registry = projectRegistry;
-    applyPreparedLocalProject(prepared, target);
+    applyPreparedLocalProject(prepared, activeRegistryProject(projectRegistry));
     ui.pendingProjectId = "";
     ui.busy = false;
     ui.query = "";
@@ -3875,7 +3865,7 @@ async function stageServerProjectSwitch(projectId, { trigger = null, replaceUrl 
   }
 }
 
-async function prepareLocalProject(target) {
+async function prepareLocalProject(target, { requestPermission = true } = {}) {
   const bundle = readProjectBundle(localStorage, target.id);
   let rawWorkspace = bundle.workspace || encodeWorkspaceDocument(createEmptyWorkspaceDocument());
   let workspace = importPortableWorkspace(rawWorkspace);
@@ -3889,7 +3879,7 @@ async function prepareLocalProject(target) {
     const handle = await loadLinkedFileHandle(target.id);
     if (!handle) throw new Error("Choose the linked file again before opening this project.");
     let permission = await queryLinkedFilePermission(handle);
-    if (permission === "prompt") permission = await requestLinkedFilePermission(handle);
+    if (permission === "prompt" && requestPermission) permission = await requestLinkedFilePermission(handle);
     if (permission !== "granted") throw new Error("Linked file permission was not granted; the current project remains open.");
     const file = await readLinkedWorkspaceFile(handle);
     const remoteWorkspace = importPortableWorkspace(file.text);
@@ -3964,8 +3954,9 @@ function updateProjectWizardChoice(event) {
   if (!ui) return;
   captureServerWizardFields();
   ui.wizard[event.currentTarget.name] = event.currentTarget.value;
+  const selector = `[name="${cssEscape(event.currentTarget.name)}"][value="${cssEscape(event.currentTarget.value)}"]`;
   render();
-  document.querySelector(`[name="${cssEscape(event.currentTarget.name)}"][value="${cssEscape(event.currentTarget.value)}"]`)?.focus();
+  queueMicrotask(() => document.querySelector(selector)?.focus());
 }
 
 function captureServerWizardFields() {
@@ -4091,6 +4082,7 @@ async function createProductionProject() {
     };
     const created = createRegistryProject(localStorage, ui.registry, {
       id: projectId, name: wizard.name, provider: wizard.provider,
+      onboarding: wizard.provider === "browser" || wizard.sourceAction === "create" ? wizard.onboarding : "guided",
       location: { space: "today", mode: "focus" }
     }, bundle);
     registered = true;
@@ -4170,7 +4162,7 @@ async function createServerProjectFromWizard() {
       if (!wizard.createAttemptId) wizard.createAttemptId = teamCreateAttemptId("project");
       try {
         const result = await client.teamService.createWorkspace({
-          name: wizard.name, templateId: "focused", createAttemptId: wizard.createAttemptId
+          name: wizard.name, templateId: wizard.onboarding === "blank" ? "blank" : "focused", createAttemptId: wizard.createAttemptId
         });
         const response = result?.workspace || result;
         workspace = normalizeTeamWorkspace({
@@ -4194,6 +4186,7 @@ async function createServerProjectFromWizard() {
     const projectId = `project-${globalThis.crypto?.randomUUID?.().toLowerCase() || Date.now().toString(36)}`.slice(0, 80);
     const created = createRegistryProject(localStorage, ui.registry, {
       id: projectId, name: workspace.name || wizard.name, provider: "server",
+      onboarding: wizard.serverAction === "create" ? wizard.onboarding : "guided",
       connectorId: connector.id, workspaceId: workspace.id, serverRole: workspace.role || "viewer",
       serverRevision: workspace.revision || 0, serverStatus: "available", location: { space: "today", mode: "focus" }
     }, {});
@@ -4403,6 +4396,7 @@ function requestProjectArchive(event) {
 
 function cancelProjectArchive() {
   const ui = state.projects;
+  if (ui.busy) return;
   const projectId = ui.archiveProjectId;
   ui.archiveProjectId = "";
   ui.surface = "manage";
@@ -4412,18 +4406,36 @@ function cancelProjectArchive() {
 
 async function confirmProjectArchive() {
   const ui = state.projects;
+  if (!ui || ui.busy || ui.archivePending || state.dataBusy || state.team.mutationBusy) return;
+  ui.archivePending = true;
+  let createdFallbackId = "";
   try {
     const project = registryProjectById(ui.registry, ui.archiveProjectId);
     if (project.id === ui.registry.activeProjectId) {
-      const fallback = ui.registry.projects.find((entry) => !entry.archivedAt && entry.id !== project.id && entry.provider !== "server");
-      if (!fallback) throw new Error("Create another browser project before archiving the current project.");
-      if (state.team.active && state.team.projectId === project.id) {
-        await closeTeamWorkspace("Returned to the saved browser project.");
-      } else if (!await stageLocalProjectSwitch(fallback.id)) {
-        throw new Error("Another project could not be opened before archiving.");
+      if (!await approveProjectDeparture()) return;
+      ui.busy = true;
+      render();
+      let fallback;
+      let prepared;
+      for (const candidate of recentProjects(ui.registry).filter((entry) => entry.id !== project.id && entry.provider !== "server")) {
+        try {
+          prepared = await prepareLocalProject(candidate, { requestPermission: false });
+          fallback = candidate;
+          break;
+        } catch { /* Keep unavailable projects intact and try the next recent local project. */ }
       }
+      if (!fallback) {
+        const created = createBlankBrowserProject(ui.registry);
+        projectRegistry = created.registry;
+        ui.registry = projectRegistry;
+        fallback = created.project;
+        createdFallbackId = fallback.id;
+        prepared = await prepareLocalProject(fallback);
+      }
+      ui.busy = false;
+      if (!await stageLocalProjectSwitch(fallback.id, { confirmTeamExit: false, departureApproved: true, preparedProject: prepared })) return;
     }
-    projectRegistry = setProjectArchived(localStorage, ui.registry, ui.archiveProjectId, true);
+    projectRegistry = setProjectArchived(localStorage, ui.registry, project.id, true);
     ui.registry = projectRegistry;
     ui.status = `${project.name} is hidden on this device. Its source was not deleted.`;
     ui.archiveProjectId = "";
@@ -4433,8 +4445,31 @@ async function confirmProjectArchive() {
   } catch (error) {
     ui.error = error.message;
     ui.surface = "manage";
+    ui.busy = false;
     render();
+  } finally {
+    ui.busy = false;
+    if (createdFallbackId && ui.registry.activeProjectId !== createdFallbackId) {
+      try {
+        const keys = projectKeys(createdFallbackId);
+        projectRegistry = runStorageTransaction(localStorage, ["pm-os-staging.projects.v1", ...Object.values(keys)], () => {
+          const archived = setProjectArchived(localStorage, ui.registry, createdFallbackId, true);
+          return forgetRegistryProject(localStorage, archived, createdFallbackId);
+        });
+        ui.registry = projectRegistry;
+      } catch {
+        ui.error = "The archive was cancelled. An unused blank project remains available in Manage projects.";
+      }
+      render();
+    }
+    ui.archivePending = false;
   }
+}
+
+function createBlankBrowserProject(registry) {
+  return createRegistryProject(localStorage, registry, {
+    name: "Blank project", provider: "browser", onboarding: "blank", location: { space: "today", mode: "focus" }
+  }, { workspace: encodeWorkspaceDocument(createEmptyWorkspaceDocument()), activity: JSON.stringify({ activity: [] }) });
 }
 
 function unarchiveProject(event) {
@@ -7411,7 +7446,7 @@ async function openTeamWorkspaceById(workspaceId, trigger, options = {}) {
         });
         state.projects.registry = projectRegistry;
         resetWorkspaceUiState();
-        restoreProjectLocation(options.serverProject.location);
+        restoreProjectLocation(activeRegistryProject(projectRegistry)?.location);
         state.projects.surface = "closed";
         state.projects.status = `Opened ${workspace.name}.`;
         pushViewUrl(Boolean(options.replaceUrl));
@@ -9087,48 +9122,18 @@ function navigateToView(deepLink, origin, requestedMode = "") {
     : document.querySelector("#viewTitle");
   focusTarget?.focus();
 }
-async function restoreLinkedProject() {
-  const ui = state.projects;
-  if (!ui || ui.busy || !ui.archivedLinkId) return;
-  const projectId = ui.archivedLinkId;
-  const search = ui.archivedLinkSearch;
-  try {
-    projectRegistry = setProjectArchived(localStorage, ui.registry, projectId, false);
-    ui.registry = projectRegistry;
-    const target = registryProjectById(projectRegistry, projectId);
-    const opened = target.provider === "server"
-      ? await stageServerProjectSwitch(projectId, { replaceUrl: true })
-      : await stageLocalProjectSwitch(projectId, { replaceUrl: true });
-    if (!opened) return;
-    ui.archivedLinkId = "";
-    ui.archivedLinkSearch = "";
-    const linkedParams = new URLSearchParams(search);
-    if (!linkedParams.has("space") && !linkedParams.has("view")) return;
-    history.replaceState(history.state, "", `${location.pathname}?${search}`);
-    await restoreViewFromLocation();
-  } catch (error) {
-    ui.error = error.message || "The project could not be restored. Your current project remains open.";
-    render();
-  }
-}
-
 async function restoreViewFromLocation() {
+  if (state.projects?.archivedLinkPending) {
+    document.querySelector("#confirmationDialog")?.close("cancel");
+    return;
+  }
   const params = new URLSearchParams(location.search);
   const projectId = params.get("project")?.trim() || "";
   const switchingProject = state.projects && projectId && projectId !== state.projects.registry.activeProjectId;
   if (switchingProject) {
     const target = registryProjectById(state.projects.registry, projectId);
-    if (!target || target.archivedAt) {
-      if (target?.archivedAt) {
-        state.projects.archivedLinkId = target.id;
-        state.projects.archivedLinkSearch = params.toString();
-        state.projects.surface = "archived-link";
-        state.projects.error = "";
-      } else state.projects.status = "This project link is unavailable on this device. Your current project remains open.";
-      pushViewUrl(true);
-      render();
-      return;
-    }
+    if (!target) { state.projects.status = "This project link is unavailable on this device. Your current project remains open."; pushViewUrl(true); render(); return; }
+    if (target.archivedAt && !await reopenArchivedProjectLink(target)) return;
     const opened = target.provider === "server"
       ? await stageServerProjectSwitch(projectId, { replaceUrl: true })
       : await stageLocalProjectSwitch(projectId, { replaceUrl: true });
@@ -9177,6 +9182,42 @@ async function restoreViewFromLocation() {
   focusAfterRender(selectedId
     ? focusRecordId ? `initiative-record-${elementIdToken(focusRecordId)}` : focusSection ? `initiative-${focusSection}` : "initiativeDetailTitle"
     : returnFocusId || "viewTitle");
+}
+
+async function reopenArchivedProjectLink(project) {
+  const ui = state.projects;
+  const requestedUrl = location.href;
+  ui.archivedLinkPending = true;
+  let confirmed = false;
+  try {
+    // Let any restored record dialog open before placing this decision on top.
+    await Promise.resolve();
+    confirmed = await requestDataConfirmation({
+      title: "Project is archived",
+      description: `${project.name} is archived on this device. Unarchive it to open it again. Your current project stays open until the destination is ready.`,
+      confirmLabel: "Unarchive and open",
+      trigger: document.querySelector("#projectSwitcherButton, #mobileProjectSwitcherButton")
+    });
+    if (confirmed && location.href === requestedUrl) {
+      projectRegistry = setProjectArchived(localStorage, ui.registry, project.id, false);
+      ui.registry = projectRegistry;
+    }
+  } catch (error) {
+    ui.status = error.message || "The project could not be unarchived.";
+    confirmed = false;
+  } finally {
+    ui.archivedLinkPending = false;
+  }
+  if (location.href !== requestedUrl) {
+    void restoreViewFromLocation();
+    return false;
+  }
+  if (!confirmed) {
+    pushViewUrl(true);
+    render();
+    document.querySelector(window.matchMedia("(max-width: 1100px)").matches ? "#mobileProjectSwitcherButton" : "#projectSwitcherButton")?.focus();
+  }
+  return confirmed;
 }
 function spaceIcon(space) {
   return ({ today: "⌁", initiatives: "▤", insights: "◌", planning: "◇", delivery: "→", briefings: "▱", team: "◎", settings: "⚙" })[space] || "·";

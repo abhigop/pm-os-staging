@@ -129,6 +129,12 @@ export function projectById(registry, projectId) {
   return registry?.projects.find((entry) => entry.id === projectId) || null;
 }
 
+export function recentProjects(registry) {
+  return (registry?.projects || []).filter((entry) => !entry.archivedAt).sort((left, right) =>
+    (right.lastOpenedAt || right.createdAt || "").localeCompare(left.lastOpenedAt || left.createdAt || "")
+    || left.id.localeCompare(right.id));
+}
+
 export function createProject(storage, registry, input, bundle = {}, { now = () => new Date().toISOString(), idFactory = defaultProjectId } = {}) {
   registry = currentRegistryForMutation(storage, registry);
   const timestamp = now();
@@ -272,6 +278,7 @@ function normalizeProject(input) {
     id,
     name,
     provider,
+    onboarding: input.onboarding === "blank" ? "blank" : "guided",
     ...(provider === "server" ? {
       connectorId,
       workspaceId,

@@ -1,8 +1,8 @@
-import { activeProject, projectById, projectProviderLabel } from "./projects.js";
+import { activeProject, projectById, projectProviderLabel, recentProjects } from "./projects.js";
 
 export function newProjectWizardState({ driveClientId = "", drivePickerAvailable = false } = {}) {
   return {
-    step: 1, name: "", provider: "browser", error: "", connectorId: "", connectorMode: "remote",
+    step: 1, name: "", onboarding: "guided", provider: "browser", error: "", connectorId: "", connectorMode: "remote",
     connectorLabel: "", connectorUrl: "", connectorKey: "", persistSession: true, serverAction: "create",
     serverWorkspaceId: "", serverWorkspaces: [], createAttemptId: "",
     sourceAction: "create", driveClientId, drivePickerAvailable, driveFileLink: "", driveFolderName: "PM OS"
@@ -12,7 +12,7 @@ export function newProjectWizardState({ driveClientId = "", drivePickerAvailable
 export function createProjectUiState(registry, { persistent = true, warning = "", connectors = [] } = {}) {
   return {
     registry, persistent, warning, connectors, surface: "closed", query: "", busy: false, error: "", status: "",
-    pendingProjectId: "", archivedLinkId: "", archivedLinkSearch: "", returnFocusId: "projectSwitcherButton", renameProjectId: "", renameMutationId: "",
+    pendingProjectId: "", returnFocusId: "projectSwitcherButton", renameProjectId: "", renameMutationId: "",
     archiveProjectId: "", deleteProjectId: "", deleteName: "", backupDownloaded: false, deleteRevision: 0,
     deleteMutationId: "", deleteRemoteDrive: false, driveDeleteTicket: null, driveDeleteToken: "", connectorBusyId: "", serverGate: null, wizard: newProjectWizardState()
   };
@@ -50,19 +50,14 @@ export function projectSwitcherMarkup(ui, { team = null, teamWorkspaces = [], li
   if (ui.surface === "confirm-archive") return `${live}${archiveDialog(ui)}`;
   const body = ui.surface === "wizard" ? wizard(ui, linkedFileAvailable) : ui.surface === "manage" ? manager(ui)
     : ui.surface === "rename" ? renameDialog(ui) : ui.surface === "delete" ? deleteDialog(ui)
-      : ui.surface === "server-auth" ? serverAuthDialog(ui) : ui.surface === "archived-link" ? archivedLinkDialog(ui) : switcher(ui, team, teamWorkspaces);
+      : ui.surface === "server-auth" ? serverAuthDialog(ui) : switcher(ui, team, teamWorkspaces);
   return `${live}<dialog class="project-prototype-dialog" id="projectSwitcherDialog" aria-labelledby="projectSwitcherTitle">${body}</dialog>`;
-}
-
-function archivedLinkDialog(ui) {
-  const project = projectById(ui.registry, ui.archivedLinkId);
-  return `<div class="project-dialog-shell"><header class="project-dialog-header"><div><p class="panel-kicker">Project link</p><h2 id="projectSwitcherTitle" tabindex="-1">This project is archived</h2><p>${esc(project?.name || "The linked project")} is hidden on this device. Restore it to open the link. Your current project stays open until the destination is ready.</p></div></header><div class="project-dialog-body">${alerts(ui)}</div><footer class="project-dialog-footer project-confirm-actions"><button class="secondary" id="closeProjectSwitcherButton" type="button">Stay in current project</button><button class="primary" id="restoreLinkedProjectButton" type="button" ${ui.busy ? "disabled" : ""}>Restore and open</button></footer></div>`;
 }
 
 function switcher(ui, team, teamWorkspaces) {
   const current = currentProjectDescriptor(ui, team);
   const needle = ui.query.trim().toLowerCase();
-  const registered = ui.registry.projects.filter((entry) => !entry.archivedAt && matches(entry, needle));
+  const registered = recentProjects(ui.registry).filter((entry) => matches(entry, needle));
   const rows = registered.map((entry) => projectRow({
     id: entry.id, name: entry.name,
     provider: entry.provider === "server" ? connectorLabel(ui, entry.connectorId) : projectProviderLabel(entry.provider),
@@ -83,7 +78,7 @@ function switcher(ui, team, teamWorkspaces) {
 function wizard(ui, linkedFileAvailable) {
   const state = ui.wizard;
   const content = state.step === 1
-    ? `<label class="project-name-field"><span>Project name</span><input id="projectName" name="name" maxlength="160" value="${esc(state.name)}" placeholder="e.g. Pricing redesign" autocomplete="off"></label>`
+    ? `<label class="project-name-field"><span>Project name</span><input id="projectName" name="name" maxlength="160" value="${esc(state.name)}" placeholder="e.g. Pricing redesign" autocomplete="off"></label><fieldset class="prototype-choice-grid"><legend>How would you like to start?</legend>${choice("onboarding", "guided", "Guided start", "An empty workspace with a getting started checklist.", state.onboarding)}${choice("onboarding", "blank", "Start blank", "An empty workspace without the checklist.", state.onboarding)}</fieldset><p class="field-note">Both use the same simple workspace. Opening an existing source keeps its workspace and settings.</p>`
     : `<fieldset class="prototype-choice-grid"><legend>Choose where this project lives</legend>${choice("provider", "browser", "Browser", "Saved privately in this browser.", state.provider)}${choice("provider", "local-file", "Linked file", linkedFileAvailable ? "Create or open a portable workspace file." : "Unavailable in this browser.", state.provider, !linkedFileAvailable)}${choice("provider", "google-drive", "Google Drive", "Connect and create or open a workspace file.", state.provider)}${choice("provider", "server", "Server", "Create or open a workspace on a saved connection.", state.provider)}</fieldset>${state.provider === "server" ? serverFields(ui) : ["local-file", "google-drive"].includes(state.provider) ? externalSourceFields(state) : ""}`;
   return `<form class="project-dialog-shell" id="projectWizardForm" novalidate><header class="project-dialog-header"><div><p class="panel-kicker">New project · Step ${state.step} of 2</p><h2 id="projectSwitcherTitle">${state.step === 1 ? "Name the project" : "Choose a source"}</h2><p>${state.step === 2 ? "Choose where to save this project." : "Create a separate PM workspace."}</p></div><button class="icon-button project-dialog-close" id="closeProjectSwitcherButton" type="button" aria-label="Close new project wizard">Close</button></header><ol class="project-wizard-progress" aria-label="Project setup progress"><li class="active">Name</li><li class="${state.step >= 2 ? "active" : ""}">Source</li></ol><div class="project-dialog-body project-wizard-body">${state.error ? `<p class="project-dialog-error" role="alert">${esc(state.error)}</p>` : ""}${content}</div><footer class="project-dialog-footer project-wizard-actions"><button class="secondary" id="projectWizardBackButton" type="button" ${ui.busy ? "disabled" : ""}>${state.step === 1 ? "Back to projects" : "Back"}</button><button class="primary" id="projectWizardContinueButton" type="submit" ${ui.busy ? "disabled" : ""}>${ui.busy ? "Connecting…" : state.step === 2 ? ["local-file", "google-drive"].includes(state.provider) && state.sourceAction === "existing" ? "Open project" : "Create project" : "Continue"}</button></footer></form>`;
 }
@@ -121,7 +116,8 @@ function renameDialog(ui) {
 
 function archiveDialog(ui) {
   const project = projectById(ui.registry, ui.archiveProjectId);
-  return `<dialog class="project-prototype-dialog project-confirm-dialog" id="projectArchiveDialog" aria-labelledby="projectArchiveTitle"><div class="project-dialog-shell"><header class="project-dialog-header"><div><p class="panel-kicker">Archive project</p><h2 id="projectArchiveTitle" tabindex="-1">Archive ${esc(project?.name || "this project")}?</h2><p>It will be hidden from quick switching on this device. Its workspace and source remain intact.</p></div></header><footer class="project-dialog-footer project-confirm-actions"><button class="secondary" id="cancelProjectArchiveButton" type="button">Cancel</button><button class="primary" id="confirmProjectArchiveButton" type="button">Archive project</button></footer></div></dialog>`;
+  const needsFallback = project?.id === ui.registry.activeProjectId && !ui.registry.projects.some((entry) => entry.id !== project.id && !entry.archivedAt && entry.provider !== "server");
+  return `<dialog class="project-prototype-dialog project-confirm-dialog" id="projectArchiveDialog" aria-labelledby="projectArchiveTitle"><div class="project-dialog-shell"><header class="project-dialog-header"><div><p class="panel-kicker">Archive project</p><h2 id="projectArchiveTitle" tabindex="-1">Archive ${esc(project?.name || "this project")}?</h2><p>It will be hidden from quick switching on this device. Its workspace and source remain intact.${needsFallback ? " A new blank project will open so you can keep working." : ""}</p></div></header><footer class="project-dialog-footer project-confirm-actions"><button class="secondary" id="cancelProjectArchiveButton" type="button" ${ui.busy ? "disabled" : ""}>Cancel</button><button class="primary" id="confirmProjectArchiveButton" type="button" ${ui.busy ? "disabled" : ""}>${ui.busy ? "Opening another project…" : "Archive project"}</button></footer></div></dialog>`;
 }
 
 function deleteDialog(ui) {
