@@ -6,7 +6,7 @@ const metadataKeys = new Set(["updatedAt", "updatedBy"]);
 /** Deterministic base/local/remote merge with field-level conflict output. */
 export function mergeWorkspaceDocuments(base, local, remote) {
   const conflicts = [];
-  const value = mergeValue(base, local, remote, [], conflicts);
+  const value = mergeValue(base, preserveUnsupportedCapacity(base, local), preserveUnsupportedCapacity(base, remote), [], conflicts);
   return immutableWorkspaceValue({
     merged: value === missing ? null : value,
     conflicts,
@@ -30,12 +30,37 @@ export function resolveWorkspaceConflicts(result, resolutions = {}) {
   return immutableWorkspaceValue({ merged: document, conflicts: unresolved, clean: unresolved.length === 0, changed: true });
 }
 
-function mergeValue(base, local, remote, path, conflicts) {
-  if (same(local, remote)) return clone(local);
-  if (same(local, base)) return clone(remote);
-  if (same(remote, base)) return clone(local);
-  if (local === missing || remote === missing) return conflict(base, local, remote, path, conflicts, "delete-edit");
+// Missing fields from old clients are not an explicit clear. JSON null is the clear operation.
+function preserveUnsupportedCapacity(base, document) {
+  if (!base?.planningCalendar?.capacityPlan || !plainObject(document?.planningCalendar)
+    || Object.hasOwn(document.planningCalendar, "capacityPlan")) return document;
+  return { ...document, planningCalendar: { ...document.planningCalendar, capacityPlan: clone(base.planningCalendar.capacityPlan) } };
+}
 
+function mergeValue(base, local, remote, path, conflicts) {
+  // Immutable history requires review even when only one file changes a saved ID.
+  if (path.length === 2 && path[0] === "artifacts" && base !== missing
+    && local !== missing && remote !== missing && (!same(base, local) || !same(base, remote))) {
+    return conflict(base, local, remote, path, conflicts, "immutable-record");
+  }
+  // Root/collection shortcuts must not bypass that per-record check.
+  const inspectHistory = path.length === 0
+    ? changedExistingArtifact(base?.artifacts, local?.artifacts, remote?.artifacts)
+    : path.length === 1 && path[0] === "artifacts" && changedExistingArtifact(base, local, remote);
+  if (!inspectHistory) {
+    if (same(local, remote)) return clone(local);
+    if (same(local, base)) return clone(remote);
+    if (same(remote, base)) return clone(local);
+  }
+  // The authored horizon and budget are one decision; never combine independently edited halves.
+  if (path.length === 2 && path[0] === "planningCalendar" && path[1] === "capacityPlan") return conflict(base, local, remote, path, conflicts, "capacity-plan");
+  if (local === missing || remote === missing) return conflict(base, local, remote, path, conflicts, "delete-edit");
+  if (path.length === 2 && path[0] === "artifacts") return conflict(base, local, remote, path, conflicts, "immutable-record");
+
+  // Pre-v15 merge bases have no artifact collection; concurrent new IDs still merge independently.
+  if (path.length === 1 && path[0] === "artifacts" && base === missing && Array.isArray(local) && Array.isArray(remote)) {
+    return mergeIdCollection([], local, remote, path, conflicts);
+  }
   if (Array.isArray(local) && Array.isArray(remote) && Array.isArray(base)) {
     if (isIdCollection([...base, ...local, ...remote])) return mergeIdCollection(base, local, remote, path, conflicts);
     return conflict(base, local, remote, path, conflicts, "array");
@@ -61,6 +86,12 @@ function mergeValue(base, local, remote, path, conflicts) {
   }
 
   return conflict(base, local, remote, path, conflicts, "value");
+}
+
+function changedExistingArtifact(base, local, remote) {
+  if (!Array.isArray(base) || !Array.isArray(local) || !Array.isArray(remote)) return false;
+  const prior = new Map(base.map(record => [String(record.id), record]));
+  return [...local, ...remote].some(record => prior.has(String(record.id)) && !same(prior.get(String(record.id)), record));
 }
 
 function mergeIdCollection(base, local, remote, path, conflicts) {

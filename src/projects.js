@@ -9,12 +9,13 @@ export const LEGACY_PROJECT_KEYS = Object.freeze({
   activity: "pm-os-staging.activity.v1",
   source: "pm-os-staging.source.v2",
   sync: "pm-os-staging.sync.v2",
-  backups: "pm-os-staging.backups.v1"
+  backups: "pm-os-staging.backups.v1",
+  checklist: "pm-os-staging.checklist.v1"
 });
 
 const providers = new Set(["browser", "local-file", "google-drive", "server"]);
 const serverRoles = new Set(["owner", "editor", "viewer"]);
-const serverStatuses = new Set(["available", "sign-in-required"]);
+const serverStatuses = new Set(["available", "sign-in-required", "unavailable"]);
 const secondaryLegacyKeys = Object.freeze({ source: "pm-os-staging.source.v1", sync: "pm-os-staging.sync.v1" });
 const spaces = new Set(["today", "initiatives", "insights", "planning", "delivery", "briefings", "team", "settings"]);
 const projectIdPattern = /^[a-z0-9][a-z0-9-]{0,79}$/;
@@ -27,7 +28,8 @@ export function projectKeys(projectId) {
     activity: `${prefix}.activity`,
     source: `${prefix}.source`,
     sync: `${prefix}.sync`,
-    backups: `${prefix}.backups`
+    backups: `${prefix}.backups`,
+    checklist: `${prefix}.checklist`
   });
 }
 
@@ -169,12 +171,28 @@ export function activateProject(storage, registry, projectId, previousLocation, 
   return next;
 }
 
-export function renameProject(storage, registry, projectId, name, { now = () => new Date().toISOString() } = {}) {
+export function readCurrentProjectRegistry(storage, registry) {
+  return currentRegistryForMutation(storage, registry);
+}
+
+export function readWeeklyUpdateCopied(storage, key) {
+  try { return Boolean(key) && storage.getItem(key) === "1"; }
+  catch { return false; }
+}
+
+export function prepareProjectRename(storage, registry, projectId, name) {
   registry = currentRegistryForMutation(storage, registry);
   const normalizedName = normalizeProjectName(name);
   const target = projectById(registry, projectId);
   if (!target || target.archivedAt) throw new Error("That project is not available.");
-  const projects = registry.projects.map((entry) => entry.id === target.id ? normalizeProject({ ...entry, name: normalizedName, updatedAt: now() }) : entry);
+  return { registry, project: target, name: normalizedName, unchanged: target.name === normalizedName };
+}
+
+export function renameProject(storage, registry, projectId, name, { now = () => new Date().toISOString() } = {}) {
+  const prepared = prepareProjectRename(storage, registry, projectId, name);
+  registry = prepared.registry;
+  if (prepared.unchanged) return registry;
+  const projects = registry.projects.map((entry) => entry.id === prepared.project.id ? normalizeProject({ ...entry, name: prepared.name, updatedAt: now() }) : entry);
   const next = normalizeProjectRegistry({ ...registry, projects });
   persistRegistry(storage, next);
   return next;

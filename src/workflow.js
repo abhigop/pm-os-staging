@@ -72,6 +72,19 @@ export function statusForInitiative(workflow, item) {
   return statusForId(workflow, item?.statusId || item?.status, item?.status || "intake");
 }
 
+export function initiativeReportingContext(workflow, item) {
+  const statuses = normalizeInitiativeWorkflow(workflow).statuses;
+  const stage = statuses.find(status => status.id === (item?.statusId || item?.status));
+  const category = categorySet.has(item?.status) ? item.status[0].toUpperCase() + item.status.slice(1) : "Unavailable";
+  return `Stage: ${stage?.name || "Unavailable"}; Reporting category: ${category}`;
+}
+
+export function workflowReportingNote(items = [], workflow) {
+  if (!items.length) return "";
+  return ["## Workflow stages and reporting categories", "Reporting categories group workflow stages; they do not replace the actual stage.",
+    ...items.map(item => `- ${item.title} — ${initiativeReportingContext(workflow, item)}`)].join("\n");
+}
+
 export function initiativeStatusUsage(workflow, items = []) {
   const normalized = normalizeInitiativeWorkflow(workflow);
   const usage = Object.fromEntries(normalized.statuses.map((status) => [status.id, 0]));

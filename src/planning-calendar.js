@@ -2,6 +2,8 @@ export const PLANNING_CALENDAR_VERSION = 1;
 export const PLANNING_PERIOD_TYPES = Object.freeze(["sprint", "month", "quarter", "year"]);
 export const DEFAULT_ENABLED_PERIOD_TYPES = Object.freeze(["month", "quarter", "year"]);
 
+export const MAX_PLANNING_CAPACITY = 1000000;
+
 const DAY_MS = 86400000;
 const formatter = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
 const monthFormatter = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" });
@@ -21,7 +23,8 @@ export function emptyPlanningCalendar() {
     enabledPeriodTypes: [...DEFAULT_ENABLED_PERIOD_TYPES],
     fiscalYearStartMonth: 1,
     sprintLengthWeeks: 2,
-    sprintAnchorDate: ""
+    sprintAnchorDate: "",
+    capacityPlan: null
   });
 }
 
@@ -39,13 +42,59 @@ export function normalizePlanningCalendar(input = {}) {
     enabledPeriodTypes: PLANNING_PERIOD_TYPES.filter((type) => resolvedTypes.includes(type)),
     fiscalYearStartMonth: integerBetween(source.fiscalYearStartMonth, 1, 12, 1),
     sprintLengthWeeks: integerBetween(source.sprintLengthWeeks, 1, 6, 2),
-    sprintAnchorDate
+    sprintAnchorDate,
+    capacityPlan: normalizeCapacityPlan(source.capacityPlan)
   });
 }
 
 export function updatePlanningCalendar(calendar, patch) {
   const current = normalizePlanningCalendar(calendar);
   return normalizePlanningCalendar({ ...current, ...patch, version: current.version + 1 });
+}
+
+// Validation deliberately does not resolve the calendar: authored boundaries must survive calendar edits.
+function normalizeCapacityPlan(value) {
+  if (value === undefined || value === null) return null;
+  const horizon = value?.horizon;
+  if (!plainObject(value) || Object.keys(value).some(key => !["horizon", "effort"].includes(key))
+    || !plainObject(horizon) || Object.keys(horizon).some(key => !["kind", "startDate", "endDate"].includes(key))
+    || !PLANNING_PERIOD_TYPES.includes(horizon.kind)
+    || typeof horizon.startDate !== "string" || typeof horizon.endDate !== "string"
+    || !/^\d{4}-\d{2}-\d{2}$/.test(horizon.startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(horizon.endDate)
+    || !parsePlainDate(horizon.startDate) || !parsePlainDate(horizon.endDate) || horizon.startDate > horizon.endDate
+    || typeof value.effort !== "number" || !Number.isFinite(value.effort) || value.effort < 0 || value.effort > MAX_PLANNING_CAPACITY) {
+    fail("INVALID_CAPACITY_PLAN", "Capacity requires a valid bounded horizon and numeric effort from 0 to 1,000,000.");
+  }
+  return { horizon: { kind: horizon.kind, startDate: horizon.startDate, endDate: horizon.endDate }, effort: value.effort };
+}
+
+export function createPlanningCapacityPlan(calendar, selection, effort) {
+  const current = normalizePlanningCalendar(calendar);
+  if (!plainObject(selection) || !current.enabledPeriodTypes.includes(selection.kind)
+    || typeof selection.startDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(selection.startDate)
+    || !parsePlainDate(selection.startDate)) {
+    fail("CAPACITY_HORIZON_REQUIRED", "Choose an enabled sprint, month, quarter, or year before setting capacity.");
+  }
+  const period = periodForDate(selection.kind, selection.startDate, current);
+  if (!period) fail("CAPACITY_HORIZON_REQUIRED", "Choose a valid planning horizon before setting capacity.");
+  return deepFreeze(normalizeCapacityPlan({ horizon: { kind: selection.kind, startDate: period.startDate, endDate: period.endDate }, effort }));
+}
+
+export function resolvePlanningCapacity(calendar, selection, options = {}) {
+  const current = normalizePlanningCalendar(calendar);
+  const plan = current.capacityPlan;
+  const label = plan ? `${plan.horizon.kind[0].toUpperCase()}${plan.horizon.kind.slice(1)} · ${plan.horizon.startDate} – ${plan.horizon.endDate}` : "Capacity not configured";
+  const result = reason => deepFreeze({ available: reason === "available", capacity: reason === "available" ? plan.effort : null, plan, reason, label });
+  if (!plan) return result("unset");
+  if (options.filtered) return result("filtered");
+  if (!current.enabledPeriodTypes.includes(plan.horizon.kind)) return result("disabled");
+  const savedPeriod = periodForDate(plan.horizon.kind, plan.horizon.startDate, current);
+  if (!savedPeriod || savedPeriod.startDate !== plan.horizon.startDate || savedPeriod.endDate !== plan.horizon.endDate) return result("calendar-changed");
+  if (!plainObject(selection) || !PLANNING_PERIOD_TYPES.includes(selection.kind) || !parsePlainDate(selection.startDate)) return result("unbounded");
+  if (!current.enabledPeriodTypes.includes(selection.kind)) return result("disabled");
+  const period = periodForSelection(selection, current);
+  if (!period || selection.kind !== plan.horizon.kind || period.startDate !== plan.horizon.startDate || period.endDate !== plan.horizon.endDate) return result("horizon-mismatch");
+  return result("available");
 }
 
 export function normalizePeriodSelection(input, calendar = emptyPlanningCalendar(), now = new Date()) {

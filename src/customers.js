@@ -77,9 +77,12 @@ export function updateCustomerAccount(directory, id, input) {
   return updateCollection(directory, "accounts", { ...input, id }, {}, true);
 }
 
-export function removeCustomerAccount(directory, id, initiatives = []) {
+export function removeCustomerAccount(directory, id, initiatives = [], insightRecords = []) {
   if (list(initiatives).some((item) => list(item.customerIds).includes(id))) {
     throw error("REFERENCE_IN_USE", "This account is targeted by an initiative and cannot be deleted.", { id });
+  }
+  if (list(insightRecords).some((record) => list(record.customerIds).includes(id))) {
+    throw error("REFERENCE_IN_USE", "This account is linked to an Insights record and cannot be deleted. Remove its link from the record first.", { id });
   }
   return removeFrom(directory, "accounts", id);
 }
@@ -131,9 +134,12 @@ export function updateCustomerSegment(directory, id, input) {
   return updateCollection(directory, "segments", { ...input, id }, {}, true);
 }
 
-export function removeCustomerSegment(directory, id, initiatives = []) {
+export function removeCustomerSegment(directory, id, initiatives = [], insightRecords = []) {
   if (list(initiatives).some((item) => list(item.segmentIds).includes(id))) {
     throw error("REFERENCE_IN_USE", "This segment is targeted by an initiative and cannot be deleted.", { id });
+  }
+  if (list(insightRecords).some((record) => list(record.segmentIds).includes(id))) {
+    throw error("REFERENCE_IN_USE", "This segment is linked to an Insights record and cannot be deleted. Remove its link from the record first.", { id });
   }
   return removeFrom(directory, "segments", id);
 }
@@ -144,9 +150,13 @@ export function evaluateSegment(account, segment, directory) {
     || normalizeAccount(account, 0, current.tags, current.fields);
   const normalizedSegment = current.segments.find((entry) => entry.id === segment?.id)
     || normalizeSegment(segment, 0, current.tags, current.fields);
-  if (!normalizedSegment.rules.length) return false;
-  const results = normalizedSegment.rules.map((rule) => evaluateRule(normalizedAccount, rule, current.fields));
-  return normalizedSegment.match === "any" ? results.some(Boolean) : results.every(Boolean);
+  return matchesSegment(normalizedAccount, normalizedSegment, current.fields);
+}
+
+function matchesSegment(account, segment, fields) {
+  if (!segment.rules.length) return false;
+  const matches = rule => evaluateRule(account, rule, fields);
+  return segment.match === "any" ? segment.rules.some(matches) : segment.rules.every(matches);
 }
 
 export function segmentMembers(segmentOrId, directory) {
@@ -155,22 +165,25 @@ export function segmentMembers(segmentOrId, directory) {
     ? current.segments.find((entry) => entry.id === segmentOrId)
     : segmentOrId;
   if (!segment) return [];
-  return current.accounts.filter((account) => evaluateSegment(account, segment, current));
+  const normalizedSegment = current.segments.find(entry => entry.id === segment.id)
+    || normalizeSegment(segment, 0, current.tags, current.fields);
+  return current.accounts.filter(account => matchesSegment(account, normalizedSegment, current.fields));
 }
 
 export function segmentMemberships(directory) {
   const current = normalizeCustomerDirectory(directory);
-  return new Map(current.segments.map((segment) => [segment.id, segmentMembers(segment, current).map((account) => account.id)]));
+  return new Map(current.segments.map(segment => [segment.id, current.accounts.filter(account => matchesSegment(account, segment, current.fields)).map(account => account.id)]));
 }
 
 export function resolveInitiativeAudience(initiative, directory) {
   const current = normalizeCustomerDirectory(directory);
   const segmentIds = new Set(list(initiative?.segmentIds).filter((id) => current.segments.some((segment) => segment.id === id)));
-  const customerIds = new Set(list(initiative?.customerIds).filter((id) => current.accounts.some((account) => account.id === id)));
+  const accountsById = new Map(current.accounts.map(account => [account.id, account]));
+  const customerIds = new Set(list(initiative?.customerIds).filter(id => accountsById.has(id)));
   for (const customerId of customerIds) {
-    const account = current.accounts.find((entry) => entry.id === customerId);
+    const account = accountsById.get(customerId);
     for (const segment of current.segments) {
-      if (evaluateSegment(account, segment, current)) segmentIds.add(segment.id);
+      if (matchesSegment(account, segment, current.fields)) segmentIds.add(segment.id);
     }
   }
   return freeze({ customerIds: [...customerIds], segmentIds: [...segmentIds] });
@@ -257,47 +270,78 @@ export function exportCustomerCsv(directory) {
 }
 
 export function previewCustomerCsv(csv, directory) {
-  const current = normalizeCustomerDirectory(directory);
-  const matrix = parseCsv(String(csv || ""));
-  const headers = matrix.shift()?.map((entry) => entry.trim()) || [];
-  const requiredHeaders = ["name", "domain"];
-  const errors = [];
-  for (const header of requiredHeaders) if (!headers.includes(header)) errors.push({ row: 1, field: header, message: `Missing required ${header} column.` });
-  const allowed = new Set(["id", "name", "domain", "status", "industry", "region", "employeeCount", "planTier", "ownerPersonId", "tagIds", "notes", ...current.fields.map((field) => `custom.${field.id}`)]);
-  for (const header of headers) if (!allowed.has(header)) errors.push({ row: 1, field: header, message: `Unknown column ${header}.` });
-
-  const seenDomains = new Set();
-  const changes = [];
-  matrix.forEach((cells, index) => {
-    const rowNumber = index + 2;
-    const raw = Object.fromEntries(headers.map((header, column) => [header, cells[column] ?? ""]));
-    try {
-      const parsed = csvAccount(raw, current);
-      if (parsed.domain && seenDomains.has(parsed.domain)) throw error("DUPLICATE_DOMAIN", `Duplicate domain ${parsed.domain} in CSV.`);
-      if (parsed.domain) seenDomains.add(parsed.domain);
-      const byId = parsed.id ? current.accounts.find((account) => account.id === parsed.id) : null;
-      const byDomain = parsed.domain ? current.accounts.find((account) => account.domain === parsed.domain) : null;
-      if (byId && byDomain && byId.id !== byDomain.id) throw error("AMBIGUOUS_MATCH", "ID and domain match different accounts.");
-      const existing = byId || byDomain;
-      changes.push({ action: existing ? "update" : "create", account: { ...existing, ...parsed, id: parsed.id || existing?.id || stableId("account", parsed.domain || parsed.name) } });
-    } catch (cause) {
-      errors.push({ row: rowNumber, field: cause.details?.field || "row", message: cause.message });
-    }
-  });
-  return freeze({ valid: errors.length === 0, creates: changes.filter((entry) => entry.action === "create").length, updates: changes.filter((entry) => entry.action === "update").length, errors, changes });
+  return prepareCustomerCsv(csv, normalizeCustomerDirectory(directory)).preview;
 }
 
 export function applyCustomerCsvImport(csv, directory) {
   const current = normalizeCustomerDirectory(directory);
-  const preview = previewCustomerCsv(csv, current);
-  if (!preview.valid) throw error("INVALID_CSV", "Customer CSV contains errors and was not imported.", { errors: preview.errors });
-  let next = current;
-  for (const change of preview.changes) {
-    next = change.action === "create"
-      ? createCustomerAccount(next, change.account)
-      : updateCustomerAccount(next, change.account.id, change.account);
+  const prepared = prepareCustomerCsv(csv, current);
+  if (!prepared.preview.valid) throw error("INVALID_CSV", "Customer CSV contains errors and was not imported.", { errors: prepared.preview.errors });
+  return freeze({ directory: prepared.directory, recoverySnapshot: current, preview: prepared.preview });
+}
+
+// Preview and apply use the same prospective batch. Never normalize the complete
+// directory once per row: both matching and assembling the final accounts use indexes.
+function prepareCustomerCsv(csv, current) {
+  const matrix = parseCsv(String(csv || ""));
+  const headers = matrix.shift()?.map((entry) => entry.trim()) || [];
+  const requiredHeaders = headers.includes("id") ? ["name"] : ["name", "domain"];
+  const errors = [];
+  for (const header of requiredHeaders) if (!headers.includes(header)) errors.push({ row: 1, field: header, message: `Missing required ${header} column.` });
+  const allowed = new Set(["id", "name", "domain", "status", "industry", "region", "employeeCount", "planTier", "ownerPersonId", "tagIds", "notes", ...current.fields.map((field) => `custom.${field.id}`)]);
+  const seenHeaders = new Set();
+  for (const header of headers) {
+    if (!allowed.has(header)) errors.push({ row: 1, field: header, message: `Unknown column ${header}.` });
+    if (seenHeaders.has(header)) errors.push({ row: 1, field: header, message: `Duplicate column ${header}.` });
+    seenHeaders.add(header);
   }
-  return freeze({ directory: next, recoverySnapshot: current, preview });
+
+  const accountsById = new Map(current.accounts.map(account => [account.id, account]));
+  const accountsByDomain = new Map(current.accounts.filter(account => account.domain).map(account => [account.domain, account]));
+  const seenDomains = new Set(), seenIds = new Set(), seenTargets = new Set();
+  const changes = [];
+  let creates = 0;
+  matrix.forEach((cells, index) => {
+    const rowNumber = index + 2;
+    const raw = Object.fromEntries(headers.map((header, column) => [header, cells[column] ?? ""]));
+    try {
+      if (cells.length > headers.length) throw error("INVALID_CSV", "Row contains more values than the header.");
+      const parsed = csvAccount(raw, current);
+      if (parsed.domain && seenDomains.has(parsed.domain)) throw error("DUPLICATE_DOMAIN", `Duplicate domain ${parsed.domain} in CSV.`, { field: "domain" });
+      if (parsed.domain) seenDomains.add(parsed.domain);
+      if (parsed.id && seenIds.has(parsed.id)) throw error("DUPLICATE_ID", `Duplicate account id ${parsed.id} in CSV.`, { field: "id" });
+      if (parsed.id) seenIds.add(parsed.id);
+      const byId = accountsById.get(parsed.id);
+      const byDomain = accountsByDomain.get(parsed.domain);
+      if (byId && byDomain && byId.id !== byDomain.id) throw error("AMBIGUOUS_MATCH", "ID and domain match different accounts.", { field: "id" });
+      const existing = byId || byDomain;
+      const id = existing?.id || parsed.id || stableId("account", parsed.domain || parsed.name);
+      if (seenTargets.has(id) || (!existing && accountsById.has(id))) throw error("DUPLICATE_ID", `Duplicate account id ${id} in CSV.`, { field: "id" });
+      seenTargets.add(id);
+      const account = normalizeAccount({ ...existing, ...parsed, id, attributes: { ...existing?.attributes, ...parsed.attributes } }, index, current.tags, current.fields);
+      if (!existing) {
+        assertLimit("accounts", current.accounts.length + creates + 1);
+        creates += 1;
+      }
+      changes.push({ action: existing ? "update" : "create", account });
+    } catch (cause) {
+      errors.push({ row: rowNumber, field: cause.details?.field || "row", message: cause.message });
+    }
+  });
+  let directory = null;
+  if (!errors.length) {
+    const updates = new Map(changes.filter(change => change.action === "update").map(change => [change.account.id, change.account]));
+    const accounts = current.accounts.map(account => updates.get(account.id) || account);
+    accounts.push(...changes.filter(change => change.action === "create").map(change => change.account));
+    try {
+      // Validate the complete resulting directory before either preview approval or publication.
+      directory = normalizeCustomerDirectory({ ...current, accounts });
+    } catch (cause) {
+      errors.push({ row: 1, field: cause.details?.field || "row", message: cause.message });
+    }
+  }
+  const preview = freeze({ valid: errors.length === 0, creates, updates: changes.length - creates, errors, changes });
+  return { preview, directory };
 }
 
 function updateCollection(directory, kind, input, options, replacing) {
@@ -346,7 +390,7 @@ function normalizeAccount(value, index, tags, fields) {
   const status = CUSTOMER_STATUSES.includes(account.status) ? account.status : "prospect";
   const tagIds = unique(list(account.tagIds).map(text).filter(Boolean));
   const tagSet = new Set(tags.map((tag) => tag.id));
-  if (tagIds.some((tagId) => !tagSet.has(tagId))) throw error("INVALID_REFERENCE", "Account references an unknown tag.", { id });
+  if (tagIds.some((tagId) => !tagSet.has(tagId))) throw error("INVALID_REFERENCE", "Account references an unknown tag.", { id, field: "tagIds" });
   const attributes = {};
   for (const field of fields) {
     if (!Object.prototype.hasOwnProperty.call(account.attributes || {}, field.id)) continue;
@@ -434,7 +478,13 @@ function evaluateRule(account, rule, fields) {
 function normalizeTypedValue(value, field) {
   if (value === null || value === undefined || value === "") return field.type === "multi-select" ? [] : "";
   if (field.type === "number") return optionalNumber(value);
-  if (field.type === "boolean") return value === true || String(value).toLowerCase() === "true";
+  if (field.type === "boolean") {
+    if (typeof value === "boolean") return value;
+    const token = text(value).toLowerCase();
+    if (token === "true") return true;
+    if (token === "false") return false;
+    throw error("INVALID_VALUE", "Expected true or false.");
+  }
   if (field.type === "date") return dateValue(value);
   if (field.type === "multi-select") {
     const values = unique(list(value).map(text).filter(Boolean));
@@ -447,19 +497,30 @@ function normalizeTypedValue(value, field) {
 }
 
 function csvAccount(raw, directory) {
+  if (!text(raw.name)) throw error("INVALID_ACCOUNT", "Customer accounts require a name.", { field: "name" });
   const attributes = {};
   for (const field of directory.fields) {
     const cell = raw[`custom.${field.id}`];
-    if (cell === undefined || cell === "") continue;
-    attributes[field.id] = normalizeTypedValue(field.type === "multi-select" ? parseJsonList(cell) : cell, field);
+    if (cell === undefined) continue;
+    attributes[field.id] = withCsvField(`custom.${field.id}`, () => normalizeTypedValue(field.type === "multi-select" && cell !== "" ? parseJsonList(cell) : cell, field));
   }
-  return {
-    id: text(raw.id), name: text(raw.name), domain: normalizeDomain(raw.domain),
-    status: text(raw.status) || "prospect", industry: text(raw.industry), region: text(raw.region),
-    employeeCount: raw.employeeCount === "" ? null : optionalNumber(raw.employeeCount),
-    planTier: text(raw.planTier), ownerPersonId: text(raw.ownerPersonId), notes: text(raw.notes),
-    tagIds: raw.tagIds ? parseJsonList(raw.tagIds) : [], attributes
-  };
+  const account = { attributes };
+  for (const field of ["id", "name", "domain", "status", "industry", "region", "planTier", "ownerPersonId", "notes"]) {
+    if (Object.hasOwn(raw, field)) account[field] = text(raw[field]);
+  }
+  if (Object.hasOwn(raw, "domain")) account.domain = normalizeDomain(account.domain);
+  if (account.status && !CUSTOMER_STATUSES.includes(account.status)) throw error("INVALID_VALUE", "Unknown customer status.", { field: "status" });
+  if (Object.hasOwn(raw, "employeeCount")) account.employeeCount = withCsvField("employeeCount", () => optionalNumber(raw.employeeCount));
+  if (Object.hasOwn(raw, "tagIds")) account.tagIds = withCsvField("tagIds", () => raw.tagIds ? parseJsonList(raw.tagIds) : []);
+  return account;
+}
+
+function withCsvField(field, read) {
+  try { return read(); }
+  catch (cause) {
+    if (cause instanceof CustomerDirectoryError) cause.details = { ...cause.details, field };
+    throw cause;
+  }
 }
 
 function parseJsonList(value) {
@@ -547,8 +608,11 @@ function optionalNumber(value) {
 
 function dateValue(value) {
   const candidate = text(value);
-  if (!candidate || Number.isNaN(Date.parse(candidate))) throw error("INVALID_VALUE", "Expected an ISO date.");
-  return candidate.slice(0, 10);
+  const parsed = new Date(`${candidate}T00:00:00.000Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(candidate) || candidate.startsWith("0000-") || Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== candidate) {
+    throw error("INVALID_VALUE", "Expected an ISO date (YYYY-MM-DD) that exists in the calendar.");
+  }
+  return candidate;
 }
 
 function iso(value) {

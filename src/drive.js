@@ -348,9 +348,9 @@ function multipartBody(metadata, content) {
 }
 
 function driveConflictMessage(kind) {
-  if (kind === "deleted") return "The Drive workspace was deleted since the last sync. Pull Remote before pushing.";
-  if (kind === "mismatch") return "The Drive workspace changed since the last sync. Pull Remote or save local work as a conflict copy.";
-  return "The Drive workspace has no trusted local baseline. Pull Remote before pushing.";
+  if (kind === "deleted") return "The Drive workspace file was deleted since your last sync. Save your work as a separate copy, then choose an existing Drive file or create a new project.";
+  if (kind === "mismatch") return "The Drive file changed since your last sync. Download the Drive copy or save this device's work as a separate conflict copy before continuing.";
+  return "PM OS has no saved Drive version to compare changes against. Download the Drive copy before uploading.";
 }
 
 function loadGoogleIdentityScript(doc) {

@@ -1,6 +1,10 @@
+import { localDateStamp } from "./local-date.js";
+import { parseInboundFile, buildInboundWorkspace } from "./inbound-import.js";
+import { reviewInboundImport } from "./inbound-import-dialog.js";
+import { APP_RELEASE } from "./release.js";
 import { serviceWorkerUpdateSettingsMarkup } from "./service-worker-update.js?v=26";
+import { recordDraftKey, recordDraftBaseline, recordDraftSaveError } from "./record-drafts.js";
 import {
-  CAPACITY_BENCHMARKS,
   buildActionMemo,
   buildActionQueue,
   isActionQueueEntryComplete,
@@ -11,6 +15,8 @@ import {
   buildCommunicationMemo,
   buildCommunicationPlan,
   buildDependencyMap,
+  findDependencyCycles,
+  rolloutReadinessGuidance,
   buildDependencyMemo,
   buildDeliveryBoard,
   buildDeliveryMemo,
@@ -54,6 +60,7 @@ import {
   buildTemplateDraft,
   buildWeeklyPlan,
   calculateHealth,
+  formatOperationalScore,
   calculateLaunchReadiness,
   activeDependencies,
   activeRisks,
@@ -67,8 +74,6 @@ import {
   exportWorkspace,
   importActivityLog,
   groupByStatus,
-  importCsv,
-  importGitHubIssueMarkdown,
   importWorkspace,
   normalizeDependencyRecord,
   normalizeRiskRecord,
@@ -111,7 +116,7 @@ import {
   saveDriveConflictCopy,
   saveDriveWorkspace
 } from "./drive.js";
-import { runStorageTransaction } from "./storage.js";
+import { runStorageTransaction, createStorageWriteScope, captureStorageValues, staleWorkspaceWriteError, forgetStorageWriteScope } from "./storage.js";
 import {
   childrenOf,
   createPerson,
@@ -155,6 +160,7 @@ import {
   updateCustomerTag
 } from "./customers.js";
 import {
+  WORKSPACE_DOCUMENT_SCHEMA,
   createEmptyWorkspaceDocument,
   createWorkspaceDocument,
   decodeWorkspaceDocument,
@@ -184,6 +190,9 @@ import {
 import {
   EXPERIENCE_BUNDLES,
   EXPERIENCE_CAPABILITIES,
+  WORKSPACE_PRESETS,
+  workspaceExperienceForPreset,
+  matchingWorkspacePreset,
   fullWorkspaceExperience,
   normalizeWorkspaceExperience,
   updateWorkspaceExperience,
@@ -197,6 +206,8 @@ import {
   InitiativeWorkflowError,
   defaultInitiativeWorkflow,
   initiativeStatusUsage,
+  initiativeReportingContext,
+  workflowReportingNote,
   isTerminalInitiativeStatus,
   normalizeInitiativeWorkflow,
   statusForId,
@@ -227,10 +238,12 @@ import {
   INSIGHT_STATUSES,
   INSIGHT_STATUS_LABELS,
   INSIGHT_TYPE_LABELS,
+  ENABLEMENT_AREAS,
   SUPPORT_SEVERITIES,
   SUPPORT_SEVERITY_LABELS,
   VALIDATION_DECISIONS,
   VALIDATION_DECISION_LABELS,
+  validationDecisionSummary,
   buildDiscoveryWorkspace,
   buildFeedbackWorkspace,
   buildInsightMemo,
@@ -240,11 +253,15 @@ import {
   createInsightRecord,
   deleteInsightRecord,
   filterInsightRecords,
+  projectCanonicalInitiativeRecords,
+  migrateLegacyWorkRecords,
   normalizeInsightRecord,
   updateInsightRecord
 } from "./insights.js";
 import {
   PlanningCalendarError,
+  createPlanningCapacityPlan,
+  resolvePlanningCapacity,
   describeInitiativeTimeline,
   emptyPlanningCalendar,
   filterItemsByPeriod,
@@ -259,6 +276,7 @@ import {
   shiftPeriodSelection,
   updatePlanningCalendar as patchPlanningCalendar
 } from "./planning-calendar.js";
+import { planningCapacityMessage, capacityNumber, capacityFormDefaults, capacityDraftPreview, planningCapacityMarkup } from "./planning-capacity-ui.js";
 import {
   allowedModes as policyAllowedModes,
   defaultSpaceMode as policyDefaultSpaceMode,
@@ -288,11 +306,14 @@ import {
   createProject as createRegistryProject,
   forgetProject as forgetRegistryProject,
   normalizeProjectRegistry,
+  prepareProjectRename,
   normalizeProjectLocation,
   projectById as registryProjectById,
   projectKeys,
   projectsForConnector,
   readProjectBundle,
+  readCurrentProjectRegistry,
+  readWeeklyUpdateCopied,
   recentProjects,
   renameProject as renameRegistryProject,
   setProjectArchived,
@@ -304,9 +325,17 @@ import {
   createProjectUiState,
   currentProjectDescriptor,
   newProjectWizardState,
+  projectWizardConnection,
   projectSwitcherButtonMarkup,
   projectSwitcherMarkup
 } from "./project-switcher.js";
+
+import { DocumentComposer, buildWeeklyUpdateMarkdown } from "./document-composer.js";
+import { createArtifactRecord, normalizeArtifactRecord } from "./artifacts.js";
+const documentComposer = new DocumentComposer();
+const planningCapacityDrafts = new Map();
+const initiativeRecordDrafts = new Map();
+const portfolioOpenRecommendations = new Set();
 
 const legacyStorageKey = "pm-os-staging.workspace.v1";
 const legacyActivityKey = "pm-os-staging.activity.v1";
@@ -317,6 +346,8 @@ const usageKey = "pm-os-staging.usage.v2";
 const themeKey = "pm-os-staging.ui-theme.v1";
 const workspaceModeKey = "pm-os-staging.workspace-mode.v1";
 const teamFactoryHook = "__PM_OS_TEAM_CLIENT_FACTORY__";
+import { readTeamInvitationCallback, showTeamInvitation } from "./team-invitation.js";
+const receivedTeamInvitation = readTeamInvitationCallback(globalThis);
 const urlParams = new URLSearchParams(location.search);
 const storedWorkspaceMode = loadWorkspaceModePreference();
 const explicitDemoMode = urlParams.get("demo") === "1";
@@ -351,7 +382,8 @@ let activeProjectStorageKeys = (initialServerProjectId ? projectKeys(projectRegi
   activity: legacyActivityKey,
   source: "pm-os-staging.source.v2",
   sync: "pm-os-staging.sync.v2",
-  backups: legacyBackupKey
+  backups: legacyBackupKey,
+  checklist: "pm-os-staging.checklist.v1"
 };
 let storageKey = activeProjectStorageKeys.workspace;
 let activityKey = activeProjectStorageKeys.activity;
@@ -394,6 +426,11 @@ const VIEW_REGISTRY = Object.freeze([
   { id: "settings", deepLink: "settings", label: "Settings", title: "Settings", renderer: () => settingsSpaceView(), showSearch: false }
 ].map((view) => Object.freeze(view)));
 const viewByDeepLink = new Map(VIEW_REGISTRY.map((view) => [view.deepLink, view]));
+const demoReferenceDate = new Date();
+function demoDate(offset) {
+  const date = new Date(demoReferenceDate.getFullYear(), demoReferenceDate.getMonth(), demoReferenceDate.getDate() + offset, 12);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
 const demoSeedItems = [
   {
     title: "Reduce onboarding drop-off",
@@ -406,8 +443,8 @@ const demoSeedItems = [
     impact: 4,
     confidence: 0.75,
     effort: 5,
-    startDate: "2026-07-20",
-    dueDate: "2026-08-15",
+    startDate: demoDate(-7),
+    dueDate: demoDate(14),
     nextStep: "Review activation funnel with design and data.",
     risk: "Analytics event coverage is incomplete.",
     experiment: "Guided setup checklist with progressive disclosure.",
@@ -423,8 +460,8 @@ const demoSeedItems = [
     impact: 5,
     confidence: 0.6,
     effort: 8,
-    startDate: "2026-08-03",
-    dueDate: "2026-09-01",
+    startDate: demoDate(-3),
+    dueDate: demoDate(21),
     nextStep: "Interview success managers about tagging workflow.",
     experiment: "CSV import plus manual triage queue."
   },
@@ -449,10 +486,11 @@ const demoSeedItems = [
     impact: 4,
     confidence: 0.7,
     effort: 5,
-    startDate: "2026-07-27",
-    dueDate: "2026-08-22",
+    startDate: demoDate(-10),
+    dueDate: demoDate(7),
     nextStep: "Confirm the audit event model with security and data.",
     risk: "Retention requirements are not approved.",
+    dependencies: [{ id: "demo-audit-approval", description: "Security approval of the audit retention policy", targetType: "external", targetName: "Security review", status: "blocked", ownerName: "Trust PM", ownerPersonId: "", targetInitiativeId: "", neededBy: demoDate(3), createdAt: demoReferenceDate.toISOString(), updatedAt: demoReferenceDate.toISOString() }],
     experiment: "Pilot audit exports with five enterprise admins."
   },
   {
@@ -460,14 +498,15 @@ const demoSeedItems = [
     customer: "New self-serve teams",
     problem: "Teams need clearer upgrade guidance after completing setup.",
     owner: "Monetization PM",
-    status: "discovery",
+    status: "shipped",
     reach: 1300,
     impact: 3,
     confidence: 0.65,
     effort: 3,
-    startDate: "2026-08-10",
-    dueDate: "2026-08-29",
-    nextStep: "Test upgrade guidance after the activation milestone.",
+    startDate: demoDate(-21),
+    dueDate: demoDate(-2),
+    nextStep: "Review the shipped upgrade guidance with support.",
+    decision: "Released contextual upgrade guidance; review customer feedback after launch.",
     experiment: "Compare contextual upgrade guidance with the current trial banner."
   }
 ].map((item) => createItem(item));
@@ -479,7 +518,10 @@ const demoWorkspace = {
 const emptyOperationWorkspace = createEmptyWorkspaceDocument();
 let cachedOperationalWorkspaceRaw;
 let cachedOperationalWorkspaceResult;
+let localWriteScope;
+try { localWriteScope = createLocalWriteScope(); } catch { /* Recovery stays available when storage cannot be read. */ }
 const initialOperationalWorkspaceLoad = loadOperationalWorkspaceResult();
+let localCommittedWorkspace = initialOperationalWorkspaceLoad.workspace;
 
 const initialRecovery = loadRecoverySnapshots();
 const initialExperience = loadExperience();
@@ -497,11 +539,12 @@ const state = {
   experienceStatus: "",
   experienceBusy: false,
   routeAnnouncement: "",
-  weeklyUpdateCopied: false,
+  weeklyUpdateCopied: !demoMode && readWeeklyUpdateCopied(localStorage, activeProjectStorageKeys.checklist),
   items: loadItems(),
   insightRecords: loadInsightRecords(),
   codeRepositories: loadCodeRepositories(),
   implementationRuns: loadImplementationRuns(),
+  artifacts: loadArtifacts(),
   planningCalendar: initialPlanningCalendar,
   periodSelection: normalizePeriodSelection(urlParams, initialPlanningCalendar),
   periodAnnouncement: initialPeriodInvalid ? "That timeline selection is invalid or unavailable. Showing All time." : "",
@@ -523,6 +566,7 @@ const state = {
   customerStatus: "",
   customerImport: null,
   customerSegmentDraft: null,
+  customerAccountDrafts: new Map(),
   organizationStatus: "",
   workflowStatus: "",
   selectedWorkflowStatusId: "",
@@ -552,6 +596,7 @@ const state = {
   driveReview: null,
   driveToken: "",
   driveAdvancedOpen: false,
+  dataAdvancedOpen: false,
   syncStatus: demoMode ? "Drive sync is disabled in demo mode." : "Drive sync not connected.",
   linkedFile: { handle: null, name: "", permission: "unknown", lastModified: 0, status: "" },
   team: createTeamState(),
@@ -584,7 +629,23 @@ const state = {
     connectors: serverConnectorPool?.registry.connectors || []
   })
 };
+window.addEventListener("beforeunload", event => {
+  const initiativeDraft = state.initiativeEditor.mode && state.initiativeEditor.draft;
+  const insightDraft = state.insightEditor.mode && state.insightEditor.mode !== "view" && state.insightEditor.draft;
+  if (documentComposer.hasEdits || state.customerAccountDrafts.size || initiativeRecordDrafts.size || initiativeDraft || insightDraft) { event.preventDefault(); event.returnValue = ""; }
+});
 state.sourceSelection = sourceSelectionFor(state.source);
+if (receivedTeamInvitation) { state.modeChoiceOpen = false; }
+if (initialWorkspaceModeChoiceOpen && state.projects?.persistent && !receivedTeamInvitation) {
+  state.modeChoiceOpen = false;
+  state.projects.surface = "wizard";
+  const drive = normalizeDriveRuntimeConfig(globalThis.PM_OS_DRIVE_CONFIG);
+  state.projects.wizard = {
+    ...newProjectWizardState({ managedConfig: resolveBackendRuntimeConfig(globalThis), driveClientId: drive?.clientId || "", drivePickerAvailable: Boolean(drive?.pickerApiKey && drive?.appId) }),
+    firstRun: true, entryMode: "blank", presetId: "solo-pm", customCapabilities: [],
+    importDocument: null, importName: "", onboarding: "blank"
+  };
+}
 if (!demoMode) state.syncStatus = state.source.type === "google-drive"
   ? "Drive is ready to connect."
   : state.source.type === "local-file" ? "Restoring linked file access..." : "Browser storage is active.";
@@ -608,13 +669,24 @@ if (state.projects && ((!urlParams.has("space") && !urlParams.has("view")) || (u
 if (urlParams.has("insightId")) restoreInsightSelection(urlParams.get("insightId"));
 if (urlParams.has("insightStatus")) state.insightStatusFilter = validInsightStatus(urlParams.get("insightStatus"));
 app.addEventListener("click", handleDelegatedNavigation);
-if (!state.modeChoiceOpen && (!state.projects || !urlParams.get("project") || urlParams.get("project") === state.projects.registry.activeProjectId)
+if (!initialWorkspaceModeChoiceOpen && (!state.projects || !urlParams.get("project") || urlParams.get("project") === state.projects.registry.activeProjectId)
   && (!urlParams.get("space") || urlParams.get("view") || urlParams.has("experience") || (state.projects && !urlParams.get("project")))) pushViewUrl(true);
-if (!state.modeChoiceOpen) recordViewUsage(state.selectedView);
+if (!initialWorkspaceModeChoiceOpen) recordViewUsage(state.selectedView);
 render();
 if (!urlParams.get("project") || urlParams.get("project") === state.projects?.registry.activeProjectId) persistCurrentProjectLocation();
 void restoreLinkedWorkspaceHandle();
-if (state.projects && initialServerProjectId) {
+if (receivedTeamInvitation) {
+  void showTeamInvitation({ invitation: receivedTeamInvitation, config: resolveBackendRuntimeConfig(globalThis), pool: serverConnectorPool,
+    onJoined: async ({ workspaceId, workspaceName, connectorId }) => {
+      if (!state.projects) throw new Error("Project storage is unavailable.");
+      state.projects.connectors = serverConnectorPool.registry.connectors;
+      state.projects.wizard = { ...newProjectWizardState(), provider: "server", name: workspaceName, connectorId,
+        serverAction: "existing", serverWorkspaceId: workspaceId, onboarding: "blank" };
+      await createServerProjectFromWizard();
+      if (!state.team.active || state.team.workspace?.id !== workspaceId) throw new Error("Workspace could not open.");
+    }
+  });
+} else if (state.projects && initialServerProjectId) {
   queueMicrotask(() => { void restoreViewFromLocation(); });
 } else if (state.projects && urlParams.get("project") && urlParams.get("project") !== state.projects.registry.activeProjectId) {
   queueMicrotask(() => { void restoreViewFromLocation(); });
@@ -622,14 +694,19 @@ if (state.projects && initialServerProjectId) {
 window.addEventListener("popstate", restoreViewFromLocation);
 window.addEventListener("focus", inspectLinkedWorkspaceOnFocus);
 window.addEventListener("online", () => {
+  refreshSaveStatus();
   if (state.source.type === "google-drive" && state.driveToken && state.sync.localPending) scheduleAutomaticDriveSync();
 });
+window.addEventListener("offline", refreshSaveStatus);
 document.addEventListener("keydown", handleViewsEscape);
 document.addEventListener("keydown", handleTutorialKeydown);
 window.addEventListener("resize", scheduleTutorialLayout);
 document.addEventListener("scroll", scheduleTutorialLayout, true);
 
 function render() {
+  state.generatedAskTargets = new Map();
+  state.measureTargets = new Map();
+  state.items = projectCanonicalInitiativeRecords(state.items, state.insightRecords);
   recoverUnavailableRoute();
   const catalogActiveProject = currentProjectDescriptor(state.projects, state.team);
   const audienceItems = decorateInitiativeAudiences(decorateWorkspacePriorities(state.items));
@@ -671,12 +748,17 @@ function render() {
         <p class="sr-only" id="initiativeEditorStatus" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.editorAnnouncement)}</p>
         <p class="sr-only" id="periodStatus" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.periodAnnouncement)}</p>
         <p class="sr-only" id="copyStatus" role="status" aria-live="polite" aria-atomic="true"></p>
-        <p class="sr-only" id="routeStatus" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.routeAnnouncement)}</p>
+        <p class="${state.routeAnnouncement ? "route-notice" : "sr-only"}" id="routeStatus" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.routeAnnouncement)}</p>
         ${storageWarningMarkup()}
+        ${localWriteRecoveryMarkup()}
+        ${state.initiativeDetail.selectedId ? "" : initiativeRecordDraftRecoveryMarkup()}
+        ${linkedFileWarningMarkup()}
+        ${demoMode && currentView.id === "today" ? `<section class="panel" aria-label="Demo scenarios"><p>Sample dates are relative to ${demoDate(0)}. Explore healthy feedback research, blocked audit work, shipped trial guidance, and unscheduled export controls. Demo edits reset on reload and stay separate from saved work.</p></section>` : ""}
         ${currentView.id === "today" ? weeklyLoopMarkup() : ""}
         ${scopeActive ? timelineToolbarMarkup(periodItems.length) : ""}
         ${teamConflictMarkup()}
         ${contextualWorkflowsMarkup()}
+        ${operationalMeasureGuideMarkup()}
         ${currentView.renderer(viewContext)}
       </main>
     </div>
@@ -690,13 +772,34 @@ function render() {
     ${tutorialMarkup()}`;
 
   bindEvents();
+  bindInitiativeRecordDraftRecovery();
+  const artifactScope = captureDocumentArtifactScope();
+  documentComposer.bind({ root: app, context: documentComposerContext, refresh: renderAndFocus,
+    saveArtifact: (input, expectedVersion) => saveDocumentArtifact(input, expectedVersion, artifactScope),
+    deleteArtifact: (id, expectedVersion) => deleteDocumentArtifact(id, expectedVersion, artifactScope),
+    confirm: (title, description, confirmLabel) => requestDataConfirmation({ title, description, confirmLabel, trigger: document.activeElement }),
+    download: downloadFile });
+  document.querySelectorAll("[data-open-document]").forEach(button => button.addEventListener("click", async () => {
+    const projectKey = documentComposerContext().projectKey;
+    if (documentComposer.hasEdits && !await requestDataConfirmation({ title: "Replace your edited draft?", description: "Save or download your draft before replacing it with another document.", confirmLabel: "Replace draft", trigger: button })) return;
+    if (documentComposerContext().projectKey !== projectKey) return;
+    documentComposer.choose(button.dataset.openDocument, button.dataset.documentInitiative || "");
+    navigateToView("today", "content", "documents");
+  }));
+  bindLocalWriteRecovery();
+  if (state.localWriteConflict) restoreLocalFormDrafts(state.localWriteConflict.forms);
   revealActiveSpaceMode();
   scheduleTutorialLayout();
 }
 
+function linkedFileWarningMarkup() {
+  if (demoMode || state.team.active || state.source.type !== "local-file" || !state.sync.fileConflicts.length) return "";
+  return '<aside class="storage-warning" role="alert" aria-labelledby="linkedFileWarningTitle"><div><strong id="linkedFileWarningTitle">File conflict needs review</strong><p>Your changes are saved on this device. The linked file has different changes and has not been overwritten.</p></div><button class="secondary" id="reviewLinkedFileConflictButton" type="button">Review file conflict</button></aside>';
+}
+
 function storageWarningMarkup() {
   if (!state.storageWarning) return "";
-  return `<aside class="storage-warning" role="alert" aria-labelledby="storageWarningTitle"><div><strong id="storageWarningTitle">Operational workspace needs recovery</strong><p>${escapeHtml(state.storageWarning)}</p></div><button class="secondary" id="openDataRecoveryButton" type="button">Open data &amp; backup</button></aside>`;
+  return `<aside class="storage-warning" role="alert" aria-labelledby="storageWarningTitle"><div><strong id="storageWarningTitle">Saved workspace needs recovery</strong><p>${escapeHtml(state.storageWarning)}</p></div><button class="secondary" id="openDataRecoveryButton" type="button">Open data &amp; backup</button></aside>`;
 }
 
 function contextualWorkflowsMarkup() {
@@ -743,7 +846,8 @@ function revealActiveSpaceMode() {
 }
 
 function timelineScopeApplies() {
-  return experienceHas("timeline-planning") && ["initiatives", "planning", "delivery", "briefings", "team"].includes(state.selectedView);
+  const capacitySurface = (state.selectedView === "initiatives" && state.selectedMode === "portfolio") || (state.selectedView === "planning" && state.selectedMode === "capacity");
+  return (experienceHas("timeline-planning") && ["initiatives", "planning", "delivery", "briefings", "team"].includes(state.selectedView)) || (experienceHas("portfolio-planning") && capacitySurface);
 }
 
 function timelineToolbarMarkup(resultCount) {
@@ -753,7 +857,7 @@ function timelineToolbarMarkup(resultCount) {
   const typeOptions = state.planningCalendar.enabledPeriodTypes
     .map((type) => `<option value="${type}" ${selection.kind === type ? "selected" : ""}>${titleCase(type)}</option>`)
     .join("");
-  const jumpDate = period?.startDate || new Date().toISOString().slice(0, 10);
+  const jumpDate = period?.startDate || localDateStamp();
   return `<section class="timeline-toolbar" aria-labelledby="timelineScopeTitle">
     <div class="timeline-scope-copy"><p class="panel-kicker">Timeline scope</p><h3 id="timelineScopeTitle">${escapeHtml(periodSelectionLabel(selection, state.planningCalendar))}</h3><p>${escapeHtml(periodSelectionRangeLabel(selection, state.planningCalendar))}</p></div>
     <div class="timeline-scope-controls">
@@ -768,7 +872,7 @@ function changeTimelineKind(event) {
   const kind = event.currentTarget.value;
   const selection = ["all", "unscheduled"].includes(kind)
     ? { kind }
-    : { kind, startDate: periodForDate(kind, new Date().toISOString().slice(0, 10), state.planningCalendar)?.startDate };
+    : { kind, startDate: periodForDate(kind, localDateStamp(), state.planningCalendar)?.startDate };
   applyPeriodSelection(selection, "periodKind");
 }
 
@@ -779,7 +883,7 @@ function moveTimelinePeriod(amount, focusId) {
 function selectCurrentTimelinePeriod() {
   const kind = state.periodSelection.kind;
   if (!["sprint", "month", "quarter", "year"].includes(kind)) return;
-  applyPeriodSelection({ kind, startDate: new Date().toISOString().slice(0, 10) }, "currentPeriodButton");
+  applyPeriodSelection({ kind, startDate: localDateStamp() }, "currentPeriodButton");
 }
 
 function jumpTimelinePeriod(event) {
@@ -801,21 +905,378 @@ function applyPeriodSelection(selection, focusId = "periodKind") {
   });
 }
 
+function documentComposerContext() {
+  const saveUnavailableReason = documentArtifactSaveUnavailableReason();
+  return {
+    artifacts: state.artifacts, canSave: !saveUnavailableReason, saveUnavailableReason,
+    projectKey: state.team.active ? `team:${state.team.connectorId}:${state.team.workspace?.id}` : activeRegistryProject(state.projects?.registry)?.id || "browser",
+    projectName: (state.team.active && state.team.workspace?.name) || activeRegistryProject(state.projects?.registry)?.name || (demoMode ? "Demo workspace" : "My project"),
+    items: decorateInitiativeAudiences(decorateWorkspacePriorities(state.items)),
+    activity: state.activity, prioritization: state.prioritization, calendar: state.planningCalendar, workflow: state.workflow,
+    insightRecords: state.insightRecords, customerDirectory: state.customerDirectory,
+    timelineEnabled: experienceHas("timeline-planning"), experience: state.experience
+  };
+}
+
+
+
+
+function planningCapacityDraft() {
+  const key = documentComposerContext().projectKey;
+  let draft = planningCapacityDrafts.get(key);
+  if (!draft || (!draft.editing && !draft.dirty && !draft.saving && draft.version !== state.planningCalendar.version)) {
+    draft = capacityFormDefaults(state.planningCalendar, state.periodSelection);
+    planningCapacityDrafts.set(key, draft);
+  }
+  return draft;
+}
+
+function currentPlanningCapacity() {
+  return resolvePlanningCapacity(state.planningCalendar, state.periodSelection, { filtered: Boolean(state.query.trim()) });
+}
+
+function planningCapacityReadOnlyReason() {
+  if (state.storageWarning && !state.team.active) return "Recover this project's saved workspace before changing planning capacity.";
+  if (demoTeamRole && demoTeamRole !== "owner") return "Only a workspace owner can change planning capacity.";
+  if (state.team.active && state.team.role !== "owner") return "Only a workspace owner can change planning capacity.";
+  if (state.team.active && state.team.connection !== "live") return "Reconnect to the workspace before changing planning capacity.";
+  if (state.team.mutationBusy) return "Wait for the current workspace change to finish.";
+  return "";
+}
+
+function planningCapacitySettingsMarkup() {
+  return planningCapacityMarkup(state.planningCalendar, state.periodSelection, planningCapacityDraft(), planningCalendarCanManage(), Boolean(state.query.trim()), planningCapacityReadOnlyReason());
+}
+
+function capturePlanningCapacityDraft(form, draft = planningCapacityDraft()) {
+  const data = new FormData(form);
+  draft.kind = String(data.get("capacityKind") || "");
+  draft.date = String(data.get("capacityDate") || "");
+  draft.effort = String(data.get("capacityEffort") ?? "");
+  draft.dirty = true;
+  draft.editing = true;
+  draft.error = "";
+  draft.status = "";
+  const preview = form.querySelector("#capacityDraftPreview");
+  if (preview) preview.textContent = capacityDraftPreview(state.planningCalendar, draft);
+}
+
+function bindPlanningCapacityEvents() {
+  const form = document.querySelector("#planningCapacityForm");
+  if (!form) return;
+  const projectKey = documentComposerContext().projectKey;
+  const draft = planningCapacityDraft();
+  const capture = () => {
+    if (form.isConnected && projectKey === documentComposerContext().projectKey && !draft.saving) capturePlanningCapacityDraft(form, draft);
+  };
+  form.addEventListener("input", capture);
+  form.addEventListener("change", capture);
+  form.addEventListener("submit", savePlanningCapacity);
+  const details = document.querySelector("#planningCapacityDetails");
+  details?.addEventListener("toggle", () => {
+    if (details.isConnected && projectKey === documentComposerContext().projectKey && !draft.saving) draft.editing = details.open;
+  });
+  document.querySelector("#cancelPlanningCapacity")?.addEventListener("click", () => {
+    if (draft.saving) return;
+    const restored = capacityFormDefaults(state.planningCalendar, state.periodSelection);
+    restored.status = "Changes cancelled. Showing the saved planning capacity.";
+    planningCapacityDrafts.set(projectKey, restored);
+    renderAndFocus("planningCapacityStatus");
+  });
+  document.querySelector("#clearPlanningCapacity")?.addEventListener("click", () => void savePlanningCapacity(null, true));
+  document.querySelector("#openCapacityHorizon")?.addEventListener("click", openSavedCapacityHorizon);
+}
+
+function openSavedCapacityHorizon() {
+  const saved = state.planningCalendar.capacityPlan;
+  if (!saved) return;
+  const selection = { kind: saved.horizon.kind, startDate: saved.horizon.startDate };
+  const resolved = resolvePlanningCapacity(state.planningCalendar, selection);
+  if (!resolved.available) {
+    planningCapacityDraft().error = planningCapacityMessage(resolved);
+    renderAndFocus("planningCapacityStatus");
+    return;
+  }
+  state.query = "";
+  applyPeriodSelection(selection, "planningCapacityStatus");
+}
+
+function refreshLocalPlanningWorkspace() {
+  const readValues = captureStorageValues(localStorage, [storageKey, activityKey, syncKey, sourceKey]);
+  const raw = readValues[0].value;
+  const latest = importPortableWorkspace(raw || encodeWorkspaceDocument(emptyOperationWorkspace));
+  const current = importPortableWorkspace(exportPortableWorkspace());
+  if (JSON.stringify(latest) !== JSON.stringify(current)) {
+    const experienceDraft = state.experienceDraft;
+    applyTeamSnapshot(latest);
+    state.experienceDraft = experienceDraft;
+    state.sync = loadSync();
+    rememberLocalWorkspaceRead(readValues);
+    throw documentArtifactError("VERSION_CONFLICT", "This project's saved work changed in another tab. The workspace was refreshed and your planning draft is preserved. Review the latest saved calendar before retrying; cancel changes to reload its values.");
+  }
+}
+
+async function commitLocalPlanningCalendar(next, actionTitle) {
+  await commitLocalWorkspacePatch({ planningCalendar: next }, [createActivityEntry("planning-calendar-updated", { id: "", title: actionTitle }, { planningCalendar: { from: state.planningCalendar, to: next } })]);
+}
+
+async function writePlanningCalendar(next, expectedVersion, scope, actionTitle) {
+  if (!documentArtifactScopeIsCurrent(scope)) throw documentArtifactError("PROJECT_CHANGED", "The active project changed. Reopen the original project to review your planning draft.");
+  const reason = planningCapacityReadOnlyReason();
+  if (reason) throw documentArtifactError("PERMISSION_DENIED", reason);
+  if (!scope.repository && !demoMode) refreshLocalPlanningWorkspace();
+  if (state.planningCalendar.version !== expectedVersion) throw documentArtifactError("VERSION_CONFLICT", "The saved planning calendar changed. Your draft is preserved; cancel changes to reload its latest values before editing again.");
+  if (!scope.repository) {
+    await commitLocalPlanningCalendar(next, actionTitle);
+    return;
+  }
+  scope.team.mutationBusy = true;
+  try {
+    const result = await scope.repository.updatePlanningCalendar(next, expectedVersion);
+    if (!documentArtifactScopeIsCurrent(scope)) throw documentArtifactError("PROJECT_CHANGED", "The planning change may have been saved in the previous workspace. Reopen that project to review it.");
+    if (!result?.snapshot?.planningCalendar || !applyTeamSnapshot(result.snapshot)) throw documentArtifactError("REMOTE_ERROR", "The server did not confirm the saved planning calendar. Your draft is preserved; check the workspace before retrying.");
+    scope.team.error = false;
+    scope.team.status = "Planning settings saved.";
+  } catch (error) {
+    if (!documentArtifactScopeIsCurrent(scope)) throw documentArtifactError("PROJECT_CHANGED", "The active workspace changed while saving. Reopen the original project to check whether its planning change was saved.");
+    if (isTeamConflict(error) || error?.code === "VERSION_CONFLICT" || isAmbiguousTeamError(error)) {
+      await refreshDocumentArtifactTeamScope(scope).catch(() => undefined);
+    }
+    if (!documentArtifactScopeIsCurrent(scope)) throw documentArtifactError("PROJECT_CHANGED", "The active workspace changed. Reopen the original project to review its planning draft.");
+    throw error;
+  } finally {
+    scope.team.mutationBusy = false;
+  }
+}
+
+function planningSaveError(error) {
+  if (error?.message && (error instanceof PlanningCalendarError || ["VERSION_CONFLICT", "PROJECT_CHANGED", "REMOTE_ERROR", "PERMISSION_DENIED"].includes(error?.code))) return error.message;
+  return safeTeamError(error, "Planning settings could not be saved. Your draft is preserved; try again.");
+}
+
+async function savePlanningCapacity(event, clear = false) {
+  event?.preventDefault();
+  const draft = planningCapacityDraft();
+  if (draft.saving || !planningCalendarCanManage()) return;
+  if (event) capturePlanningCapacityDraft(event.currentTarget, draft);
+  const scope = captureDocumentArtifactScope();
+  let next;
+  try {
+    if (!clear && draft.effort.trim() === "") throw new PlanningCalendarError("CAPACITY_REQUIRED", "Enter an effort budget. Use 0 only when no capacity is available.");
+    const capacityPlan = clear ? null : createPlanningCapacityPlan(state.planningCalendar, { kind: draft.kind, startDate: draft.date }, Number(draft.effort));
+    next = patchPlanningCalendar(state.planningCalendar, { capacityPlan });
+  } catch (error) {
+    draft.error = planningSaveError(error);
+    draft.editing = true;
+    renderAndFocus("planningCapacityStatus");
+    return;
+  }
+  draft.saving = true;
+  draft.error = "";
+  draft.status = "";
+  render();
+  try {
+    await writePlanningCalendar(next, draft.version, scope, clear ? "Planning capacity cleared" : "Planning capacity");
+    if (!documentArtifactScopeIsCurrent(scope)) throw documentArtifactError("PROJECT_CHANGED", "The active project changed. Reopen the original project to review the saved capacity.");
+    if (next.capacityPlan) state.periodSelection = { kind: next.capacityPlan.horizon.kind, startDate: next.capacityPlan.horizon.startDate };
+    state.query = "";
+    const saved = capacityFormDefaults(state.planningCalendar, state.periodSelection);
+    saved.status = clear ? "Saved capacity cleared. Capacity recommendations are unavailable until another budget is saved."
+      : "Planning capacity saved: " + state.planningCalendar.capacityPlan.effort + " effort · " + capacityDraftPreview(state.planningCalendar, saved);
+    planningCapacityDrafts.set(scope.projectKey, saved);
+    state.periodAnnouncement = clear ? "Saved planning capacity cleared." : "Viewing the saved planning horizon.";
+    pushViewUrl(true);
+  } catch (error) {
+    draft.error = planningSaveError(error);
+    draft.editing = true;
+  } finally {
+    draft.saving = false;
+    if (documentArtifactScopeIsCurrent(scope)) renderAndFocus("planningCapacityStatus");
+  }
+}
+
+function documentArtifactSaveUnavailableReason() {
+  if (demoMode) return "Create or open a project to save documents. Demo edits are temporary.";
+  if (state.storageWarning && !state.team.active) return "Recover this project's saved workspace before saving documents.";
+  return teamEditorReadOnlyReason();
+}
+
+function captureDocumentArtifactScope() {
+  return {
+    projectKey: documentComposerContext().projectKey,
+    storageKey, sourceType: state.source.type,
+    team: state.team, repository: state.team.active ? state.team.repository : null,
+    workspaceId: state.team.active ? state.team.workspace?.id : "",
+    extension: state.team.openResult?.extension
+  };
+}
+
+function documentArtifactScopeIsCurrent(scope) {
+  return scope.projectKey === documentComposerContext().projectKey
+    && scope.storageKey === storageKey && scope.sourceType === state.source.type
+    && (scope.repository
+      ? state.team.active && scope.team === state.team && scope.repository === state.team.repository && scope.workspaceId === state.team.workspace?.id
+      : !state.team.active);
+}
+
+function documentArtifactError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
+function assertDocumentArtifactScope(scope) {
+  if (!documentArtifactScopeIsCurrent(scope)) throw documentArtifactError("PROJECT_CHANGED", "The active project changed. Reopen the original project before saving this document.");
+  const reason = documentArtifactSaveUnavailableReason();
+  if (reason) throw documentArtifactError("PERMISSION_DENIED", reason);
+}
+
+function refreshLocalArtifactVersions() {
+  // A document write serializes the whole workspace. Refresh every canonical
+  // field before retrying so a stale tab cannot overwrite unrelated saved work.
+  const readValues = captureStorageValues(localStorage, [storageKey, activityKey, syncKey, sourceKey]);
+  const raw = readValues[0].value;
+  const latest = importPortableWorkspace(raw || encodeWorkspaceDocument(emptyOperationWorkspace));
+  const current = importPortableWorkspace(exportPortableWorkspace());
+  if (JSON.stringify(latest) !== JSON.stringify(current)) {
+    const experienceDraft = state.experienceDraft;
+    applyTeamSnapshot(latest);
+    state.experienceDraft = experienceDraft;
+    state.sync = loadSync();
+    rememberLocalWorkspaceRead(readValues);
+    throw documentArtifactError("VERSION_CONFLICT", "This project's saved work changed in another tab. Your draft is preserved and the workspace has been refreshed. Review the latest history before saving again, or save an independent copy.");
+  }
+}
+
+function documentArtifactPredecessor(input, expectedVersion) {
+  const parentId = input.supersedesId || "";
+  if (!parentId) {
+    if (expectedVersion != null) throw documentArtifactError("VERSION_CONFLICT", "An independent document cannot replace an earlier version.");
+    return null;
+  }
+  const parent = state.artifacts.find(record => record.id === parentId);
+  if (!parent) throw documentArtifactError("NOT_FOUND", "The saved version you were revising was deleted. Your draft is preserved; save it as an independent copy.");
+  if (parent.version !== expectedVersion || state.artifacts.some(record => record.supersedesId === parentId)) {
+    throw documentArtifactError("VERSION_CONFLICT", "This document already has a newer saved version. Your draft is preserved. Review its history or save an independent copy.");
+  }
+  return parent;
+}
+
+async function commitLocalArtifactUpdate(artifacts, activityEntry) {
+  await commitLocalWorkspacePatch({ artifacts }, [activityEntry]);
+}
+
+async function refreshDocumentArtifactTeamScope(scope) {
+  if (!documentArtifactScopeIsCurrent(scope)) return;
+  const refreshed = typeof scope.extension?.refresh === "function"
+    ? await scope.extension.refresh() : await scope.repository.open();
+  if (documentArtifactScopeIsCurrent(scope)) applyTeamSnapshot(refreshed?.snapshot || refreshed);
+}
+
+async function mutateTeamDocumentArtifact(scope, operation) {
+  scope.team.mutationBusy = true;
+  try {
+    const result = await operation();
+    if (!documentArtifactScopeIsCurrent(scope)) throw documentArtifactError("PROJECT_CHANGED", "The document change was saved in the previous workspace. Reopen that project to review it.");
+    if (!applyTeamSnapshot(result?.snapshot)) throw documentArtifactError("REMOTE_ERROR", "The server did not confirm the saved document. Your draft is preserved; check the workspace before retrying.");
+    scope.team.error = false;
+    scope.team.status = "Saved documents updated.";
+    return result;
+  } catch (error) {
+    if (!documentArtifactScopeIsCurrent(scope)) throw documentArtifactError("PROJECT_CHANGED", "The active workspace changed while saving. Reopen the original project to review whether the change was saved.");
+    const conflict = isTeamConflict(error) || error?.code === "CONFLICT";
+    if (conflict || error?.code === "NOT_FOUND" || isAmbiguousTeamError(error)) await refreshDocumentArtifactTeamScope(scope).catch(() => undefined);
+    if (!documentArtifactScopeIsCurrent(scope)) throw documentArtifactError("PROJECT_CHANGED", "The active workspace changed. Reopen the original project to review its saved documents.");
+    const message = conflict
+      ? "This document changed elsewhere or already has a newer version. Your draft is preserved. Review its history or save an independent copy."
+      : error?.code === "NOT_FOUND"
+        ? "That saved document version was deleted. Your draft is preserved; save it as an independent copy."
+        : safeTeamError(error, error?.message || "The document could not be saved. Your draft is preserved; try again.");
+    scope.team.error = true;
+    scope.team.status = message;
+    throw documentArtifactError(error?.code || "REMOTE_ERROR", message);
+  } finally {
+    scope.team.mutationBusy = false;
+  }
+}
+
+async function saveDocumentArtifact(input, expectedSupersededVersion = null, scope = captureDocumentArtifactScope()) {
+  assertDocumentArtifactScope(scope);
+  const draft = structuredClone(input);
+  if (scope.repository) {
+    if (typeof scope.repository.createArtifact !== "function") throw documentArtifactError("UNSUPPORTED_OPERATION", "This server does not support saved documents yet. Update the server before saving.");
+    const result = await mutateTeamDocumentArtifact(scope, () => scope.repository.createArtifact(draft, expectedSupersededVersion));
+    const artifact = result.artifact && state.artifacts.find(record => record.id === result.artifact.id);
+    if (!artifact) throw documentArtifactError("REMOTE_ERROR", "The server response did not include the saved document. Your draft is preserved; check its history before retrying.");
+    return artifact;
+  }
+  try {
+    refreshLocalArtifactVersions();
+    const predecessor = documentArtifactPredecessor(draft, expectedSupersededVersion);
+    const artifact = createArtifactRecord(draft, { predecessor });
+    const activity = createActivityEntry("artifact-created", artifact, { artifactType: artifact.artifactType, title: artifact.title, supersedesId: artifact.supersedesId });
+    await commitLocalArtifactUpdate([...state.artifacts, artifact], activity);
+    return artifact;
+  } catch (error) {
+    if (["VERSION_CONFLICT", "NOT_FOUND"].includes(error?.code)) throw error;
+    throw documentArtifactError(error?.code || "LOCAL_SAVE_FAILED", error?.name === "QuotaExceededError" || error?.name === "SecurityError"
+      ? localInitiativeSaveError(error) : error?.message || "The document could not be saved in this browser. Your draft is preserved.");
+  }
+}
+
+async function deleteDocumentArtifact(id, expectedVersion, scope = captureDocumentArtifactScope()) {
+  assertDocumentArtifactScope(scope);
+  if (scope.repository) {
+    if (typeof scope.repository.deleteArtifact !== "function") throw documentArtifactError("UNSUPPORTED_OPERATION", "This server does not support deleting saved documents yet. Update the server before deleting.");
+    await mutateTeamDocumentArtifact(scope, () => scope.repository.deleteArtifact(id, expectedVersion));
+    return;
+  }
+  try {
+    refreshLocalArtifactVersions();
+    const artifact = state.artifacts.find(record => record.id === id);
+    if (!artifact) throw documentArtifactError("NOT_FOUND", "That saved document version was already deleted.");
+    if (artifact.version !== expectedVersion) throw documentArtifactError("VERSION_CONFLICT", "That document version changed. Review the latest saved documents before deleting.");
+    await commitLocalArtifactUpdate(state.artifacts.filter(record => record.id !== id), createActivityEntry("artifact-deleted", artifact, { title: { from: artifact.title, to: "" } }));
+  } catch (error) {
+    if (["VERSION_CONFLICT", "NOT_FOUND"].includes(error?.code)) throw error;
+    throw documentArtifactError(error?.code || "LOCAL_SAVE_FAILED", localInitiativeSaveError(error));
+  }
+}
+
 function todaySpaceView({ filteredItems, health, followUps }) {
-  if (state.selectedMode === "actions") return `${spaceModeMarkup([["focus", "Focus"], ["actions", "Actions"]])}${actionsView(filteredItems)}`;
+  const modes = spaceModeMarkup([["focus", "Focus"], ["actions", "Actions"], ["manager", "Manager"], ["documents", "Documents"], ["admin", "Administration"]]);
+  if (state.selectedMode === "documents") return `${modes}${documentComposer.markup(documentComposerContext())}`;
+  if (state.selectedMode === "manager") return `${modes}${managerHomeView(filteredItems)}`;
+  if (state.selectedMode === "admin") return `${modes}${administratorHomeView()}`;
+  if (state.selectedMode === "actions") return `${modes}${actionsView(filteredItems)}`;
   const priorities = prioritizeItems(filteredItems, state.prioritization).slice(0, 5);
   const weeklyUpdate = simpleWeeklyUpdate(filteredItems);
   const ordered = state.prioritization.manualOrder.length > 0;
-  const showGettingStarted = (state.team.active && !state.team.projectId) || activeRegistryProject(state.projects?.registry)?.onboarding !== "blank";
-  return `${spaceModeMarkup([["focus", "Focus"], ["actions", "Actions"]])}
-    <section class="welcome-band simple-welcome"><div><p class="eyebrow">${todayStamp()}</p><h3>Move the most important work forward.</h3><p>Capture the work, order priorities, make the next step clear, and share the week.</p></div><div class="focus-score"><span>Workspace health</span><strong>${health.score}</strong></div></section>
+  const showGettingStarted = !(state.team.active && state.team.role === "viewer") && ((state.team.active && !state.team.projectId) || activeRegistryProject(state.projects?.registry)?.onboarding !== "blank");
+  return `${modes}
+    <section class="welcome-band simple-welcome"><div><p class="eyebrow">${todayStamp()}</p><h3>Move the most important work forward.</h3><p>Capture the work, order priorities, make the next step clear, and share the week.</p></div><div class="focus-score"><span>Workspace health</span><strong class="${health.score === null ? "no-score" : ""}">${formatOperationalScore(health.score)}</strong></div></section>
     <section class="metrics simple-metrics" aria-label="Workspace health">${metric("Active", health.active)}${metric("No next step", health.noNextStep)}</section>
     ${!demoMode && showGettingStarted && !state.team?.active && !state.items.length ? `<section class="panel" aria-labelledby="emptyProjectStartTitle"><div class="panel-header"><div><p class="panel-kicker">Start here</p><h3 id="emptyProjectStartTitle">Choose how to start this project</h3></div></div><p>Create your first initiative below, bring in saved work, or choose the supporting workflows you need. You can change these choices later.</p><div class="data-actions"><button class="secondary" id="startProjectImport" type="button">Import saved work</button><button class="secondary" id="startProjectWorkflows" type="button">Choose workflows</button></div></section>` : ""}
     <section class="today-grid simple-today-grid">
       ${showGettingStarted ? `<section class="panel getting-started-card" aria-labelledby="gettingStartedTitle"><div class="panel-header"><div><p class="panel-kicker">First week</p><h3 id="gettingStartedTitle">Get your workspace moving</h3></div><span class="muted" id="gettingStartedProgress">${[state.items.length > 0, ordered, state.weeklyUpdateCopied].filter(Boolean).length} / 3</span></div><ol class="today-checklist"><li class="${state.items.length ? "complete" : ""}"><span>${state.items.length ? "✓" : "1"}</span><button id="checklistCreateInitiative" type="button">Create the first initiative</button></li><li class="${ordered ? "complete" : ""}"><span>${ordered ? "✓" : "2"}</span><button data-jump-space="initiatives" data-jump-mode="priorities" type="button">Order the most important work</button></li><li class="${state.weeklyUpdateCopied ? "complete" : ""}"><span>${state.weeklyUpdateCopied ? "✓" : "3"}</span><button id="checklistCopyUpdate" type="button">Copy the weekly update</button></li></ol></section>` : ""}
       <section class="panel priority-panel"><div class="panel-header"><div><p class="panel-kicker">Now</p><h3>Top priorities</h3></div><span class="muted">${priorities.length} in focus</span></div><div class="item-list simple-item-list">${priorities.map(simpleItemCard).join("") || emptyState("Capture your first initiative to start the priority stack.")}</div></section>
-      <section class="panel today-weekly-update"><div class="panel-header"><div><p class="panel-kicker">Share</p><h3>Weekly update</h3></div><button class="secondary" id="copyWeeklyUpdateButton" type="button">Copy update</button></div><textarea id="weeklyUpdateDraft" readonly>${escapeHtml(weeklyUpdate)}</textarea></section>
+      <section class="panel today-weekly-update"><div class="panel-header"><div><p class="panel-kicker">Share</p><h3>Weekly update</h3></div><div class="data-actions"><button class="secondary" id="copyWeeklyUpdateButton" type="button">Copy update</button><button class="secondary" data-open-document="weekly" type="button">Edit a document draft</button></div></div><textarea id="weeklyUpdateDraft" readonly>${escapeHtml(weeklyUpdate)}</textarea></section>
     </section>`;
+}
+
+function initiativeEmptyStateMarkup() {
+  const scoped = timelineScopeApplies();
+  const selection = scoped ? normalizePeriodSelection(state.periodSelection, state.planningCalendar) : { kind: "all" };
+  const searching = Boolean(state.query);
+  const label = periodSelectionLabel(selection, state.planningCalendar);
+  const message = searching
+    ? `No initiatives match this search${scoped ? ` in ${label}` : ""}.`
+    : selection.kind === "unscheduled" ? "No unscheduled initiatives."
+      : selection.kind !== "all" ? `No initiatives in ${label}.` : "No initiatives yet.";
+  const actions = [
+    ...(scoped && selection.kind !== "all" ? ['<button class="secondary" data-empty-period="all" type="button">Show all time</button>'] : []),
+    ...(scoped && selection.kind !== "unscheduled" && (selection.kind !== "all" || state.items.length) ? ['<button class="secondary" data-empty-period="unscheduled" type="button">Show unscheduled</button>'] : []),
+    ...(searching ? ['<button class="secondary" id="clearEmptyInitiativeSearch" type="button">Clear search</button>'] : [])
+  ];
+  return `<div class="initiative-empty-state" role="region" aria-label="No matching initiatives">${emptyState(escapeHtml(message))}${actions.length ? `<div class="data-actions">${actions.join("")}</div>` : ""}</div>`;
 }
 
 function initiativesSpaceView({ filteredItems, workflowGroups }) {
@@ -826,7 +1287,7 @@ function initiativesSpaceView({ filteredItems, workflowGroups }) {
   if (state.selectedMode === "board") {
     return `${spaceModeMarkup(modes)}${initiativeBoardView(filteredItems)}`;
   }
-  return `${spaceModeMarkup(modes)}<section class="panel initiative-register"><div class="panel-header"><div><p class="panel-kicker">Portfolio</p><h3>All initiatives</h3></div><span class="muted">${filteredItems.length} initiatives</span></div><div class="item-list">${prioritizeItems(filteredItems, state.prioritization).map(itemCard).join("") || emptyState("No initiatives match this search.")}</div></section>`;
+  return `${spaceModeMarkup(modes)}<section class="panel initiative-register"><div class="panel-header"><div><p class="panel-kicker">Portfolio</p><h3>All initiatives</h3></div><span class="muted">${filteredItems.length} initiatives</span></div><div class="item-list">${prioritizeItems(filteredItems, state.prioritization).map(itemCard).join("") || initiativeEmptyStateMarkup()}</div></section>`;
 }
 
 function prioritiesView(items) {
@@ -851,16 +1312,16 @@ function prioritiesView(items) {
       ? result.breakdown.map((entry) => `<span><b>${escapeHtml(entry.label)}</b> ${escapeHtml(entry.value)}</span>`).join("")
       : `<span>${escapeHtml(result.missing.length ? `Missing: ${result.missing.join(", ")}` : "Explicit order")}</span>`;
     return `${levelHeading}<li class="priority-row ${result.complete ? "" : "incomplete"}" data-priority-item="${escapeHtml(item.id)}" ${reorderable ? 'draggable="true"' : ""}>
-      <span class="priority-rank" aria-label="Rank ${index + 1}">#${index + 1}</span>
+      <span class="priority-rank" aria-label="${result.complete ? `Rank ${index + 1}` : method.frameworkId === "manual" ? "Unranked" : method.frameworkId === "levels" ? "Unassigned" : "Unscored"}">${result.complete ? `#${index + 1}` : "—"}</span>
       <div class="priority-row-main"><div><span class="pill">${escapeHtml(initiativeStatusLabel(item))}</span><h4 tabindex="-1">${escapeHtml(item.title)}</h4></div><div class="priority-breakdown">${breakdown}</div></div>
       <strong class="priority-value">${escapeHtml(result.valueLabel)}</strong>
-      <div class="priority-row-actions">${reorderable ? `<button class="secondary small" data-priority-move="up" data-item-id="${escapeHtml(item.id)}" ${groupIndex <= 0 ? "disabled" : ""} type="button" aria-label="Move ${escapeHtml(item.title)} up">Up</button><button class="secondary small" data-priority-move="down" data-item-id="${escapeHtml(item.id)}" ${groupIndex >= group.length - 1 ? "disabled" : ""} type="button" aria-label="Move ${escapeHtml(item.title)} down">Down</button>` : ""}<button class="secondary small" data-edit-item="${escapeHtml(item.id)}" ${editable ? "" : "disabled"} type="button">${result.complete || method.frameworkId === "manual" ? "Edit" : method.frameworkId === "levels" ? "Assign" : "Score"}</button></div>
+      <div class="priority-row-actions">${reorderable ? `<button class="secondary small" data-priority-move="up" data-item-id="${escapeHtml(item.id)}" ${groupIndex <= 0 ? "disabled" : ""} type="button" aria-label="Move ${escapeHtml(item.title)} up">Up</button><button class="secondary small" data-priority-move="down" data-item-id="${escapeHtml(item.id)}" ${groupIndex >= group.length - 1 ? "disabled" : ""} type="button" aria-label="Move ${escapeHtml(item.title)} down">Down</button>` : ""}<button class="secondary small" data-edit-item="${escapeHtml(item.id)}" data-editor-focus="${escapeHtml(priorityEditorFocus(item, priorityFrameworkForId(policy, method.frameworkId)))}" ${editable ? "" : "disabled"} type="button">${result.complete || method.frameworkId === "manual" ? "Edit" : method.frameworkId === "levels" ? "Assign" : "Score"}</button></div>
     </li>`;
   }).join("");
   return `<section class="priority-workspace" aria-labelledby="priorityWorkspaceTitle">
     <div class="priority-hero"><div><p class="eyebrow">Workspace methodology</p><h3 id="priorityWorkspaceTitle">${escapeHtml(method.label)}</h3><p id="priorityMethodHelp">${escapeHtml(`${priorityMethodDescription(method.frameworkId)}${scoreOrderingHelp}`)}</p><small class="priority-policy-version">Policy v${policy.version}</small></div><button class="secondary" id="openPrioritizationSettings" type="button">${experienceHas("advanced-prioritization") ? workflowCanManage() ? "Configure method" : "View settings" : "Add scoring methods"}</button></div>
     ${state.prioritizationStatus ? `<p class="priority-status" role="status" aria-live="polite">${escapeHtml(state.prioritizationStatus)}</p>` : ""}
-    <ol class="priority-list" aria-label="Initiatives ordered by ${escapeHtml(method.label)}" aria-describedby="priorityMethodHelp">${rows || `<li>${emptyState("No initiatives match this search.")}</li>`}</ol>
+    <ol class="priority-list" aria-label="Initiatives ordered by ${escapeHtml(method.label)}" aria-describedby="priorityMethodHelp">${rows || `<li>${initiativeEmptyStateMarkup()}</li>`}</ol>
   </section>`;
 }
 
@@ -868,7 +1329,7 @@ function priorityMethodDescription(frameworkId) {
   return ({
     manual: "An explicit pecking order. Drag rows or use Move up/down; unranked initiatives stay at the bottom in title order. Editing notes does not set a rank.",
     levels: "Configured priority levels determine groups; manual order resolves work inside each level, then title order for ties.",
-    rice: "Reach x Impact x Confidence / Effort.",
+    rice: "RICE compares expected benefit with effort: Reach × Impact × Confidence ÷ Effort. Higher scores rank first.",
     ice: "Impact x Confidence x Ease, with each input rated from 1 to 10.",
     wsjf: "Business value + time criticality + risk reduction, divided by job size.",
     "value-effort": "Value divided by effort.",
@@ -951,7 +1412,7 @@ function boardCard(item, framework, showTeam) {
     <div class="board-card-heading"><h4>${escapeHtml(item.title)}</h4><span class="priority-score ${score.complete ? "" : "unscored"}" aria-label="${escapeHtml(score.label)} ${score.complete ? `score ${score.value}` : "unscored"}"><small>${escapeHtml(score.label)}</small><strong>${score.complete ? score.value : "Unscored"}</strong></span></div>
     ${initiativeTargetChips(item, 2)}
     <dl class="board-card-facts"><div><dt>Owner</dt><dd>${escapeHtml(organizationPersonName(item.pocPersonId) || item.owner || "Unowned")}</dd></div>${showTeam ? `<div><dt>Team</dt><dd title="${escapeHtml(teamPath)}" aria-label="Team: ${escapeHtml(teamPath)}">${escapeHtml(teamPath)}</dd></div>` : ""}</dl>
-    <div class="board-card-actions">${initiativeDetailButton(item, `board-${item.id}`, "View")}<button class="secondary small" data-edit-item="${itemId}" type="button" ${readonly || busy ? "disabled" : ""} ${!score.complete ? `data-editor-focus="${escapeHtml(priorityFieldInputName(framework.id, score.missingFields[0] || framework.fields[0]?.id || ""))}"` : ""}>${score.complete ? "Edit" : "Score"}</button>
+    <div class="board-card-actions">${initiativeDetailButton(item, `board-${item.id}`, "View")}<button class="secondary small" data-edit-item="${itemId}" type="button" ${readonly || busy ? "disabled" : ""} ${!score.complete ? `data-editor-focus="${escapeHtml(priorityEditorFocus(item, framework))}"` : ""}>${score.complete ? "Edit" : "Score"}</button>
       <details class="move-menu"><summary class="secondary small" ${readonly || busy ? 'aria-disabled="true"' : ""}>Move</summary><div class="move-menu-list" role="group" aria-label="Move ${escapeHtml(item.title)}">${moveOptions.map((status) => `<button data-move-item="${itemId}" data-move-status="${escapeHtml(status.id)}" type="button" ${readonly || busy ? "disabled" : ""}><span class="status-swatch status-${escapeHtml(status.color)}" aria-hidden="true"></span>${escapeHtml(status.name)}</button>`).join("")}</div></details>
     </div>
   </article>`;
@@ -1022,9 +1483,9 @@ async function moveInitiativeToStatus(itemId, statusId) {
   const patch = { statusId: target.id, status: target.category };
   state.boardStatus = `Moving ${item.title} to ${target.name}.`;
   if (!state.team.active) {
-    state.items = updateItem(state.items, item.id, patch);
-    logActivity("updated", item, { statusId: { from: item.statusId, to: target.id }, status: { from: item.status, to: target.category } });
-    persist();
+    try {
+      await commitLocalWorkspacePatch({ items: updateItem(state.items, item.id, patch) }, [createActivityEntry("updated", item, { statusId: { from: item.statusId, to: target.id }, status: { from: item.status, to: target.category } })]);
+    } catch (error) { state.boardStatus = error.message; render(); return; }
     state.boardStatus = `${item.title} moved to ${target.name}.`;
     render();
     document.getElementById(`boardCard-${item.id}`)?.focus();
@@ -1116,9 +1577,12 @@ function customerAccountRow(account, selectedId) {
 
 function customerAccountInspector(account, segments, canManage) {
   const isNew = !account;
-  const value = account || { id: "", name: "", domain: "", status: "prospect", industry: "", region: "", employeeCount: "", planTier: "", ownerPersonId: "", notes: "", tagIds: [], attributes: {} };
+  const draft = state.customerAccountDrafts.get(account?.id || "new");
+  const value = draft?.values || account || { id: "", name: "", domain: "", status: "prospect", industry: "", region: "", employeeCount: "", planTier: "", ownerPersonId: "", notes: "", tagIds: [], attributes: {} };
   return `<div class="inspector-heading"><p class="panel-kicker">${isNew ? "New account" : "Account profile"}</p><h3>${escapeHtml(isNew ? "Add a company" : value.name)}</h3><p>${isNew ? "Create an account that initiatives can target directly." : escapeHtml(value.domain || "No domain captured")}</p></div>
     ${!isNew ? `<div class="customer-chip-list" aria-label="Dynamic segment membership">${segments.map((segment) => `<span class="target-chip segment">${escapeHtml(segment.name)}</span>`).join("") || `<span class="muted">Not currently in a saved segment</span>`}</div>` : ""}
+    <p id="customerAccountDraftStatus" role="status" ${draft ? "" : "hidden"}>Unsaved account draft. Kept in this tab until you save or discard it.</p>
+    <button id="discardCustomerAccountDraft" class="secondary" type="button" ${draft ? "" : "hidden"}>Discard account draft</button>
     <form id="customerAccountForm" class="inspector-form" novalidate>
       <input type="hidden" name="accountId" value="${escapeHtml(value.id)}">
       <label><span>Name</span><input name="name" value="${escapeHtml(value.name)}" required ${canManage ? "" : "disabled"}></label>
@@ -1213,7 +1677,7 @@ function customerRuleFieldType(field) {
 
 function customerFieldsTagsMarkup(canManage) {
   const owner = customerCanManageFields();
-  return `<div class="governance-grid"><section class="panel governance-panel"><div class="panel-header"><div><p class="panel-kicker">Reusable classification</p><h3>Tags</h3></div><span class="muted">${state.customerDirectory.tags.length} / 200</span></div><div class="governance-list">${state.customerDirectory.tags.map((tag) => `<form class="governance-row customerTagForm"><input type="hidden" name="tagId" value="${escapeHtml(tag.id)}"><label><span class="sr-only">Tag name</span><input name="name" value="${escapeHtml(tag.name)}" ${canManage ? "" : "disabled"}></label>${canManage ? `<button class="secondary" type="submit">Save</button><button class="danger" data-delete-tag="${escapeHtml(tag.id)}" type="button">Delete</button>` : ""}</form>`).join("") || emptyState("Tags provide manual, reusable account classification.")}</div>${canManage ? `<form id="newCustomerTagForm" class="governance-create"><label><span>New tag</span><input name="name" required placeholder="e.g. Design partner"></label><button class="primary" type="submit">Add tag</button></form>` : ""}</section><section class="panel governance-panel"><div class="panel-header"><div><p class="panel-kicker">Typed schema</p><h3>Custom fields</h3></div><span class="muted">${state.customerDirectory.fields.length} / 50</span></div>${!owner ? `<p class="readonly-banner">Only workspace owners can change field definitions.</p>` : ""}<div class="governance-list">${state.customerDirectory.fields.map((field) => `<form class="governance-row customerFieldForm"><input type="hidden" name="fieldId" value="${escapeHtml(field.id)}"><label><span class="sr-only">Field name</span><input name="name" value="${escapeHtml(field.name)}" ${owner ? "" : "disabled"}></label><select name="type" ${owner ? "" : "disabled"}>${["text", "number", "boolean", "date", "single-select", "multi-select"].map((type) => `<option value="${type}" ${type === field.type ? "selected" : ""}>${titleCase(type)}</option>`).join("")}</select><label><span class="sr-only">Options separated by commas</span><input name="options" value="${escapeHtml(field.options.join(", "))}" placeholder="Options, comma separated" ${owner && ["single-select", "multi-select"].includes(field.type) ? "" : "disabled"}></label>${owner ? `<button class="secondary" type="submit">Save</button><button class="danger" data-delete-field="${escapeHtml(field.id)}" type="button">Delete</button>` : ""}</form>`).join("") || emptyState("Typed fields add product-specific customer context.")}</div>${owner ? `<form id="newCustomerFieldForm" class="governance-create field-create"><label><span>Field name</span><input name="name" required></label><label><span>Type</span><select name="type">${["text", "number", "boolean", "date", "single-select", "multi-select"].map((type) => `<option value="${type}">${titleCase(type)}</option>`).join("")}</select></label><label><span>Options</span><input name="options" placeholder="For select fields, comma separated"></label><button class="primary" type="submit">Add field</button></form>` : ""}</section></div>`;
+  return `<div class="governance-grid"><section class="panel governance-panel"><div class="panel-header"><div><p class="panel-kicker">Reusable classification</p><h3>Tags</h3></div><span class="muted">${state.customerDirectory.tags.length} / 200</span></div><div class="governance-list">${state.customerDirectory.tags.map((tag) => `<form class="governance-row customerTagForm"><input type="hidden" name="tagId" value="${escapeHtml(tag.id)}"><label><span class="sr-only">Tag name</span><input name="name" value="${escapeHtml(tag.name)}" ${canManage ? "" : "disabled"}></label>${canManage ? `<button class="secondary" type="submit">Save</button><button class="danger" data-delete-tag="${escapeHtml(tag.id)}" type="button">Delete</button>` : ""}</form>`).join("") || emptyState("Tags provide manual, reusable account classification.")}</div>${canManage ? `<form id="newCustomerTagForm" class="governance-create"><label><span>New tag</span><input name="name" required placeholder="e.g. Design partner"></label><button class="primary" type="submit">Add tag</button></form>` : ""}</section><section class="panel governance-panel"><div class="panel-header"><div><p class="panel-kicker">Typed schema</p><h3>Custom fields</h3></div><span class="muted">${state.customerDirectory.fields.length} / 50</span></div>${!owner ? `<p class="readonly-banner">Only workspace owners can change field definitions.</p>` : ""}<div class="governance-list">${state.customerDirectory.fields.map((field) => `<form class="governance-row customerFieldForm"><input type="hidden" name="fieldId" value="${escapeHtml(field.id)}"><label><span class="sr-only">Field name</span><input name="name" value="${escapeHtml(field.name)}" ${owner ? "" : "disabled"}></label><select name="type" aria-label="Type for ${escapeHtml(field.name)}" ${owner ? "" : "disabled"}>${["text", "number", "boolean", "date", "single-select", "multi-select"].map((type) => `<option value="${type}" ${type === field.type ? "selected" : ""}>${titleCase(type)}</option>`).join("")}</select><label><span class="sr-only">Options separated by commas</span><input name="options" value="${escapeHtml(field.options.join(", "))}" placeholder="Options, comma separated" ${owner && ["single-select", "multi-select"].includes(field.type) ? "" : "disabled"}></label>${owner ? `<button class="secondary" type="submit">Save</button><button class="danger" data-delete-field="${escapeHtml(field.id)}" type="button">Delete</button>` : ""}</form>`).join("") || emptyState("Typed fields add product-specific customer context.")}</div>${owner ? `<form id="newCustomerFieldForm" class="governance-create field-create"><label><span>Field name</span><input name="name" required></label><label><span>Type</span><select name="type">${["text", "number", "boolean", "date", "single-select", "multi-select"].map((type) => `<option value="${type}">${titleCase(type)}</option>`).join("")}</select></label><label><span>Options</span><input name="options" placeholder="For select fields, comma separated"></label><button class="primary" type="submit">Add field</button></form>` : ""}</section></div>`;
 }
 
 function segmentRuleSummary(segment) {
@@ -1261,13 +1725,72 @@ function briefingsSpaceView({ items }) {
     specs: specsView,
     templates: templatesView
   };
-  return `${spaceModeMarkup(modes)}${(renderers[state.selectedMode] || briefView)(items)}`;
+  const documentType = state.selectedMode === "templates" ? `template:${state.selectedTemplate}` : state.selectedMode === "meetings" ? `meeting:${state.selectedMeeting}` : state.selectedMode;
+  const documentEntry = !["decisions", "operations"].includes(state.selectedMode) ? `<div class="data-actions"><button class="secondary" data-open-document="${escapeHtml(documentType)}" data-document-initiative="${state.selectedMode === "specs" ? escapeHtml(state.selectedSpecId || "") : ""}" type="button">Create a document</button><p>Choose its scope and edit the draft in Documents.</p></div>` : "";
+  return `${spaceModeMarkup(modes)}${documentEntry}${(renderers[state.selectedMode] || briefView)(items)}`;
 }
 
 function settingsSpaceView() {
   const modes = [["setup", "Workspace setup"], ["data", "Data & backup"], ...(experienceHas("custom-workflow") ? [["workflow", "Workflow"]] : []), ...(experienceHas("timeline-planning") ? [["calendar", "Planning calendar"]] : []), ...(experienceHas("advanced-prioritization") ? [["prioritization", "Prioritization"]] : []), ...(experienceHas("activity-history") ? [["activity", "Activity"]] : [])];
   const renderers = { setup: workspaceSetupView, data: dataView, workflow: workflowSettingsView, calendar: planningCalendarView, prioritization: prioritizationSettingsView, activity: activityView };
-  return `${spaceModeMarkup(modes)}<div id="pm-os-update-settings">${serviceWorkerUpdateSettingsMarkup()}</div>${(renderers[state.selectedMode] || workspaceSetupView)()}`;
+  return `${spaceModeMarkup(modes)}<div id="pm-os-update-settings">${serviceWorkerUpdateSettingsMarkup()}</div>${(renderers[state.selectedMode] || workspaceSetupView)()}<section class="panel workspace-release" aria-labelledby="workspaceReleaseTitle"><h3 id="workspaceReleaseTitle">About PM OS</h3><p>${APP_RELEASE.edition === "ide" ? "IDE edition" : "Web edition"} · Version ${escapeHtml(APP_RELEASE.version)}</p><p>Workspace release <code id="workspaceReleaseId">${escapeHtml(APP_RELEASE.id)}</code></p><p class="muted">Include this release ID when reporting an issue. It identifies this workspace interface, including when used offline.</p><details class="expert-details"><summary>Edition differences</summary><p>Both editions share Today, Work, Insights, Settings and the project storage flows.</p><p>${APP_RELEASE.edition === "ide" ? "This edition also includes Build. Coding sessions and repository access require PM OS Desktop; the browser can review saved build summaries." : "This edition focuses on product management. Local coding sessions are available in the IDE edition through PM OS Desktop."}</p><p>Connected services, the Desktop runtime and deployment configuration are versioned separately.</p></details></section>`;
+}
+
+function managerHomeView(items) {
+  const brief = buildExecutiveBrief(items, new Date(), state.prioritization, themeEvidenceOptions());
+  const memo = buildExecutiveBriefMemo(items, new Date(), state.prioritization, themeEvidenceOptions());
+  return `<section class="role-home" aria-labelledby="managerHomeTitle">
+    <header class="role-home-heading"><div><p class="panel-kicker">Manager home</p><h3 id="managerHomeTitle">Portfolio overview</h3><p>${escapeHtml(brief.headline)}</p></div><div class="data-actions"><button class="secondary" data-jump-space="initiatives" data-jump-mode="priorities" type="button">Review priorities</button><button class="secondary" id="copyManagerBriefButton" type="button">Copy briefing</button><button class="secondary" id="downloadManagerBriefButton" type="button">Download briefing</button></div></header>
+    <p class="muted">From the current search results. Review source initiatives to resolve an ask or record a decision.</p>
+    <div class="role-home-grid">
+      <section class="panel"><h3>Leading priorities</h3><div class="brief-list">${brief.priorities.map(briefPriorityCard).join("") || emptyState("No active priorities yet.")}</div></section>
+      <section class="panel"><h3>Risks to review</h3><div class="brief-list">${brief.risks.map(briefRiskCard).join("") || emptyState("No active risks detected.")}</div><p class="muted">Shows up to five initiatives with the highest risk signals.</p></section>
+      <section class="panel" aria-labelledby="managerDecisionsTitle"><h3 id="managerDecisionsTitle">Decisions needed</h3><div class="brief-list">${brief.decisions.map(briefDecisionCard).join("") || emptyState("No pending decisions for active work.")}</div></section>
+      <section class="panel"><h3>Leadership asks</h3><div class="brief-list">${brief.asks.map(briefAskCard).join("") || emptyState("No leadership asks right now.")}</div><p class="muted">Suggested actions from risks, decisions, and missing measurement details.</p></section>
+    </div><details class="panel role-home-details"><summary>Briefing to share</summary><label for="managerBriefDraft">Manager briefing Markdown</label><textarea id="managerBriefDraft" readonly>${escapeHtml(memo)}</textarea></details>
+  </section>`;
+}
+
+function administratorHomeView() {
+  const check = state.homeHealth;
+  const portable = JSON.parse(exportPortableWorkspace());
+  const model = Object.keys(portable).filter(key => !["exportedAt", "schema"].includes(key)).map(key => `<li><code>${escapeHtml(key)}</code> — ${Array.isArray(portable[key]) ? `${portable[key].length} records` : "workspace settings"}</li>`).join("");
+  return `<section class="role-home" aria-labelledby="administratorHomeTitle"><header class="role-home-heading"><div><p class="panel-kicker">Administrator home</p><h3 id="administratorHomeTitle">Workspace operations</h3><p>Inspect storage, export your work, and check the current connection. These views keep your existing access permissions.</p></div><button class="secondary" data-jump-space="settings" data-jump-mode="data" type="button">Manage integrations and backups</button></header>
+    <div class="role-home-grid">${dataOverviewMarkup()}
+      <section class="panel" aria-labelledby="deploymentHealthTitle"><div class="panel-header"><h3 id="deploymentHealthTitle">Deployment health</h3><button class="secondary" id="checkHomeHealthButton" type="button" ${check?.busy ? "disabled" : ""}>${check?.busy ? "Checking…" : "Check health"}</button></div><dl class="home-health-facts"><div><dt>Page connection</dt><dd>${location.protocol === "https:" ? "HTTPS" : ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) ? "Local development" : "HTTP — use HTTPS for a hosted workspace"}</dd></div><div><dt>Workspace connection</dt><dd data-save-status>${escapeHtml(globalSyncLabel())}</dd></div></dl><p id="homeHealthStatus" role="status" aria-live="polite">${escapeHtml(check?.status || "Not checked yet. Run a fresh page and active-server check.")}</p><p class="muted">A point-in-time reachability check, not an uptime monitor. Browser and file storage do not require a Team server.</p></section>
+      <section class="panel"><h3>Data model and API</h3><p>Portable format: <code>${escapeHtml(portable.schema)}</code>. The backup contains these collections and settings:</p><ul class="home-model-list">${model}</ul><p>Connected servers use authenticated database API calls. Read-only checks use <code>POST /rest/v1/rpc/pm_list_workspaces</code>; membership controls the workspaces returned. Browser storage has no server API.</p><details class="role-home-details"><summary>Inspect complete workspace JSON</summary><label for="exportPreview">Complete workspace JSON</label><textarea id="exportPreview" readonly>${escapeHtml(JSON.stringify(portable, null, 2))}</textarea></details><div class="data-actions"><button class="secondary" id="exportButton" type="button" ${state.dataBusy ? "disabled" : ""}>Download backup</button><button class="secondary" id="exportCsvButton" type="button" ${state.dataBusy ? "disabled" : ""}>Export CSV</button></div><p id="dataStatus" role="status" tabindex="-1">${escapeHtml(state.dataStatus)}</p>${state.team.active ? `<p id="teamStatus" role="${state.team.error ? "alert" : "status"}" tabindex="-1" aria-live="polite">${escapeHtml(state.team.status)}</p>` : ""}<p class="muted">Team membership, connection configuration, and sessions are excluded from backups. CSV follows the current timeline scope.</p></section>
+      <section class="panel"><h3>Integration setup</h3><p>Open storage settings to connect a linked file, Google Drive, or a local or remote Team server. The active project remains open while another source is prepared.</p><button class="secondary" data-jump-space="settings" data-jump-mode="data" type="button">Open storage settings</button><p>Workflow visibility is configured separately from membership and server access.</p><button class="secondary" data-jump-space="settings" data-jump-mode="setup" type="button">Configure workspace workflows</button></section>
+    </div><details class="role-home-details panel"><summary>Audit trail and change digest</summary>${activityView()}</details></section>`;
+}
+
+async function checkHomeHealth() {
+  if (state.homeHealth?.busy) return;
+  const projectId = currentProjectDescriptor(state.projects, state.team)?.id;
+  const workspaceId = state.team.active ? state.team.workspace?.id : "";
+  const client = state.team.client;
+  const check = { busy: true, status: "Checking the page host and active server…" };
+  state.homeHealth = check;
+  const trigger = document.querySelector("#checkHomeHealthButton");
+  if (trigger) { trigger.disabled = true; trigger.textContent = "Checking…"; }
+  const status = document.querySelector("#homeHealthStatus");
+  if (status) status.textContent = check.status;
+  const timeout = promise => {
+    let timer;
+    return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Timed out")), 8000); })]).finally(() => clearTimeout(timer));
+  };
+  const [page, server] = await Promise.allSettled([
+    fetch(new URL("index.html", location.href), { method: "HEAD", cache: "no-store", signal: AbortSignal.timeout(8000) }).then(response => { if (!response.ok) throw new Error("Page unavailable"); }),
+    workspaceId ? timeout(client.teamService.listWorkspaces()).then(rows => { if (!rows.some(row => row.id === workspaceId)) throw new Error("Workspace unavailable"); }) : Promise.resolve()
+  ]);
+  if (state.homeHealth !== check || currentProjectDescriptor(state.projects, state.team)?.id !== projectId || state.team.client !== client || (state.team.active ? state.team.workspace?.id : "") !== workspaceId) return;
+  check.busy = false;
+  check.status = `Checked ${new Date().toLocaleTimeString()}. Page host: ${page.status === "fulfilled" ? "reachable" : "unavailable"}. ${workspaceId ? `Active server: ${server.status === "fulfilled" ? "authorized workspace reachable" : "could not verify access or reach the server"}.` : "No active Team server to check."}`;
+  if (state.selectedView === "today" && state.selectedMode === "admin") {
+    const button = document.querySelector("#checkHomeHealthButton");
+    if (button) { button.disabled = false; button.textContent = "Check health"; }
+    const status = document.querySelector("#homeHealthStatus");
+    if (status) status.textContent = check.status;
+  }
 }
 
 function simpleItemCard(item) {
@@ -1275,9 +1798,7 @@ function simpleItemCard(item) {
 }
 
 function simpleWeeklyUpdate(items) {
-  const ordered = prioritizeItems(items, state.prioritization).filter((item) => !["shipped", "parked"].includes(item.status)).slice(0, 5);
-  const lines = ordered.map((item) => `- ${item.title}: ${item.nextStep || "Next step to define"}`);
-  return `# Weekly update\n\n## Top priorities\n${lines.join("\n") || "- No active priorities yet"}\n\n## Decisions and changes\n${ordered.filter((item) => item.decision).map((item) => `- ${item.title}: ${item.decision}`).join("\n") || "- No decisions recorded this week"}`;
+  return buildWeeklyUpdateMarkdown(items, state.prioritization, themeEvidenceOptions());
 }
 
 function workspaceSetupView() {
@@ -1288,6 +1809,7 @@ function workspaceSetupView() {
     ${!canManage ? `<p class="readonly-banner">Only workspace owners can change which capabilities are visible.</p>` : ""}
     ${state.experienceStatus ? `<p class="organization-status" id="experienceStatus" tabindex="-1" role="status" aria-live="polite">${escapeHtml(state.experienceStatus)}</p>` : ""}
     <section class="panel core-capabilities" aria-labelledby="coreCapabilitiesTitle"><div class="panel-header"><div><p class="panel-kicker">Always available</p><h3 id="coreCapabilitiesTitle">Workspace</h3></div><span class="locked-pill">Always on</span></div><div class="core-capability-grid">${["Today", "Work", "Insights", "Settings"].map((label) => `<div><span aria-hidden="true">✓</span><strong>${label}</strong></div>`).join("")}</div></section>
+    <section class="panel workspace-presets" aria-labelledby="workspacePresetsTitle"><h3 id="workspacePresetsTitle">Start with tools for your work</h3><p>Choose a preset, then adjust any workflow below. This changes tools for this workspace; it does not change anyone's Team permissions.</p><label><span>Workspace preset</span><select id="workspacePreset" ${canManage ? "" : "disabled"}>${WORKSPACE_PRESETS.map(preset => `<option value="${preset.id}" ${preset.id === (state.experiencePresetChoice || matchingWorkspacePreset(experience)) ? "selected" : ""}>${escapeHtml(preset.label)}</option>`).join("")}</select></label></section>
     <div class="bundle-grid">${EXPERIENCE_BUNDLES.map((bundle) => experienceBundleMarkup(bundle, experience, canManage)).join("")}</div>
     ${canManage ? `<div class="workspace-setup-actions"><button class="primary" id="saveExperienceButton" type="button" ${state.experienceBusy ? "disabled" : ""}>${state.experienceBusy ? "Saving…" : "Save workflows"}</button></div>` : ""}
   </section>`;
@@ -1304,6 +1826,7 @@ function draftWorkspaceExperience() {
 }
 
 function setExperienceDraft(next) {
+  state.experiencePresetChoice = "";
   state.experienceDraft = [...normalizeWorkspaceExperience(next).enabledCapabilities];
   state.experienceStatus = "Workspace changes are ready to save.";
   render();
@@ -1332,9 +1855,7 @@ async function saveWorkspaceExperience() {
       applyTeamSnapshot(result?.snapshot);
     } else {
       const previous = state.experience;
-      state.experience = next;
-      logActivity("workspace-experience-updated", { title: "Workspace experience" }, { experience: { from: workspaceExperienceProfile(previous), to: workspaceExperienceProfile(next) } });
-      persist();
+      await commitLocalWorkspacePatch({ experience: next }, [createActivityEntry("workspace-experience-updated", { title: "Workspace experience" }, { experience: { from: workspaceExperienceProfile(previous), to: workspaceExperienceProfile(next) } })]);
     }
     state.experienceDraft = [...state.experience.enabledCapabilities];
     state.experienceStatus = "Workspace experience saved. Hidden capability data is unchanged.";
@@ -1509,9 +2030,7 @@ async function commitInitiativeWorkflow(input, message, focusId = "workflowStatu
       const result = await state.team.repository.updateWorkflow(next, state.workflow.version);
       applyTeamSnapshot(result?.snapshot);
     } else {
-      state.workflow = next;
-      logActivity("initiative-workflow-updated", { title: "Initiative workflow" }, { workflow: message });
-      persist();
+      await commitLocalWorkspacePatch({ workflow: next }, [createActivityEntry("initiative-workflow-updated", { title: "Initiative workflow" }, { workflow: message })]);
     }
     state.workflowStatus = message;
   } catch (error) {
@@ -1520,7 +2039,7 @@ async function commitInitiativeWorkflow(input, message, focusId = "workflowStatu
   renderAndFocus(focusId);
 }
 
-async function commitPrioritization(input, message, focusId = "prioritizationStatus") {
+async function commitPrioritization(input, message, focusId = "prioritizationStatus", selectedFrameworkId) {
   if (!workflowCanManage()) return;
   try {
     const next = assertPriorityAssignments(normalizePrioritization({ ...input, version: state.prioritization.version + 1 }), state.organization, state.items);
@@ -1532,10 +2051,9 @@ async function commitPrioritization(input, message, focusId = "prioritizationSta
       applyTeamSnapshot(result?.snapshot);
       state.team.mutationBusy = false;
     } else {
-      state.prioritization = next;
-      persist();
-      logActivity("prioritization-updated", { title: "Workspace prioritization" }, { prioritization: message });
+      await commitLocalWorkspacePatch({ prioritization: next }, [createActivityEntry("prioritization-updated", { title: "Workspace prioritization" }, { prioritization: message })]);
     }
+    if (selectedFrameworkId !== undefined) state.selectedPriorityFrameworkId = selectedFrameworkId;
     state.prioritizationStatus = message;
   } catch (error) {
     state.team.mutationBusy = false;
@@ -1628,6 +2146,7 @@ async function movePriorityItem(event) {
 }
 
 function startPriorityDrag(event) {
+  if (teamEditorReadOnlyReason() || state.prioritizationBusy) return event.preventDefault();
   state.priorityDragId = event.currentTarget.dataset.priorityItem || "";
   event.dataTransfer.effectAllowed = "move";
   event.dataTransfer.setData("text/plain", state.priorityDragId);
@@ -1635,13 +2154,19 @@ function startPriorityDrag(event) {
 }
 
 function allowPriorityDrop(event) {
-  if (!state.priorityDragId) return;
+  if (!state.priorityDragId || teamEditorReadOnlyReason() || state.prioritizationBusy) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = "move";
+  document.querySelectorAll(".priority-row[data-priority-drop]").forEach((row) => row.removeAttribute("data-priority-drop"));
+  const target = event.currentTarget;
+  if (target.dataset.priorityItem === state.priorityDragId) return;
+  const bounds = target.getBoundingClientRect();
+  target.dataset.priorityDrop = event.clientY >= bounds.top + bounds.height / 2 ? "after" : "before";
 }
 
 async function dropPriorityItem(event) {
   event.preventDefault();
+  if (teamEditorReadOnlyReason() || state.prioritizationBusy) return finishPriorityDrag();
   const sourceId = state.priorityDragId || event.dataTransfer.getData("text/plain");
   const targetId = event.currentTarget.dataset.priorityItem;
   if (!sourceId || !targetId || sourceId === targetId) return finishPriorityDrag();
@@ -1656,13 +2181,18 @@ async function dropPriorityItem(event) {
       return;
     }
   }
-  await saveManualOrder(moveIdBeforeOrAfter(ranked.map((item) => item.id), sourceId, targetId, false), "Priority order updated.");
+  const bounds = event.currentTarget.getBoundingClientRect();
+  const after = event.clientY >= bounds.top + bounds.height / 2;
+  await saveManualOrder(moveIdBeforeOrAfter(ranked.map((item) => item.id), sourceId, targetId, after), "Priority order updated.");
   finishPriorityDrag();
 }
 
 function finishPriorityDrag() {
   state.priorityDragId = "";
-  document.querySelectorAll(".priority-row.dragging").forEach((row) => row.classList.remove("dragging"));
+  document.querySelectorAll(".priority-row.dragging, .priority-row[data-priority-drop]").forEach((row) => {
+    row.classList.remove("dragging");
+    row.removeAttribute("data-priority-drop");
+  });
 }
 
 function moveIdBeforeOrAfter(ids, sourceId, targetId, after) {
@@ -1684,9 +2214,7 @@ async function saveManualOrder(manualOrder, message) {
       const result = await state.team.repository.updatePrioritization(next, current.version);
       applyTeamSnapshot(result?.snapshot);
     } else {
-      state.prioritization = next;
-      persist();
-      logActivity("prioritization-updated", { title: "Workspace prioritization" }, { manualOrder: message });
+      await commitLocalWorkspacePatch({ prioritization: next }, [createActivityEntry("prioritization-updated", { title: "Workspace prioritization" }, { manualOrder: message })]);
     }
     state.prioritizationStatus = message;
   } catch (error) {
@@ -1722,19 +2250,22 @@ async function saveTeamPriorityOverrides(event) {
 
 async function addPriorityFramework() {
   if (!workflowCanManage()) return;
-  const ids = priorityFrameworks(state.prioritization).map((framework) => framework.id);
-  const id = customPriorityFrameworkId("New framework", ids);
+  const frameworks = priorityFrameworks(state.prioritization);
+  const names = new Set(frameworks.map(framework => framework.name.trim().toLowerCase()));
+  let name = "New framework";
+  let suffix = 2;
+  while (names.has(name.toLowerCase())) name = `New framework ${suffix++}`;
+  const id = customPriorityFrameworkId(name, frameworks.map(framework => framework.id));
   const framework = {
     id,
-    name: "New framework",
+    name,
     description: "Describe the decision this framework should support.",
     criteria: [
       { id: "value", name: "Value", weight: 3, direction: "higher" },
       { id: "effort", name: "Effort", weight: 2, direction: "lower" }
     ]
   };
-  state.selectedPriorityFrameworkId = id;
-  await commitPrioritization({ ...state.prioritization, customFrameworks: [...state.prioritization.customFrameworks, framework] }, "Custom framework added.", "customFrameworkTitle");
+  await commitPrioritization({ ...state.prioritization, customFrameworks: [...state.prioritization.customFrameworks, framework] }, "Custom framework added.", "customFrameworkTitle", id);
 }
 
 async function saveCustomPriorityFramework(event) {
@@ -1766,7 +2297,7 @@ function addPriorityCriterion() {
   wrapper.innerHTML = priorityCriterionRow({ id: `criterion-${suffix}`, name: `Criterion ${suffix}`, weight: 1, direction: "higher" }, list.children.length, true, list.children.length + 1);
   list.append(wrapper.firstElementChild);
   bindPriorityCriterionRemoveButtons();
-  document.querySelector("#addPriorityCriterionButton")?.toggleAttribute("disabled", list.children.length >= MAX_CUSTOM_PRIORITY_CRITERIA);
+  refreshPriorityCriterionControls(list);
   list.lastElementChild?.querySelector('[name="criterionName"]')?.focus();
 }
 
@@ -1774,9 +2305,13 @@ function removePriorityCriterion(event) {
   const list = document.querySelector("#priorityCriteriaList");
   if (!list || list.children.length <= MIN_CUSTOM_PRIORITY_CRITERIA) return;
   event.currentTarget.closest(".priority-criterion-row")?.remove();
-  document.querySelector("#addPriorityCriterionButton")?.removeAttribute("disabled");
-  [...list.querySelectorAll("[data-remove-priority-criterion]")].forEach((button) => button.toggleAttribute("disabled", list.children.length <= MIN_CUSTOM_PRIORITY_CRITERIA));
+  refreshPriorityCriterionControls(list);
   document.querySelector("#customFrameworkTitle")?.focus();
+}
+
+function refreshPriorityCriterionControls(list) {
+  document.querySelector("#addPriorityCriterionButton")?.toggleAttribute("disabled", list.children.length >= MAX_CUSTOM_PRIORITY_CRITERIA);
+  list.querySelectorAll("[data-remove-priority-criterion]").forEach(button => button.toggleAttribute("disabled", list.children.length <= MIN_CUSTOM_PRIORITY_CRITERIA));
 }
 
 function bindPriorityCriterionRemoveButtons() {
@@ -1798,16 +2333,15 @@ async function deletePriorityFramework(event) {
     trigger: event.currentTarget
   });
   if (!confirmed) return;
-  state.selectedPriorityFrameworkId = "";
-  await commitPrioritization({ ...state.prioritization, customFrameworks: state.prioritization.customFrameworks.filter((entry) => entry.id !== frameworkId) }, `${framework.name} deleted.`, "prioritizationSettingsTitle");
+  await commitPrioritization({ ...state.prioritization, customFrameworks: state.prioritization.customFrameworks.filter((entry) => entry.id !== frameworkId) }, `${framework.name} deleted.`, "prioritizationSettingsTitle", "");
 }
 
 function planningCalendarView() {
   const calendar = state.planningCalendar;
   const canManage = planningCalendarCanManage();
-  const currentPeriods = calendar.enabledPeriodTypes.map((type) => periodForDate(type, new Date().toISOString().slice(0, 10), calendar)).filter(Boolean);
+  const currentPeriods = calendar.enabledPeriodTypes.map((type) => periodForDate(type, localDateStamp(), calendar)).filter(Boolean);
   const status = state.planningCalendarStatus ? `<p class="organization-status" id="planningCalendarStatus" tabindex="-1" role="status">${escapeHtml(state.planningCalendarStatus)}</p>` : "";
-  return `<section class="planning-calendar-layout">
+  return `${planningCapacitySettingsMarkup()}<section class="planning-calendar-layout">
     <section class="panel planning-calendar-settings" aria-labelledby="planningCalendarTitle">
       <div class="panel-header"><div><p class="panel-kicker">Workspace structure</p><h3 id="planningCalendarTitle">Planning calendar</h3></div><span class="muted">Version ${calendar.version}</span></div>
       <p class="governance-note">Choose the time layers your team uses. Initiative membership is derived from planned start and target dates, so changing this calendar never rewrites initiative assignments.</p>
@@ -1835,6 +2369,7 @@ function calendarLayerDescription(type) {
 }
 
 function planningCalendarCanManage() {
+  if (state.storageWarning && !state.team.active) return false;
   if (demoTeamRole) return demoTeamRole === "owner";
   if (!state.team.active) return true;
   return state.team.role === "owner" && state.team.connection === "live" && !state.team.mutationBusy;
@@ -1927,46 +2462,74 @@ function organizationUnitPath(unitId) {
 function briefView(items) {
   const priorityLabel = workspacePriorityLabel();
   const priorityHelp = priorityMethodDescription(state.prioritization.defaultFrameworkId);
-  const brief = buildExecutiveBrief(items, new Date(), state.prioritization);
-  const memo = scopeGeneratedText(buildExecutiveBriefMemo(items, new Date(), state.prioritization), items);
+  const brief = buildExecutiveBrief(items, new Date(), state.prioritization, themeEvidenceOptions());
+  const memo = scopeGeneratedText(buildExecutiveBriefMemo(items, new Date(), state.prioritization, themeEvidenceOptions()), items);
   const workspaceHealth = calculateHealth(items);
   const health = typeof brief.health === "object" ? briefValue(brief.health, ["label", "status", "score"], workspaceHealth.score) : briefValue(brief, ["health"], workspaceHealth.score);
   const active = typeof brief.health === "object" ? briefValue(brief.health, ["active"], workspaceHealth.active) : workspaceHealth.active;
   const rolloutCount = ["hold", "watch", "ready"].reduce((total, group) => total + (brief.rollouts?.[group]?.length || 0), 0);
   return `<div class="brief-grid">${briefSourceGuide()}
-    <section class="panel brief-summary" aria-labelledby="brief-summary-title">${briefPanelHeader("brief-summary", "Portfolio Summary", `Generated ${briefDate(brief.generatedAt)}`, "Recomputed from the current workspace whenever this page renders. The headline combines active initiative, risk, and pending-decision totals.")}<p class="brief-headline">${escapeHtml(briefValue(brief, ["headline"], "No active portfolio work."))}</p><div class="brief-summary-facts">${briefSummaryFact("Operations health", health, "brief-health", "Starts at 100. Each active initiative that is stale for more than 14 days, unowned, or missing a next step subtracts 8 points. More than 12 active initiatives subtract 3 additional points each.")}${briefSummaryFact("Active initiatives", active, "brief-active", "Counts initiatives whose status is not Shipped or Parked.")}</div><div class="brief-counts">${briefMetric("Active priorities", brief.priorities?.length || 0, "brief-priority-count", `Shows up to five active initiatives, ranked by ${priorityLabel} and then deterministic tie-breakers.`)}${briefMetric("Risks", brief.risks?.length || 0, "brief-risk-count", "Shows the five highest-severity initiative risks after blocker, launch, and rollout signals are merged.")}${briefMetric("Decisions", brief.decisions?.length || 0, "brief-decision-count", "Counts active Committed initiatives or initiatives with an experiment that do not yet have a recorded decision.")}${briefMetric("Leadership asks", brief.asks?.length || 0, "brief-ask-count", "Shows the first six actions derived from risks, pending decisions, and measurement gaps.")}</div></section>
+    <section class="panel brief-summary" aria-labelledby="brief-summary-title">${briefPanelHeader("brief-summary", "Portfolio Summary", `Generated ${briefDate(brief.generatedAt)}`, "Recomputed from the current workspace whenever this page renders. The headline combines active initiative, risk, and pending-decision totals.")}<p class="brief-headline">${escapeHtml(briefValue(brief, ["headline"], "No active portfolio work."))}</p><div class="brief-summary-facts">${briefSummaryFact("Operations health", formatOperationalScore(health), "brief-health", "No data yet when this scope has no active initiatives. Otherwise starts at 100. Each active initiative that is stale for more than 14 days, unowned, or missing a next step subtracts 8 points. More than 12 active initiatives subtract 3 additional points each.")}${briefSummaryFact("Active initiatives", active, "brief-active", "Counts initiatives whose status is not Shipped or Parked.")}</div><div class="brief-counts">${briefMetric("Active priorities", brief.priorities?.length || 0, "brief-priority-count", `Shows up to five active initiatives, ranked by ${priorityLabel} and then deterministic tie-breakers.`)}${briefMetric("Risks", brief.risks?.length || 0, "brief-risk-count", "Shows the five highest-severity initiative risks after blocker, launch, and rollout signals are merged.")}${briefMetric("Pending decisions", brief.metrics.pendingDecisions, "brief-decision-count", "Counts every saved Pending or Revisit decision linked to active work, before the five-card display limit. Suggested decision gaps are listed separately.")}${briefMetric("Leadership asks", brief.asks?.length || 0, "brief-ask-count", "Shows the first six actions derived from risks, pending decisions, and measurement gaps.")}</div></section>
     <section class="panel brief-priorities" aria-labelledby="brief-priorities-title">${briefPanelHeader("brief-priorities", "Key Priorities", briefPrioritySummary(brief.priorities?.length || 0), `The top five active initiatives use the workspace ${priorityLabel} methodology. ${priorityHelp} Change the corresponding priority inputs or Next step on the source initiative.`)}<div class="brief-list">${brief.priorities?.map(briefPriorityCard).join("") || emptyState("No active priorities. Shipped and parked initiatives are excluded.")}</div></section>
     <section class="panel" aria-labelledby="brief-risks-title">${briefPanelHeader("brief-risks", "Risks", "Merged by initiative", "Combines active structured risks, at-risk or blocked dependencies, missing ownership or next steps, launch-readiness gaps, and rollout blockers. The highest-severity signal wins; duplicate signals for one initiative are merged.")}<div class="brief-list">${brief.risks?.map(briefRiskCard).join("") || emptyState("No active risks or rollout blockers detected.")}</div></section>
-    <section class="panel" aria-labelledby="brief-rollouts-title">${briefPanelHeader("brief-rollouts", "Rollout Status", `${rolloutCount} items`, "Includes Committed rollout candidates. Readiness is the percentage of eight checks completed: customer, problem, owner, due date, decision, experiment, accepted risk, and next step. Gaps determine Hold, Watch, or Ready.")}${rolloutCount ? `<div class="brief-rollout-groups">${briefRolloutGroup("Hold", brief.rollouts?.hold)}${briefRolloutGroup("Watch", brief.rollouts?.watch)}${briefRolloutGroup("Ready", brief.rollouts?.ready)}</div>` : emptyState("No initiatives currently need rollout review.")}</section>
-    <section class="panel" aria-labelledby="brief-decisions-title">${briefPanelHeader("brief-decisions", "Decisions Needed", "Active committed and experimental work", "Includes active Committed initiatives and initiatives with an Experiment when the Decision field is blank. Recording a decision removes the item from this section.")}<div class="brief-list">${brief.decisions?.map(briefDecisionCard).join("") || emptyState("No pending decisions for active work.")}</div></section>
+    <section class="panel" aria-labelledby="brief-rollouts-title">${briefPanelHeader("brief-rollouts", "Rollout Status", `${rolloutCount} items`, "Includes Committed rollout candidates. Readiness is the percentage of eight checks completed: customer, problem, owner, due date, decision, experiment, accepted risk, and next step. Ready, Watch and Hold are checklist review states, not launch approval. Stage and audience are suggestions requiring confirmation.")}${rolloutCount ? `<div class="brief-rollout-groups">${briefRolloutGroup("Hold", brief.rollouts?.hold)}${briefRolloutGroup("Watch", brief.rollouts?.watch)}${briefRolloutGroup("Ready", brief.rollouts?.ready)}</div>` : emptyState("No initiatives currently need rollout review.")}</section>
+    <section class="panel" aria-labelledby="brief-decisions-title">${briefPanelHeader("brief-decisions", "Decisions Needed", `Showing ${brief.decisions.length} of ${brief.metrics.pendingDecisions + brief.metrics.decisionSuggestions} · ${brief.metrics.decisionSuggestions} suggested`, "Saved Pending and Revisit decisions appear first, with their own question, owner and date. Suggestions identify work without a captured decision. Decided outcomes remain in history. Open a source decision to review or update it.")}<div class="brief-list">${brief.decisions?.map(briefDecisionCard).join("") || emptyState("No pending decisions for active work.")}</div></section>
     <section class="panel" aria-labelledby="brief-metrics-title">${briefPanelHeader("brief-metrics", "Measurement Gaps", "Instrumentation needed", "Checks each active initiative for an experiment or decision threshold, owner, review date, and customer evidence. The first missing input and suggested instrumentation are shown.")}<div class="brief-list">${brief.metricGaps?.map(briefMetricCard).join("") || emptyState("No measurement gaps detected.")}</div></section>
-    <section class="panel" aria-labelledby="brief-themes-title">${briefPanelHeader("brief-themes", "Customer Themes", "Repeated signals", "Extracts meaningful words from initiative Problem statements and targeted customer segments. A theme appears after it occurs across at least two initiative signals.")}<div class="brief-list">${brief.themes?.map(briefThemeCard).join("") || emptyState("No repeated customer themes yet.")}</div></section>
-    <section class="panel" aria-labelledby="brief-asks-title">${briefPanelHeader("brief-asks", "Leadership Asks", "Concrete next moves", "Collects the first six recommended actions from the current risk list, pending decisions, and measurement gaps. Owner and needed-by values come from the source initiative.")}<div class="brief-list">${brief.asks?.map(briefAskCard).join("") || emptyState("No leadership asks. Current work can proceed without escalation.")}</div></section>
-    <section class="panel brief-memo" aria-labelledby="brief-memo-title"><div class="panel-header">${briefPanelTitle("brief-memo", "Memo Draft", "A read-only Markdown projection of every Executive Briefing section. Save source initiative changes and the memo regenerates automatically.")}<button class="secondary" id="copyExecutiveBriefMemoButton" type="button">Copy Memo</button></div><label class="sr-only" for="executiveBriefMemoDraft">Executive brief Markdown memo</label><textarea id="executiveBriefMemoDraft" readonly>${escapeHtml(memo)}</textarea><p class="sr-only" id="executiveBriefCopyStatus" role="status" aria-live="polite" aria-atomic="true"></p></section>
+    <section class="panel" aria-labelledby="brief-themes-title">${briefPanelHeader("brief-themes", "Customer Themes", "Repeated signals", "Themes come from intentionally assigned Tags / themes on Feedback signals. At least two distinct signals must share a tag. Filters include signals linked to matching initiatives; unlinked signals appear only in the full project scope.")}<div class="brief-list">${brief.themes?.map(briefThemeCard).join("") || emptyState("No repeated customer themes yet.")}</div></section>
+    <section class="panel" aria-labelledby="brief-asks-title">${briefPanelHeader("brief-asks", "Leadership Asks", "Concrete next moves", "Collects the first six recommended actions from the current risk list, pending decisions, and measurement gaps. Saved decision asks retain their record owner and date; suggested asks use initiative details.")}<div class="brief-list">${brief.asks?.map(briefAskCard).join("") || emptyState("No leadership asks. Current work can proceed without escalation.")}</div></section>
+    <section class="panel brief-memo" aria-labelledby="brief-memo-title"><h3 id="brief-memo-title">Memo Draft</h3><details class="measure-disclosure" id="briefMemoDetails"><summary>Show complete memo and scores</summary><div class="panel-header"><p>A complete Markdown preview, including the disclosed priority and readiness scores. Save source changes to regenerate.</p><button class="secondary" id="copyExecutiveBriefMemoButton" type="button">Copy Memo</button></div><label class="sr-only" for="executiveBriefMemoDraft">Executive brief Markdown memo</label><textarea id="executiveBriefMemoDraft" readonly>${escapeHtml(memo)}</textarea><p class="sr-only" id="executiveBriefCopyStatus" role="status" aria-live="polite" aria-atomic="true"></p></details></section>
   </div>`;
 }
+function operationalMeasureGuideMarkup() {
+  if (["settings", "team"].includes(state.selectedView) || (state.selectedView === "today" && ["documents", "admin"].includes(state.selectedMode))) return "";
+  return `<details class="panel operational-measure-guide"><summary>How to read these measures</summary><p>These calculated measures answer different questions. They are not interchangeable performance scores or proof of customer outcomes. Counts describe records; percentages and rankings need their own context.</p><dl>
+    <dt>Workspace / Operations health</dt><dd>Active means everything except Shipped and Parked in the current scope. Start at 100; subtract 8 for each stale (more than 14 days), unowned, or missing-next-step occurrence, and 3 for each active initiative beyond 12; floor at 0. Latest initiative or operational-record activity determines freshness. Saved open actions supply next steps; a generated recommendation alone does not complete one. No active initiatives means No data yet. This measures maintenance gaps, not delivery success or all risks.</dd>
+    <dt>Backlog hygiene</dt><dd>For the same active population, start at 100; subtract 8 per stale or unowned initiative, 6 per missing problem or next step, and 5 per owner with more than three initiatives; floor at 0. No active initiatives means No data yet. Its additional checks make it different from health.</dd>
+    <dt>Priority</dt><dd>Use the selected workspace methodology. Manual order and levels are authored rankings. Scoring methods require their inputs; missing inputs mean Needs scoring. RICE is Reach × Impact × Confidence ÷ Effort, with confidence as a fraction. Prioritization settings explain the active framework. A higher rank is a planning choice, not urgency or demonstrated value.</dd>
+    <dt>Queue urgency and attention</dt><dd>Action Queue orders overdue work (95 + days overdue), blockers (90), missing owner (82), next step (78), decision (74), metric (68), then stale work (60); configured priority breaks ties. These ordering weights are not percentages and overdue weights can exceed 100. Research attention adds up to 50 from relative priority, 20 for confidence below 70%, and 10 for active risks. Feedback adds relative priority, 25 for risks and 15 each for missing owner or next step, capped at 100. Support severity adds relative priority, 30 for risk, 18 for shipped work, 12 for committed work, 18 if unowned and 10 if stale, capped at 100. Validation attention adds relative priority, up to 20 days of age, 15 for active risks and rounded (1 − confidence) × 20. Relative priority contributes 0–50 by position within that candidate set, so changing the set can change attention weights. These are triage suggestions.</dd>
+    <dt>Risk and blocker severity</dt><dd>Structured risk is likelihood × impact × 4 on a 100-point scale. Dependency urgency starts at 85 blocked, 60 at risk or 25 otherwise; add 10 if unassigned and 15 overdue, 10 due within 7 days or 5 within 30 days; cap at 100. Brief severity takes the highest risk, dependency, ownership/next-step, launch or rollout signal for each initiative. It can therefore differ from the structured risk score; read its source and proposed action.</dd>
+    <dt>Readiness and checklist fractions</dt><dd>Completed checks ÷ total checks × 100, rounded. Launch, rollout and enablement use different checks; enablement counts explicitly completed saved actions. These fractions show captured preparation, not launch success. A checklist can be incomplete without a captured risk. In Executive Brief, status and next actions stay visible; open readiness details for its percentage.</dd>
+    <dt>Active load and Plan fill</dt><dd>Effort ÷ your saved effort budget × 100, rounded. Active load counts Committed + Discovery; Plan selection also considers Intake, in priority order. Both use the same authored budget and named calendar horizon. Without a matching saved horizon and budget, or while search filters the population, raw effort remains visible and capacity recommendations are unavailable. Zero means no capacity, so utilization has no percentage. This is an authored allowance, not measured team availability; simulations and suggested cuts do not change commitments.</dd>
+  </dl></details>`;
+}
+
 function briefSourceGuide() {
   const reason = teamEditorReadOnlyReason();
   const disabled = reason ? "disabled" : "";
   const editDisabled = reason || !state.items.length ? "disabled" : "";
   const describedBy = reason ? 'aria-describedby="initiativeReadOnlyReason"' : "";
-  return `<section class="panel brief-source-guide" aria-labelledby="brief-source-guide-title"><div class="brief-source-guide-copy"><p class="panel-kicker">Live workspace briefing</p><h3 id="brief-source-guide-title">Change the inputs, not the briefing.</h3><p>Every value below is generated from saved initiatives. Add or update an initiative, save it, and this briefing recalculates automatically.</p></div><ol class="brief-source-steps"><li><span>1</span><div><strong>Capture the work</strong><small>Add an initiative or choose an existing one.</small></div></li><li><span>2</span><div><strong>Update source fields</strong><small>Status, scores, owner, dates, risks, evidence, and targets feed the report.</small></div></li><li><span>3</span><div><strong>Save to regenerate</strong><small>Briefings and the memo update from the saved workspace.</small></div></li></ol><div class="brief-source-guide-actions"><button class="primary" id="briefCreateInitiativeButton" ${disabled} ${describedBy} type="button">Add initiative</button><button class="secondary" id="briefChooseInitiativeButton" ${editDisabled} ${describedBy} type="button">Choose initiative to edit</button></div></section>`;
+  return `<section class="panel brief-source-guide" aria-labelledby="brief-source-guide-title"><div class="brief-source-guide-copy"><p class="panel-kicker">Live workspace briefing</p><h3 id="brief-source-guide-title">Change the inputs, not the briefing.</h3><p>This briefing uses saved initiatives, decisions, and Feedback signals. Save a source change to refresh the briefing. Capture customer themes with Tags / themes in Insights → Feedback, then open a theme’s signal to review its evidence.</p></div><ol class="brief-source-steps"><li><span>1</span><div><strong>Capture the work</strong><small>Add an initiative or choose an existing one.</small></div></li><li><span>2</span><div><strong>Update source fields</strong><small>Status, scores, owner, dates, risks, evidence, and targets feed the report.</small></div></li><li><span>3</span><div><strong>Save to regenerate</strong><small>Briefings and the memo update from the saved workspace.</small></div></li></ol><div class="brief-source-guide-actions"><button class="primary" id="briefCreateInitiativeButton" ${disabled} ${describedBy} type="button">Add initiative</button><button class="secondary" id="briefChooseInitiativeButton" ${editDisabled} ${describedBy} type="button">Choose initiative to edit</button></div></section>`;
 }
 function briefTooltip(id, label, content) { const tooltipId = `${id}-tooltip`; return `<span class="brief-tooltip"><button class="brief-tooltip-trigger" id="${id}" type="button" aria-label="${escapeHtml(label)}" aria-describedby="${tooltipId}">i</button><span class="brief-tooltip-content" id="${tooltipId}" role="tooltip">${escapeHtml(content)}</span></span>`; }
 function briefPanelTitle(id, title, help) { return `<div class="brief-panel-title"><h3 id="${id}-title">${escapeHtml(title)}</h3>${briefTooltip(`${id}-help`, `How ${title} is populated`, help)}</div>`; }
 function briefPanelHeader(id, title, meta, help) { return `<div class="panel-header">${briefPanelTitle(id, title, help)}<span class="muted">${escapeHtml(meta)}</span></div>`; }
-function briefSummaryFact(label, value, id, help) { return `<p><span class="brief-value-label">${escapeHtml(label)}${briefTooltip(`${id}-help`, `How ${label} is populated`, help)}</span><strong>${escapeHtml(value)}</strong></p>`; }
+function briefSummaryFact(label, value, id, help) { return `<p><span class="brief-value-label">${escapeHtml(label)}${briefTooltip(`${id}-help`, `How ${label} is populated`, help)}</span><strong${id === "brief-health" ? ' data-score-family="health"' : ""}>${escapeHtml(value)}</strong></p>`; }
 function briefMetric(label, value, id, help) { return `<article class="metric"><span class="brief-value-label">${escapeHtml(label)}${briefTooltip(`${id}-help`, `How the ${label} count is populated`, help)}</span><strong>${escapeHtml(value)}</strong></article>`; }
 function briefSourceItem(entry) { const itemId = entry?.itemId || entry?.sources?.[0]?.itemId; return state.items.find((item) => item.id === itemId); }
-function briefCardActions(entry, context, focusField, actionLabel) { const item = briefSourceItem(entry); if (!item) return ""; if (focusField === "risk") return `<div class="contextual-card-actions brief-card-actions">${initiativeDetailButton(item, context, actionLabel, "risks", entry.recordId || "")}</div>`; return `<div class="contextual-card-actions brief-card-actions">${initiativeDetailButton(item, context)}${initiativeContextualEditButton(item, context, focusField, actionLabel)}</div>`; }
-function briefThemeActions(entry, index) { const sources = Array.isArray(entry?.sources) ? entry.sources.slice(0, 3) : []; const actions = sources.map((source, sourceIndex) => { const item = state.items.find((candidate) => candidate.id === source.itemId); return item ? initiativeContextualEditButton(item, `brief-theme-${index}-${sourceIndex}`, "problem", "Edit source") : ""; }).join(""); return actions ? `<div class="contextual-card-actions brief-card-actions">${actions}</div>` : ""; }
-function briefPriorityCard(entry, index) { return `<article class="brief-card" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label neutral">#${briefValue(entry, ["rank"], index + 1)} | ${escapeHtml(briefStatus(briefValue(entry, ["status"], "Active")))}</span></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.nextAction}</b>${escapeHtml(briefValue(entry, ["nextAction", "nextStep", "action"], "No next action"))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span><span><b>${executiveBriefLabels.dueDate}</b>${escapeHtml(briefValue(entry, ["dueDate"], "No date"))}</span></div><p><b>${escapeHtml(briefValue(entry, ["priorityLabel"], workspacePriorityLabel()))}</b>${escapeHtml(briefValue(entry, ["score"], "Needs scoring"))}</p>${briefCardActions(entry, `brief-priority-${index}`, "nextStep", "Update priority")}</article>`; }
-function briefRiskCard(entry, index) { const status = briefValue(entry, ["status"], "Monitor"); const severity = briefValue(entry, ["severity", "score", "severityScore"], "Not scored"); return `<article class="brief-card ${briefSeverityClass(status)}" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label ${briefSeverityClass(status)}">${executiveBriefLabels.severity}: ${escapeHtml(status)} | ${escapeHtml(severity)}/100</span><strong>${executiveBriefLabels.sources}: ${escapeHtml(briefList(briefValue(entry, ["sources", "sourceLabels"], [])) || "No source")}</strong></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.risk}</b>${escapeHtml(briefValue(entry, ["statement", "risk"], "Risk detail unavailable."))}</p><p><b>${executiveBriefLabels.leadershipAction}</b>${escapeHtml(briefValue(entry, ["action", "leadershipAction", "ask"], "Review and assign a response."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span><span><b>${executiveBriefLabels.dueDate}</b>${escapeHtml(briefValue(entry, ["dueDate"], "No date"))}</span></div>${briefCardActions(entry, `brief-risk-${index}`, "risk", "Update risk")}</article>`; }
-function briefDecisionCard(entry, index) { return `<article class="brief-card" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label neutral">Decision required</span></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.context}</b>${escapeHtml(briefValue(entry, ["context", "decision"], "Decision context unavailable."))}</p><p><b>${executiveBriefLabels.decisionAsk}</b>${escapeHtml(briefValue(entry, ["ask", "action", "decisionAsk"], "Confirm the path forward."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span><span><b>${executiveBriefLabels.dueDate}</b>${escapeHtml(briefValue(entry, ["dueDate"], "No date"))}</span></div>${briefCardActions(entry, `brief-decision-${index}`, "decision", "Record decision")}</article>`; }
+function briefCardActions(entry, context, focusField, actionLabel) { const record = state.insightRecords.find(candidate => candidate.id === entry.recordId); if (record) return `<div class="contextual-card-actions brief-card-actions">${insightRecordLink(record, context)}</div>`; const item = briefSourceItem(entry); if (!item) return ""; if (focusField === "risk") return `<div class="contextual-card-actions brief-card-actions">${initiativeDetailButton(item, context, state.team.active && state.team.role === "viewer" ? "View risk" : actionLabel, "risks", entry.recordId || "")}</div>`; return `<div class="contextual-card-actions brief-card-actions">${initiativeDetailButton(item, context)}${initiativeContextualEditButton(item, context, focusField, actionLabel)}</div>`; }
+function themeEvidenceOptions() {
+  return {
+    insightRecords: state.insightRecords,
+    customerDirectory: state.customerDirectory,
+    includeUnlinked: !state.query.trim() && (!timelineScopeApplies() || state.periodSelection.kind === "all")
+  };
+}
+
+function briefThemeActions(entry, index) {
+  const sources = Array.isArray(entry?.sources) ? entry.sources : [];
+  const actions = sources.map((source, sourceIndex) => {
+    const record = state.insightRecords.find(candidate => candidate.id === source.id && candidate.type === "feedback");
+    return record ? insightRecordLink(record, `brief-theme-${index}-${sourceIndex}`) : "";
+  }).join("");
+  return actions ? `<div class="contextual-card-actions brief-card-actions">${actions}</div>` : "";
+}
+function briefPriorityCard(entry, index) { return `<article class="brief-card" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label neutral">${escapeHtml(briefStatus(briefValue(entry, ["status"], "Active")))}</span></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.nextAction}</b>${escapeHtml(briefValue(entry, ["nextAction", "nextStep", "action"], "No next action"))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span><span><b>${executiveBriefLabels.dueDate}</b>${escapeHtml(briefValue(entry, ["dueDate"], "No date"))}</span></div><details class="measure-disclosure"><summary>Show ${escapeHtml(briefValue(entry, ["priorityLabel"], workspacePriorityLabel()))} details</summary><p data-score-family="priority">Rank ${briefValue(entry, ["rank"], index + 1)} · ${escapeHtml(briefValue(entry, ["priorityLabel"], workspacePriorityLabel()))}: ${escapeHtml(briefValue(entry, ["score"], "Needs scoring"))}</p></details>${briefCardActions(entry, `brief-priority-${index}`, "nextStep", "Update priority")}</article>`; }
+function briefRiskCard(entry, index) { const status = briefValue(entry, ["status"], "Monitor"); const severity = briefValue(entry, ["severity", "score", "severityScore"], "Not scored"); return `<article class="brief-card ${briefSeverityClass(status)}" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label ${briefSeverityClass(status)}" data-score-family="severity">${executiveBriefLabels.severity}: ${escapeHtml(status)} | ${escapeHtml(severity)}/100</span><strong>${executiveBriefLabels.sources}: ${escapeHtml(briefList(briefValue(entry, ["sources", "sourceLabels"], [])) || "No source")}</strong></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.risk}</b>${escapeHtml(briefValue(entry, ["statement", "risk"], "Risk detail unavailable."))}</p><p><b>${executiveBriefLabels.leadershipAction}</b>${escapeHtml(briefValue(entry, ["action", "leadershipAction", "ask"], "Review and assign a response."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span><span><b>${executiveBriefLabels.dueDate}</b>${escapeHtml(briefValue(entry, ["dueDate"], "No date"))}</span></div>${briefCardActions(entry, `brief-risk-${index}`, "risk", "Update risk")}</article>`; }
+function briefDecisionCard(entry, index) { return `<article class="brief-card" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label neutral">${entry.origin === "suggested" ? "Suggested decision" : escapeHtml(INSIGHT_STATUS_LABELS[entry.status] || "Captured decision")}</span></div><h4>${escapeHtml(briefTitle(entry))}</h4>${entry.initiativeTitle ? `<p class="muted">${escapeHtml(entry.initiativeTitle)}</p>` : ""}<p><b>${executiveBriefLabels.context}</b>${escapeHtml(briefValue(entry, ["context", "decision"], "Decision context unavailable."))}</p><p><b>${executiveBriefLabels.decisionAsk}</b>${escapeHtml(briefValue(entry, ["ask", "action", "decisionAsk"], "Confirm the path forward."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span><span><b>${executiveBriefLabels.dueDate}</b>${escapeHtml(briefValue(entry, ["dueDate"], "No date"))}</span></div>${briefCardActions(entry, `brief-decision-${index}`, "decision", "Record decision")}</article>`; }
 function briefRolloutGroup(label, entries = []) { return `<section class="brief-rollout-group" aria-label="${label} rollouts"><h4>${label}</h4><div class="brief-list">${entries.map((entry, index) => briefRolloutCard(entry, label, index)).join("") || `<p class="brief-group-empty">No ${label.toLowerCase()} rollouts.</p>`}</div></section>`; }
-function briefRolloutCard(entry, label, index) { return `<article class="brief-card ${label.toLowerCase()}" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label ${label.toLowerCase()}">${executiveBriefLabels.status}: ${label} | ${executiveBriefLabels.readiness}: ${escapeHtml(briefValue(entry, ["readiness"], "Not scored"))}${Number.isFinite(Number(entry.readiness)) ? "%" : ""}</span></div><h5>${escapeHtml(briefTitle(entry))}</h5><p><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.stage}</b>${escapeHtml(briefValue(entry, ["stage"], "No stage"))}</span><span><b>${executiveBriefLabels.audience}</b>${escapeHtml(briefValue(entry, ["audience"], "No audience"))}</span></div><p><b>${executiveBriefLabels.nextAction}</b>${escapeHtml(briefValue(entry, ["nextAction", "nextStep", "action"], "No next action"))}</p>${briefCardActions(entry, `brief-rollout-${label}-${index}`, "experiment", "Update readiness")}</article>`; }
+function briefRolloutCard(entry, label, index) { return `<article class="brief-card ${label.toLowerCase()}" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label ${label.toLowerCase()}">${executiveBriefLabels.status}: ${label}</span></div><h5>${escapeHtml(briefTitle(entry))}</h5><details class="measure-disclosure"><summary>Show readiness details</summary><p data-score-family="readiness">${executiveBriefLabels.readiness}: ${formatOperationalScore(entry.readiness, "%")}</p></details><p><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.stage}</b>${escapeHtml(briefValue(entry, ["stage"], "No stage"))}</span><span><b>${executiveBriefLabels.audience}</b>${escapeHtml(briefValue(entry, ["audience"], "No audience"))}</span></div><p><b>${executiveBriefLabels.nextAction}</b>${escapeHtml(briefValue(entry, ["nextAction", "nextStep", "action"], "No next action"))}</p>${briefCardActions(entry, `brief-rollout-${label}-${index}`, "experiment", "Update readiness")}</article>`; }
 function briefMetricCard(entry, index) { return `<article class="brief-card watch" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label watch">Needs tracking | ${executiveBriefLabels.reviewDate}: ${escapeHtml(briefValue(entry, ["reviewDate"], "No date"))}</span></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.firstGap}</b>${escapeHtml(briefValue(entry, ["gap", "missingDetail"], Array.isArray(entry.gaps) ? entry.gaps[0] : "Measurement detail missing."))}</p><p><b>${executiveBriefLabels.instrumentationAction}</b>${escapeHtml(briefValue(entry, ["instrumentation", "action", "instrumentationAction"], "Define and instrument the missing measure."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span></div>${briefCardActions(entry, `brief-metric-${index}`, entry.gapAction?.field || "experiment", entry.gapAction?.label || "Add measurement")}</article>`; }
-function briefThemeCard(entry, index) { return `<article class="brief-card"><div class="brief-card-heading"><span class="brief-label neutral">#${briefValue(entry, ["rank"], index + 1)} | ${briefValue(entry, ["signalCount", "count"], 0)} signals</span></div><h4>${escapeHtml(briefValue(entry, ["theme", "title"], "Customer theme"))}</h4><p><b>${executiveBriefLabels.supportingInitiatives}</b>${escapeHtml(briefList(briefValue(entry, ["initiatives", "supportingInitiatives"], [])) || "No initiatives listed")}</p><p><b>${executiveBriefLabels.supportingSegments}</b>${escapeHtml(briefList(briefValue(entry, ["segments", "supportingSegments"], [])) || "Unspecified segment")}</p>${briefThemeActions(entry, index)}</article>`; }
+function briefThemeCard(entry, index) { return `<article class="brief-card"><div class="brief-card-heading"><span class="brief-label neutral">#${briefValue(entry, ["rank"], index + 1)} | ${briefValue(entry, ["signalCount", "count"], 0)} signals</span></div><h4>${escapeHtml(briefValue(entry, ["theme", "title"], "Customer theme"))}</h4><p><b>${executiveBriefLabels.supportingInitiatives}</b>${escapeHtml(briefList(briefValue(entry, ["initiatives", "supportingInitiatives"], [])) || "No initiatives listed")}</p><p><b>${executiveBriefLabels.supportingSegments}</b>${escapeHtml(briefList(briefValue(entry, ["segments", "supportingSegments"], [])) || "No linked segments")}</p>${briefThemeActions(entry, index)}</article>`; }
 function briefAskCard(entry, index) { const type = briefValue(entry, ["type"], "Leadership ask"); const action = type === "Risk" ? ["risk", "Update risk"] : type === "Decision" ? ["decision", "Record decision"] : [entry.gapAction?.field || "experiment", entry.gapAction?.label || "Add measurement"]; return `<article class="brief-card" data-item-id="${escapeHtml(entry.itemId)}"><div class="brief-card-heading"><span class="brief-label neutral">#${index + 1} | ${escapeHtml(type)}</span></div><h4>${escapeHtml(briefTitle(entry))}</h4><p><b>${executiveBriefLabels.requestedAction}</b>${escapeHtml(briefValue(entry, ["action"], "Confirm the requested action."))}</p><div class="brief-meta"><span><b>${executiveBriefLabels.owner}</b>${escapeHtml(briefValue(entry, ["owner"], "Unassigned"))}</span><span><b>${executiveBriefLabels.neededBy}</b>${escapeHtml(briefValue(entry, ["dueDate"], "No date"))}</span></div>${briefCardActions(entry, `brief-ask-${index}`, action[0], action[1])}</article>`; }
 function briefValue(entry, keys, fallback) { for (const key of keys) { if (entry?.[key] !== undefined && entry[key] !== null && entry[key] !== "") return entry[key]; } return fallback; }
 function briefTitle(entry) { return briefValue(entry, ["title"], entry?.item?.title || "Untitled initiative"); }
@@ -1976,12 +2539,53 @@ function briefDate(value) { if (!value) return "No date"; const date = new Date(
 function briefPrioritySummary(count) { if (!count) return "No active priorities"; return count === 1 ? "Top 1 active priority" : `Top ${Math.min(5, count)} active priorities`; }
 function briefSeverityClass(value) { const status = String(value).toLowerCase(); return status === "critical" ? "critical" : status === "watch" ? "watch" : "monitor"; }
 
+function savedActionsForView(items) {
+  const matchingInitiatives = new Set(items.map((item) => item.id));
+  const matchingRecords = new Set(filterInsightRecords(state.insightRecords, { type: "action", query: state.query }).map((record) => record.id));
+  return state.insightRecords.filter((record) => record.type === "action" && (matchingRecords.has(record.id) || matchingInitiatives.has(record.initiativeId)));
+}
+
+function savedActionCard(record, context) {
+  const initiative = state.items.find((item) => item.id === record.initiativeId);
+  const owner = record.owner || organizationPersonName(record.ownerPersonId) || "Unassigned";
+  return `<article class="action-card compact" data-saved-action="${escapeHtml(record.id)}"><span>${escapeHtml(INSIGHT_STATUS_LABELS[record.status])} · ${escapeHtml(owner)}${record.dueDate ? ` · Due ${escapeHtml(record.dueDate)}` : ""}</span><h5>${escapeHtml(record.title)}</h5><p>${escapeHtml(record.description || "No work description captured.")}</p>${record.status !== "open" && record.completionEvidence ? `<p>${escapeHtml(record.completionEvidence)}</p>` : ""}<p class="muted">${escapeHtml(initiative?.title || (record.initiativeId ? "Linked initiative unavailable" : "No linked initiative"))}${record.enablementArea ? ` · ${escapeHtml(record.enablementArea)}` : ""}</p><div class="contextual-card-actions">${insightRecordLink(record, context)}</div></article>`;
+}
+
+function savedActionLists(records, context) {
+  const open = records.filter((record) => record.status === "open");
+  const history = records.filter((record) => ["done", "deferred"].includes(record.status));
+  return `<section data-action-state="open"><h4>Open actions</h4><div class="action-list">${open.map((record) => savedActionCard(record, context)).join("") || emptyState("No open actions saved.")}</div></section><section data-action-state="history"><h4>Action history</h4><div class="action-list">${history.map((record) => savedActionCard(record, context)).join("") || emptyState("No completed or deferred actions yet.")}</div></section>`;
+}
+
+function savedActionsMarkup(records) {
+  const reason = teamEditorReadOnlyReason();
+  return `<section class="panel" data-saved-actions aria-labelledby="savedActionsTitle"><div class="panel-header"><h3 id="savedActionsTitle">Saved actions</h3><button class="primary" id="newSavedActionButton" data-new-insight="action" type="button" ${reason ? "disabled" : ""}>New action</button></div><p>Track follow-ups with an owner and due date. Done and Deferred actions stay in history and can be reopened.</p>${reason ? `<p>${escapeHtml(reason)}</p>` : ""}${savedActionLists(records, "today-saved-actions")}</section>`;
+}
+
+function initiativeSavedActionsMarkup(item) {
+  const records = state.insightRecords.filter((record) => record.type === "action" && record.initiativeId === item.id);
+  return `<section class="initiative-detail-section" aria-label="Saved actions"><div class="initiative-detail-section-heading"><h4>Saved actions</h4><button class="secondary small" id="addInitiativeAction-${elementIdToken(item.id)}" data-add-initiative-action="${escapeHtml(item.id)}" type="button" ${teamEditorReadOnlyReason() ? "disabled" : ""}>Add action</button></div>${savedActionLists(records, `initiative-actions-${item.id}`)}</section>`;
+}
+
+function addInitiativeAction(trigger) {
+  if (teamEditorReadOnlyReason()) return;
+  const item = state.items.find((entry) => entry.id === trigger.dataset.addInitiativeAction);
+  if (!item) return;
+  state.insightEditor = createInsightEditorState({ mode: "new", type: "action", triggerId: trigger.id,
+    draft: { ...blankInsightValues("action"), initiativeId: item.id, owner: item.owner, ownerPersonId: item.pocPersonId || "", customerIds: item.customerIds, segmentIds: item.segmentIds }
+  });
+  render();
+}
+
 function actionsView(items) {
+  const savedActions = savedActionsForView(items);
   const actions = buildActionQueue(items, new Date(), state.prioritization, actionQueueBuildOptions());
-  const actionGroups = groupActionQueueEntries(actions.queue);
-  const memo = scopeGeneratedText(buildActionMemo(items, new Date(), state.prioritization), items);
-  const queueSummary = `${initiativeCountLabel(actionGroups.length)} · ${actionCountLabel(actions.metrics.total)} needed`;
-  return `<section class="metrics reporting-metrics">${metric("Initiatives · actions", `${actionGroups.length} · ${actions.metrics.total}`)}${metric("Overdue", actions.metrics.overdue)}${metric("Blockers", actions.metrics.blockers)}${metric("Decisions", actions.metrics.decisions)}</section><section class="actions-grid"><section class="panel action-queue" aria-labelledby="actionQueueTitle"><div class="panel-header"><h3 id="actionQueueTitle" tabindex="-1">Action Queue</h3><span class="muted">${escapeHtml(queueSummary)}</span></div><div class="action-list">${actionGroups.map(actionQueueGroupCard).join("") || emptyState("No urgent actions detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Overdue</h3><span class="muted">Dates that need reset</span></div><div class="action-list">${actions.overdue.map((entry) => `<article class="action-card compact"><span>${escapeHtml(entry.dueDate)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.action)}</p></article>`).join("") || emptyState("No overdue actions.")}</div></section><section class="panel"><div class="panel-header"><h3>Blockers</h3><span class="muted">Risks to resolve or accept</span></div><div class="action-list">${actions.blockers.map((entry) => `<article class="action-card compact"><span>${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.action)}</p></article>`).join("") || emptyState("No blockers in the action queue.")}</div></section><section class="panel actions-memo"><div class="panel-header"><h3>Action Memo</h3><button class="secondary" id="copyActionMemoButton" type="button">Copy Memo</button></div><textarea id="actionMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  const actionGroups = groupActionQueueEntries(actions.queue).map(group => ({ ...group, totalCount: actions.countsByInitiative[group.item.id] }));
+  const memo = `${scopeGeneratedText(buildActionMemo(items, new Date(), state.prioritization), items)}\n\n${buildInsightMemo("action", savedActions)}\n\n${buildInsightMemo("decision", savedDecisionsForView(items))}`;
+  const queueSummary = actions.queue.length < actions.metrics.total
+    ? `Showing ${actions.queue.length} of ${actionCountLabel(actions.metrics.total)} · ${initiativeCountLabel(actions.metrics.initiatives)} with actions`
+    : `${initiativeCountLabel(actions.metrics.initiatives)} · ${actionCountLabel(actions.metrics.total)} needed`;
+  return `${savedActionsMarkup(savedActions)}${savedDecisionsMarkup(savedDecisionsForView(items))}<section class="metrics reporting-metrics">${metric("Initiatives · actions", `${actions.metrics.initiatives} · ${actions.metrics.total}`)}${metric("Overdue", actions.metrics.overdue)}${metric("Blockers", actions.metrics.blockers)}${metric("Decisions", actions.metrics.decisions)}</section><section class="actions-grid"><section class="panel action-queue" aria-labelledby="actionQueueTitle"><div class="panel-header"><h3 id="actionQueueTitle" tabindex="-1">Action Queue</h3><span class="muted">${escapeHtml(queueSummary)}</span></div><p>Recommendations are generated from initiative gaps. Saved open actions supply next steps; pending decisions stay open until their outcomes are recorded. Other recommendations still require their named outcome.</p><div class="action-list">${actionGroups.map(actionQueueGroupCard).join("") || emptyState("No urgent actions detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Overdue</h3><span class="muted">Showing ${actions.overdue.length} of ${actions.metrics.overdue} overdue actions</span></div><div class="action-list">${actions.overdue.map((entry) => `<article class="action-card compact"><span>${escapeHtml(entry.dueDate)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.action)}</p></article>`).join("") || emptyState("No overdue actions.")}</div></section><section class="panel"><div class="panel-header"><h3>Blockers</h3><span class="muted">Showing ${actions.blockers.length} of ${actions.metrics.blockers} blockers</span></div><div class="action-list">${actions.blockers.map((entry) => `<article class="action-card compact"><span>${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.action)}</p></article>`).join("") || emptyState("No blockers in the action queue.")}</div></section><section class="panel actions-memo"><div class="panel-header"><h3>Action Memo</h3><button class="secondary" id="copyActionMemoButton" type="button">Copy Memo</button></div><textarea id="actionMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 
 function insightToolbarMarkup(type) {
@@ -1998,13 +2602,13 @@ function discoveryView(records) {
 function researchView(records) {
   const research = buildResearchWorkspace(records);
   const memo = buildInsightMemo("research", state.insightRecords);
-  return `<section class="metrics reporting-metrics">${metric("Studies", research.metrics.studies)}${metric("Recruiting", research.metrics.recruiting)}${metric("Active", research.metrics.active)}${metric("With findings", research.metrics.findings)}</section><section class="research-grid"><section class="panel insight-primary-panel"><div class="panel-header"><h3>Planned and Recruiting</h3><span class="muted">Questions and participant targets</span></div><div class="research-list">${research.planned.map((record) => insightRecordCard(record, record.objective || "Objective not captured.", `${record.questions.length} questions · ${record.participantCount}/${record.recruitmentTarget} participants`)).join("") || insightEmptyState("No planned studies.", "research")}</div></section><section class="panel"><div class="panel-header"><h3>In Progress</h3><span class="muted">Research being conducted now</span></div><div class="research-list">${research.active.map((record) => insightRecordCard(record, record.objective || "Objective not captured.", record.method || "Method not set")).join("") || emptyState("No studies are in progress.")}</div></section><section class="panel"><div class="panel-header"><h3>Findings</h3><span class="muted">Completed learning</span></div><div class="research-list">${research.complete.map((record) => insightRecordCard(record, record.findings || "No findings captured.", record.method || "Method not set")).join("") || emptyState("No completed research findings.")}</div></section><section class="panel research-memo"><div class="panel-header"><h3>Research Plan</h3><button class="secondary" id="copyResearchMemoButton" type="button">Copy Plan</button></div><textarea id="researchMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  return `<section class="metrics reporting-metrics">${metric("Studies", research.metrics.studies)}${metric("Recruiting", research.metrics.recruiting)}${metric("Active", research.metrics.active)}${metric("With findings", research.metrics.findings)}</section><section class="research-grid"><section class="panel insight-primary-panel"><div class="panel-header"><h3>Planned and Recruiting</h3><span class="muted">Questions and participant targets</span></div><div class="research-list">${research.planned.map((record) => insightRecordCard(record, record.objective || "Objective not captured.", `${record.questions.length} questions · ${record.participantCount}/${record.recruitmentTarget} participants`)).join("") || insightEmptyState("No planned studies.", "research")}</div></section><section class="panel"><div class="panel-header"><h3>In Progress</h3><span class="muted">Research being conducted now</span></div><div class="research-list">${research.active.map((record) => insightRecordCard(record, record.objective || "Objective not captured.", record.method || "Method not set")).join("") || emptyState("No studies are in progress.")}</div></section><section class="panel"><div class="panel-header"><h3>Findings</h3><span class="muted">Completed learning</span></div><div class="research-list">${research.complete.map((record) => insightRecordCard(record, record.findings || "No findings captured.", record.method || "Method not set")).join("") || emptyState("No completed research findings.")}</div></section><section class="panel" aria-labelledby="cancelledResearchTitle"><div class="panel-header"><h3 id="cancelledResearchTitle">Cancelled studies</h3><span class="muted">Review or reopen saved research</span></div><div class="research-list">${research.cancelled.map((record) => insightRecordCard(record, record.objective || "Objective not captured.", record.method || "Method not set")).join("") || emptyState("No cancelled studies.")}</div></section><section class="panel research-memo"><div class="panel-header"><h3>Research Plan</h3><button class="secondary" id="copyResearchMemoButton" type="button">Copy Plan</button></div><textarea id="researchMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 
 function validationView(records) {
   const board = buildValidationWorkspace([...state.insightRecords.filter((record) => record.type !== "validation"), ...records]);
   const memo = buildInsightMemo("validation", state.insightRecords);
-  return `<section class="metrics reporting-metrics">${metric("Experiments", board.metrics.experiments)}${metric("Running", board.metrics.running)}${metric("Decision-ready", board.metrics.decisionReady)}${metric("Evidence gaps", board.metrics.evidenceGaps)}</section><section class="validation-grid"><section class="panel insight-primary-panel"><div class="panel-header"><h3>Planned and Running</h3><span class="muted">Real experiments with declared measures</span></div><div class="validation-list">${[...board.planned, ...board.running].map((record) => insightRecordCard(record, record.hypothesis || "Hypothesis not captured.", `Success: ${record.successMetric || "Not defined"}`)).join("") || insightEmptyState("No planned or running experiments.", "validation")}</div></section><section class="panel"><div class="panel-header"><h3>Decision Ready</h3><span class="muted">Completed experiments awaiting a decision</span></div><div class="validation-list">${board.decisionReady.map((record) => insightRecordCard(record, record.result || "Result not captured.", "Record a continue, commit, iterate, or stop decision.", "Record decision")).join("") || emptyState("No experiments are decision-ready.")}</div></section><section class="panel"><div class="panel-header"><h3>Decisions</h3><span class="muted">Completed validation outcomes</span></div><div class="validation-list">${board.complete.map((record) => insightRecordCard(record, record.result || "Result not captured.", record.decisionNotes || VALIDATION_DECISION_LABELS[record.decision])).join("") || emptyState("No validation decisions yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Evidence Gaps</h3><span class="muted">Open discoveries without a linked experiment</span></div><div class="validation-list">${board.evidenceGaps.map((record) => insightRecordCard(record, record.problem || "Problem not captured.", "Link or create a validation experiment.")).join("") || emptyState("No evidence gaps detected.")}</div></section><section class="panel validation-memo"><div class="panel-header"><h3>Validation Memo</h3><button class="secondary" id="copyValidationMemoButton" type="button">Copy Memo</button></div><textarea id="validationMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  return `<section class="metrics reporting-metrics">${metric("Experiments", board.metrics.experiments)}${metric("Running", board.metrics.running)}${metric("Decision-ready", board.metrics.decisionReady)}${metric("Evidence gaps", board.metrics.evidenceGaps)}</section><section class="validation-grid"><section class="panel insight-primary-panel"><div class="panel-header"><h3>Planned and Running</h3><span class="muted">Real experiments with declared measures</span></div><div class="validation-list">${[...board.planned, ...board.running].map((record) => insightRecordCard(record, record.hypothesis || "Hypothesis not captured.", `Success: ${record.successMetric || "Not defined"}`)).join("") || insightEmptyState("No planned or running experiments.", "validation")}</div></section><section class="panel"><div class="panel-header"><h3>Decision Ready</h3><span class="muted">Completed experiments awaiting a decision</span></div><div class="validation-list">${board.decisionReady.map((record) => insightRecordCard(record, record.result || "Result not captured.", "Record a continue, commit, iterate, or stop decision.", "Record decision")).join("") || emptyState("No experiments are decision-ready.")}</div></section><section class="panel"><div class="panel-header"><h3>Decisions</h3><span class="muted">Completed validation outcomes</span></div><div class="validation-list">${board.complete.map((record) => insightRecordCard(record, record.result || "Result not captured.", validationDecisionSummary(record))).join("") || emptyState("No validation decisions yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Evidence Gaps</h3><span class="muted">Open discoveries without a linked experiment</span></div><div class="validation-list">${board.evidenceGaps.map((record) => insightRecordCard(record, record.problem || "Problem not captured.", "Link or create a validation experiment.")).join("") || emptyState("No evidence gaps detected.")}</div></section>${validationStatusHistoryMarkup(board)}<section class="panel validation-memo"><div class="panel-header"><h3>Validation Memo</h3><button class="secondary" id="copyValidationMemoButton" type="button">Copy Memo</button></div><textarea id="validationMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 
 function feedbackView(records) {
@@ -2016,7 +2620,7 @@ function feedbackView(records) {
 function supportView(records) {
   const support = buildSupportWorkspace(records);
   const memo = buildInsightMemo("support", state.insightRecords);
-  return `<section class="metrics reporting-metrics">${metric("Cases", support.metrics.total)}${metric("Open", support.metrics.open)}${metric("Critical", support.metrics.critical)}${metric("Overdue response", support.metrics.overdue)}</section><section class="support-grid"><section class="panel insight-primary-panel"><div class="panel-header"><h3>Support Queue</h3><span class="muted">Declared customer cases and response work</span></div><div class="support-list">${support.open.map((record) => insightRecordCard(record, record.issue || "Issue not captured.", `${SUPPORT_SEVERITY_LABELS[record.severity]} · ${record.owner || "Unassigned"}`, "Manage case", `support-${record.severity}`)).join("") || insightEmptyState("No open support cases.", "support")}</div></section><section class="panel"><div class="panel-header"><h3>Critical Responses</h3><span class="muted">Customer-facing follow-up</span></div><div class="support-list">${support.critical.map((record) => insightRecordCard(record, record.customerImpact || record.issue || "Impact not captured.", record.responseDueDate ? `Respond by ${record.responseDueDate}` : "Response deadline not set", "Manage case", "support-critical")).join("") || emptyState("No critical support cases.")}</div></section><section class="panel"><div class="panel-header"><h3>Owner Load</h3><span class="muted">Open cases by declared owner</span></div><div class="support-list">${support.ownerLoad.map((entry) => `<article class="support-card"><span>${entry.count} cases · ${entry.critical} critical</span><h4>${escapeHtml(entry.owner)}</h4><p>${escapeHtml(entry.cases.join(" · "))}</p></article>`).join("") || emptyState("No owner load.")}</div></section><section class="panel support-memo"><div class="panel-header"><h3>Support Memo</h3><button class="secondary" id="copySupportMemoButton" type="button">Copy Memo</button></div><textarea id="supportMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  return `<section class="metrics reporting-metrics">${metric("Cases", support.metrics.total)}${metric("Open", support.metrics.open)}${metric("Critical", support.metrics.critical)}${metric("Overdue response", support.metrics.overdue)}</section><section class="support-grid"><section class="panel insight-primary-panel"><div class="panel-header"><h3>Support Queue</h3><span class="muted">Declared customer cases and response work</span></div><div class="support-list">${support.open.map((record) => insightRecordCard(record, record.issue || "Issue not captured.", `${SUPPORT_SEVERITY_LABELS[record.severity]} · ${record.owner || "Unassigned"}`, "Manage case", `support-${record.severity}`)).join("") || insightEmptyState("No open support cases.", "support")}</div></section><section class="panel"><div class="panel-header"><h3>Critical Responses</h3><span class="muted">Customer-facing follow-up</span></div><div class="support-list">${support.critical.map((record) => insightRecordCard(record, record.customerImpact || record.issue || "Impact not captured.", record.responseDueDate ? `Respond by ${record.responseDueDate}` : "Response deadline not set", "Manage case", "support-critical")).join("") || emptyState("No critical support cases.")}</div></section><section class="panel"><div class="panel-header"><h3>Owner Load</h3><span class="muted">Open cases by declared owner</span></div><div class="support-list">${support.ownerLoad.map((entry) => `<article class="support-card"><span>${entry.count} cases · ${entry.critical} critical</span><h4>${escapeHtml(entry.owner)}</h4><p>${escapeHtml(entry.cases.join(" · "))}</p></article>`).join("") || emptyState("No owner load.")}</div></section><section class="panel" aria-labelledby="resolvedSupportTitle"><div class="panel-header"><h3 id="resolvedSupportTitle">Resolved cases</h3><span class="muted">Review resolutions or reopen saved cases</span></div><div class="support-list">${support.resolved.map((record) => insightRecordCard(record, record.resolution || "Resolution not captured.", `${record.source || "Source not captured"} · ${SUPPORT_SEVERITY_LABELS[record.severity]}`, "Manage case")).join("") || emptyState("No resolved support cases.")}</div></section><section class="panel support-memo"><div class="panel-header"><h3>Support Memo</h3><button class="secondary" id="copySupportMemoButton" type="button">Copy Memo</button></div><textarea id="supportMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 
 function insightRecordCard(record, body, meta, actionLabel = "Edit", extraClass = "") {
@@ -2029,16 +2633,18 @@ function insightEmptyState(message, type) {
   return `<div class="empty insight-empty"><p>${escapeHtml(message)}</p><button class="secondary" data-new-insight="${escapeHtml(type)}" type="button" ${readonly ? "disabled" : ""}>${escapeHtml(insightCommandLabel(type))}</button></div>`;
 }
 function portfolioView(items) {
-  const portfolio = buildPortfolioDashboard(items, new Date(), CAPACITY_BENCHMARKS.active, state.prioritization);
-  const memo = scopeGeneratedText(buildPortfolioMemo(items, new Date(), CAPACITY_BENCHMARKS.active, state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Active", portfolio.metrics.active)}${metric("Active utilization", `${portfolio.metrics.utilization}%`, `${portfolio.metrics.usedEffort} / ${portfolio.metrics.capacity} effort · committed + discovery. Active capacity benchmark.`)}${metric("Risks", portfolio.metrics.risks)}${metric("Actions", portfolio.metrics.actions)}</section><section class="portfolio-grid"><section class="panel"><div class="panel-header"><h3>Status Mix</h3><span class="muted">Portfolio shape</span></div><div class="portfolio-list">${portfolio.statusMix.map((entry, index) => `<article class="portfolio-card"><span>${entry.effort} effort</span><h4>${escapeHtml(entry.label)}</h4><p>${entry.count} initiatives</p></article>`).join("")}</div></section><section class="panel"><div class="panel-header"><h3>Objective Mix</h3><span class="muted">Active effort by outcome</span></div><div class="portfolio-list">${portfolio.objectiveMix.map((entry, index) => `<article class="portfolio-card"><span>${entry.effort} effort | ${entry.count} initiatives</span><h4>${escapeHtml(entry.objective)}</h4>${initiativeReferenceList(entry.topItems, `portfolio-objective-${index}`)}</article>`).join("") || emptyState("No active objectives yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Segment Mix</h3><span class="muted">Where work clusters</span></div><div class="portfolio-list">${portfolio.segmentMix.map((entry, index) => `<article class="portfolio-card"><span>${entry.count} initiatives</span><h4>${escapeHtml(entry.segment)}</h4>${initiativeReferenceList(entry.topItems, `portfolio-segment-${index}`)}</article>`).join("") || emptyState("No segments captured yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Portfolio Watchlist</h3><span class="muted">Top operating risks</span></div><div class="portfolio-list">${portfolio.watchlist.map((entry, index) => `<article class="portfolio-card warning"><span>${escapeHtml(entry.type)} | ${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.action)}</p>${initiativeReferenceActions(entry.item, `portfolio-watch-${index}`, entry.target?.kind === "risk" ? "risks" : "", entry.target?.recordId || "")}</article>`).join("") || emptyState("No watchlist actions.")}</div></section><section class="panel"><div class="panel-header"><h3>Recommendations</h3><span class="muted">Portfolio balancing moves</span></div><div class="portfolio-list">${portfolio.recommendations.map((entry, index) => `<article class="portfolio-card"><p>${escapeHtml(entry)}</p></article>`).join("") || emptyState("Portfolio is balanced enough for the current operating view.")}</div></section><section class="panel portfolio-memo"><div class="panel-header"><h3>Portfolio Memo</h3><button class="secondary" id="copyPortfolioMemoButton" type="button">Copy Memo</button></div><textarea id="portfolioMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  const context = currentPlanningCapacity();
+  const portfolio = buildPortfolioDashboard(items, new Date(), context.capacity, state.prioritization);
+  const memo = scopeGeneratedText(buildPortfolioMemo(items, new Date(), context.capacity, state.prioritization), items);
+  return `${dependencyCycleWarnings(items, "portfolioView")}${planningCapacitySettingsMarkup()}<section class="metrics reporting-metrics">${metric("Active", portfolio.metrics.active)}${metric("Active utilization", capacityNumber(portfolio.metrics.utilization, context.available, "%"), context.available ? `${portfolio.metrics.usedEffort} / ${context.capacity} effort · committed + discovery. Saved effort budget.` : `${portfolio.metrics.usedEffort} active effort · Capacity unavailable. Committed + discovery.`)}${metric("Risks", portfolio.metrics.risks)}${metric("Actions", portfolio.metrics.actions)}</section><section class="portfolio-grid"><section class="panel"><div class="panel-header"><h3>Reporting categories</h3><span class="muted">Groups workflow stages</span></div><div class="portfolio-list">${portfolio.statusMix.map((entry, index) => `<article class="portfolio-card"><span>${entry.effort} effort</span><h4>${escapeHtml(entry.label)}</h4><p>${entry.count} initiatives</p></article>`).join("")}</div></section><section class="panel"><div class="panel-header"><h3>Objective Mix</h3><span class="muted">Active effort by outcome</span></div><div class="portfolio-list">${portfolio.objectiveMix.map((entry, index) => `<article class="portfolio-card"><span>${entry.effort} effort | ${entry.count} initiatives</span><h4>${escapeHtml(entry.objective)}</h4>${initiativeReferenceList(entry.topItems, `portfolio-objective-${index}`)}</article>`).join("") || emptyState("No active objectives yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Segment Mix</h3><span class="muted">Where work clusters</span></div><div class="portfolio-list">${portfolio.segmentMix.map((entry, index) => `<article class="portfolio-card"><span>${entry.count} initiatives</span><h4>${escapeHtml(entry.segment)}</h4>${initiativeReferenceList(entry.topItems, `portfolio-segment-${index}`)}</article>`).join("") || emptyState("No segments captured yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Portfolio Watchlist</h3><span class="muted">Top operating risks</span></div><div class="portfolio-list">${portfolio.watchlist.map((entry, index) => `<article class="portfolio-card warning"><span>${escapeHtml(entry.type)} | ${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.action)}</p>${initiativeReferenceActions(entry.item, `portfolio-watch-${index}`, entry.target?.kind === "risk" ? "risks" : "", entry.target?.recordId || "")}</article>`).join("") || emptyState("No watchlist actions.")}</div></section><section class="panel"><div class="panel-header"><h3>Recommendations</h3><span class="muted">Portfolio balancing moves</span></div><div class="portfolio-list">${portfolio.recommendationActions.map(portfolioRecommendationCard).join("") || emptyState(context.available ? "No portfolio recommendations for this view." : planningCapacityMessage(context))}</div></section><section class="panel portfolio-memo"><div class="panel-header"><h3>Portfolio Memo</h3><button class="secondary" id="copyPortfolioMemoButton" type="button">Copy Memo</button></div><textarea id="portfolioMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 function planningView(items) {
-  const plan = buildPeriodPlan(items, state.periodSelection, state.planningCalendar, new Date(), CAPACITY_BENCHMARKS.period, state.prioritization);
-  const memo = buildPeriodPlanMemo(items, state.periodSelection, state.planningCalendar, new Date(), CAPACITY_BENCHMARKS.period, state.prioritization);
+  const context = currentPlanningCapacity();
+  const plan = buildPeriodPlan(items, state.periodSelection, state.planningCalendar, new Date(), context.capacity, state.prioritization);
+  const memo = scopeGeneratedText(buildPeriodPlanMemo(items, state.periodSelection, state.planningCalendar, new Date(), context.capacity, state.prioritization), items);
   const periodLabel = periodSelectionLabel(state.periodSelection, state.planningCalendar);
   const periodRange = periodSelectionRangeLabel(state.periodSelection, state.planningCalendar);
-  return `<section class="metrics reporting-metrics">${metric("Selected", plan.metrics.selected)}${metric("Deferred", plan.metrics.deferred)}${metric("Selected utilization", `${plan.metrics.utilization}%`, `${plan.used} / ${plan.capacity} effort · ${periodLabel}. Plan capacity benchmark.`)}${metric("Objectives", plan.metrics.objectives)}</section>${capacityComparisonMarkup(items)}<section class="planning-grid"><section class="panel"><div class="panel-header"><h3>Strategic Bets</h3><span class="muted">Outcome-led planning themes</span></div><div class="planning-list">${plan.bets.map((bet, index) => `<article class="planning-card"><span>${bet.initiatives.length} selected initiatives</span><h4>${escapeHtml(bet.objective)}</h4><p>${escapeHtml(bet.keyResult)}</p>${initiativeReferenceList(bet.initiatives, `planning-bet-${index}`)}</article>`).join("") || emptyState("No strategic bets drafted.")}</div></section><section class="panel"><div class="panel-header"><h3>Selected Work</h3><span class="muted">${plan.used} / ${plan.capacity} effort</span></div><div class="planning-list">${plan.selected.map((item, index) => `<article class="planning-card"><span>${statusLabels[item.status]} | effort ${item.effort}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.nextStep || item.problem || "Define planning detail.")}</p><div class="contextual-card-actions">${initiativeDetailButton(item, `plan-selected-${index}`)}</div></article>`).join("") || emptyState("No work selected.")}</div></section><section class="panel"><div class="panel-header"><h3>Deferred Work</h3><span class="muted">Outside current capacity</span></div><div class="planning-list">${plan.deferred.map((item, index) => `<article class="planning-card"><span>${escapeHtml(workspacePriorityLabel())} ${escapeHtml(workspacePriorityValue(item))} | effort ${item.effort}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(primaryRiskText(item) || item.nextStep || "Revisit after capacity changes.")}</p><div class="contextual-card-actions">${initiativeDetailButton(item, `plan-deferred-${index}`)}</div></article>`).join("") || emptyState("No deferred work.")}</div></section><section class="panel"><div class="panel-header"><h3>Planning Risks</h3><span class="muted">Resolve before commit</span></div><div class="planning-list">${plan.risks.map(planningRiskCard).join("") || emptyState("No planning risks detected.")}</div></section><section class="panel planning-memo"><div class="panel-header"><div><h3>Plan · ${escapeHtml(periodLabel)}</h3><span class="muted">${escapeHtml(periodRange)}</span></div><button class="secondary" id="copyQuarterlyPlanButton" type="button">Copy Plan</button></div><textarea id="quarterlyPlanDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  return `${dependencyCycleWarnings(items, "planningView")}${planningCapacitySettingsMarkup()}<section class="metrics reporting-metrics">${metric("Selected", capacityNumber(plan.metrics.selected, context.available))}${metric("Deferred", capacityNumber(plan.metrics.deferred, context.available))}${metric("Selected utilization", capacityNumber(plan.metrics.utilization, context.available, "%"), `${capacityNumber(plan.used, context.available)} / ${capacityNumber(plan.capacity, context.available)} effort · ${periodLabel}. Saved effort budget.`)}${metric("Objectives", plan.metrics.objectives)}</section>${capacityComparisonMarkup(items)}<section class="planning-grid"><section class="panel"><div class="panel-header"><h3>Strategic Bets</h3><span class="muted">Outcome-led planning themes</span></div><div class="planning-list">${plan.bets.map((bet, index) => `<article class="planning-card"><span>${bet.initiatives.length} selected initiatives</span><h4>${escapeHtml(bet.objective)}</h4><p>${escapeHtml(bet.keyResult)}</p>${initiativeReferenceList(bet.initiatives, `planning-bet-${index}`)}</article>`).join("") || emptyState("No strategic bets drafted.")}</div></section><section class="panel"><div class="panel-header"><h3>Selected Work</h3><span class="muted">${capacityNumber(plan.used, context.available)} / ${capacityNumber(plan.capacity, context.available)} effort</span></div><div class="planning-list">${plan.selected.map((item, index) => `<article class="planning-card"><span>${escapeHtml(initiativeReportingContext(state.workflow, item))} | effort ${item.effort}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.nextStep || item.problem || "Define planning detail.")}</p><div class="contextual-card-actions">${initiativeDetailButton(item, `plan-selected-${index}`)}</div></article>`).join("") || emptyState(context.available ? "No work selected." : planningCapacityMessage(context))}</div></section><section class="panel"><div class="panel-header"><h3>Deferred Work</h3><span class="muted">${context.available ? "Outside saved capacity" : "Awaiting planning capacity"}</span></div><div class="planning-list">${plan.deferred.map((item, index) => `<article class="planning-card"><span>${escapeHtml(workspacePriorityLabel())} ${escapeHtml(workspacePriorityValue(item))} | effort ${item.effort}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(primaryRiskText(item) || item.nextStep || "Revisit after capacity changes.")}</p><div class="contextual-card-actions">${initiativeDetailButton(item, `plan-deferred-${index}`)}</div></article>`).join("") || emptyState(context.available ? "No deferred work." : planningCapacityMessage(context))}</div></section><section class="panel"><div class="panel-header"><h3>Planning Risks</h3><span class="muted">Resolve before commit</span></div><div class="planning-list">${plan.risks.map(planningRiskCard).join("") || emptyState("No planning risks detected.")}</div></section><section class="panel planning-memo"><div class="panel-header"><div><h3>Plan · ${escapeHtml(periodLabel)}</h3><span class="muted">${escapeHtml(periodRange)}</span></div><button class="secondary" id="copyQuarterlyPlanButton" type="button">Copy Plan</button></div><textarea id="quarterlyPlanDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 function planningRiskCard(entry, index) {
   const item = entry.item;
@@ -2051,63 +2657,166 @@ function planningRiskCard(entry, index) {
 }
 function roadmapView(items, groups) {
   const plan = buildReleasePlan(items, state.prioritization);
-  return `<section class="roadmap">${releaseBucket("Now", "Committed work closest to delivery", plan.now)}${releaseBucket("Next", "Discovery work with enough signal", plan.next)}${releaseBucket("Later", "Promising intake items", plan.later)}</section><section class="panel"><div class="panel-header"><h3>Delivery State</h3><span class="muted">From intake to shipped</span></div><div class="status-row">${Object.entries(groups).map(([status, statusItems]) => `<div><strong>${statusItems.length}</strong><span>${statusLabels[status]}</span></div>`).join("")}</div></section>`;
+  return `<section class="roadmap">${releaseBucket("Now", "Committed work closest to delivery", plan.now)}${releaseBucket("Next", "Discovery work with enough signal", plan.next)}${releaseBucket("Later", "Promising intake items", plan.later)}</section><section class="panel"><div class="panel-header"><h3>Delivery categories</h3><span class="muted">Groups workflow stages from intake to shipped</span></div><div class="status-row">${Object.entries(groups).map(([status, statusItems]) => `<div><strong>${statusItems.length}</strong><span>${statusLabels[status]}</span></div>`).join("")}</div></section>`;
 }
 
 function deliveryView(items) {
   const board = buildDeliveryBoard(items, new Date(), state.prioritization);
   const memo = scopeGeneratedText(buildDeliveryMemo(items, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Committed", board.metrics.committed)}${metric("On track", board.metrics.onTrack)}${metric("At risk", board.metrics.atRisk)}${metric("Overdue", board.metrics.overdue)}</section><section class="delivery-grid"><section class="panel"><div class="panel-header"><h3>On Track</h3><span class="muted">Ready or close to ready</span></div><div class="delivery-list">${board.onTrack.map((entry, index) => deliveryCard(entry, `onTrack-${index}`)).join("") || emptyState("No committed work is fully on track.")}</div></section><section class="panel"><div class="panel-header"><h3>Watch</h3><span class="muted">Needs checklist attention</span></div><div class="delivery-list">${board.watch.map((entry, index) => deliveryCard(entry, `watch-${index}`)).join("") || emptyState("No watch-list delivery work.")}</div></section><section class="panel"><div class="panel-header"><h3>At Risk</h3><span class="muted">Explicit at-risk or blocked dependencies</span></div><div class="delivery-list">${board.atRisk.map((entry, index) => deliveryCard(entry, `atRisk-${index}`)).join("") || emptyState("No at-risk delivery work.")}</div></section><section class="panel"><div class="panel-header"><h3>Overdue</h3><span class="muted">Needs reset</span></div><div class="delivery-list">${board.overdue.map((entry, index) => deliveryCard(entry, `overdue-${index}`)).join("") || emptyState("No overdue committed work.")}</div></section><section class="panel delivery-memo"><div class="panel-header"><h3>Delivery Memo</h3><button class="secondary" id="copyDeliveryMemoButton" type="button">Copy Memo</button></div><textarea id="deliveryMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  return `${dependencyCycleWarnings(items, "deliveryView")}<section class="metrics reporting-metrics">${metric("Committed", board.metrics.committed)}${metric("On track", board.metrics.onTrack)}${metric("At risk", board.metrics.atRisk)}${metric("Overdue", board.metrics.overdue)}</section><section class="delivery-grid"><section class="panel"><div class="panel-header"><h3>On Track</h3><span class="muted">Ready or close to ready</span></div><div class="delivery-list">${board.onTrack.map((entry, index) => deliveryCard(entry, `onTrack-${index}`)).join("") || emptyState("No committed work is fully on track.")}</div></section><section class="panel"><div class="panel-header"><h3>Watch</h3><span class="muted">Needs checklist attention</span></div><div class="delivery-list">${board.watch.map((entry, index) => deliveryCard(entry, `watch-${index}`)).join("") || emptyState("No watch-list delivery work.")}</div></section><section class="panel"><div class="panel-header"><h3>At Risk</h3><span class="muted">Explicit at-risk or blocked dependencies</span></div><div class="delivery-list">${board.atRisk.map((entry, index) => deliveryCard(entry, `atRisk-${index}`)).join("") || emptyState("No at-risk delivery work.")}</div></section><section class="panel"><div class="panel-header"><h3>Overdue</h3><span class="muted">Needs reset</span></div><div class="delivery-list">${board.overdue.map((entry, index) => deliveryCard(entry, `overdue-${index}`)).join("") || emptyState("No overdue committed work.")}</div></section><section class="panel delivery-memo"><div class="panel-header"><h3>Delivery Memo</h3><button class="secondary" id="copyDeliveryMemoButton" type="button">Copy Memo</button></div><textarea id="deliveryMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 
 function rolloutsView(items) {
   const plan = buildRolloutPlan(items, new Date(), state.prioritization);
   const memo = scopeGeneratedText(buildRolloutMemo(items, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Candidates", plan.metrics.candidates)}${metric("Ready", plan.metrics.ready)}${metric("Watch", plan.metrics.watch)}${metric("Hold", plan.metrics.hold)}</section><section class="rollouts-grid"><section class="panel"><div class="panel-header"><h3>Rollout Plan</h3><span class="muted">Stage, audience, owner</span></div><div class="rollout-list">${plan.candidates.map((entry, index) => rolloutCard(entry, `candidates-${index}`)).join("") || emptyState("No committed work is ready for rollout planning.")}</div></section><section class="panel"><div class="panel-header"><h3>Watch And Hold</h3><span class="muted">Fix before broad exposure</span></div><div class="rollout-list">${[...plan.watch, ...plan.hold].map((entry, index) => rolloutCard(entry, `watch-hold-${index}`)).join("") || emptyState("No rollout candidates need intervention.")}</div></section><section class="panel"><div class="panel-header"><h3>Guardrails</h3><span class="muted">Monitor during exposure</span></div><div class="rollout-list">${plan.candidates.slice(0, 8).map((entry, index) => `<article class="rollout-card"><span>${escapeHtml(entry.item.title)}</span><h4>${escapeHtml(entry.guardrails[0])}</h4><p>${escapeHtml(entry.rollback)}</p>${initiativeReferenceActions(entry.item, `rollout-guardrail-${index}`)}</article>`).join("") || emptyState("No rollout guardrails drafted.")}</div></section><section class="panel rollouts-memo"><div class="panel-header"><h3>Rollout Memo</h3><button class="secondary" id="copyRolloutMemoButton" type="button">Copy Memo</button></div><textarea id="rolloutMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  return `${dependencyCycleWarnings(items, "rolloutsView")}<p class="rollout-guidance">${escapeHtml(rolloutReadinessGuidance)}</p><section class="metrics reporting-metrics">${metric("Candidates", plan.metrics.candidates)}${metric("Ready", plan.metrics.ready)}${metric("Watch", plan.metrics.watch)}${metric("Hold", plan.metrics.hold)}</section><section class="rollouts-grid"><section class="panel"><div class="panel-header"><h3>Rollout Plan</h3><span class="muted">Stage, audience, owner</span></div><div class="rollout-list">${plan.candidates.map((entry, index) => rolloutCard(entry, `candidates-${index}`)).join("") || emptyState("No committed work is ready for rollout planning.")}</div></section><section class="panel"><div class="panel-header"><h3>Watch And Hold</h3><span class="muted">Fix before broad exposure</span></div><div class="rollout-list">${[...plan.watch, ...plan.hold].map((entry, index) => rolloutCard(entry, `watch-hold-${index}`)).join("") || emptyState("No rollout candidates need intervention.")}</div></section><section class="panel"><div class="panel-header"><h3>Guardrails</h3><span class="muted">Monitor during exposure</span></div><div class="rollout-list">${plan.candidates.slice(0, 8).map((entry, index) => `<article class="rollout-card"><span>${escapeHtml(entry.item.title)}</span><h4>${escapeHtml(entry.guardrails[0])}</h4><ul>${entry.guardrails.slice(1).map((guardrail) => `<li>${escapeHtml(guardrail)}</li>`).join("")}</ul><p>${escapeHtml(entry.rollback)}</p>${initiativeReferenceActions(entry.item, `rollout-guardrail-${index}`)}</article>`).join("") || emptyState("No rollout guardrails drafted.")}</div></section><section class="panel rollouts-memo"><div class="panel-header"><h3>Rollout Memo</h3><button class="secondary" id="copyRolloutMemoButton" type="button">Copy Memo</button></div><textarea id="rolloutMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 
 function launchView(items) {
   const board = buildLaunchBoard(items, new Date(), state.prioritization);
   const memo = scopeGeneratedText(buildLaunchMemo(items, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Candidates", board.metrics.candidates)}${metric("Go", board.metrics.go)}${metric("Watch", board.metrics.watch)}${metric("No-go", board.metrics.noGo)}</section><section class="launch-grid"><section class="panel"><div class="panel-header"><h3>Launch Candidates</h3><span class="muted">Go / watch / no-go</span></div><div class="launch-list">${board.candidates.map((entry, index) => `<article class="launch-card ${entry.goNoGo.toLowerCase().replace("-", "")}"><span>${escapeHtml(entry.goNoGo)} | ${entry.readiness}% | ${escapeHtml(entry.launchDate)}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.gaps[0]?.task || entry.blockers[0]?.ask || "Ready for launch review.")}</p>${initiativeReferenceActions(entry.item, `launch-candidate-${index}`)}</article>`).join("") || emptyState("No committed or discovery launches.")}</div></section><section class="panel"><div class="panel-header"><h3>Readiness Gaps</h3><span class="muted">Top incomplete launch checks</span></div><div class="launch-list">${board.candidates.flatMap((entry) => entry.gaps.slice(0, 2).map((gap) => ({ item: entry.item, title: entry.item.title, gap }))).slice(0, 8).map((entry, index) => `<article class="launch-card"><span>${escapeHtml(entry.gap.area)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.gap.task)}</p>${initiativeReferenceActions(entry.item, `launch-gap-${index}`)}</article>`).join("") || emptyState("No readiness gaps detected.")}</div></section><section class="panel launch-memo"><div class="panel-header"><h3>Launch Memo</h3><button class="secondary" id="copyLaunchMemoButton" type="button">Copy Memo</button></div><textarea id="launchMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  return `${dependencyCycleWarnings(items, "launchView")}<p class="rollout-guidance">${escapeHtml(rolloutReadinessGuidance)}</p><section class="metrics reporting-metrics">${metric("Candidates", board.metrics.candidates)}${metric("Ready", board.metrics.go)}${metric("Watch", board.metrics.watch)}${metric("Hold", board.metrics.noGo)}</section><section class="launch-grid"><section class="panel"><div class="panel-header"><h3>Launch Candidates</h3><span class="muted">Ready / Watch / Hold</span></div><div class="launch-list">${board.candidates.map((entry, index) => `<article class="launch-card ${entry.goNoGo.toLowerCase().replace("-", "")}"><span>${escapeHtml(entry.goNoGo)} | ${entry.readiness}% | ${escapeHtml(entry.launchDate)}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.gaps[0]?.task || entry.blockers[0]?.ask || "Ready for launch review.")}</p>${workflowRecommendationControls(entry.item, `launch-candidate-${index}`, entry.gaps[0]?.actions || [], entry.blockers)}</article>`).join("") || emptyState("No committed or discovery launches.")}</div></section><section class="panel"><div class="panel-header"><h3>Readiness Gaps</h3><span class="muted">Top incomplete launch checks</span></div><div class="launch-list">${board.candidates.flatMap((entry) => entry.gaps.map((gap) => ({ item: entry.item, title: entry.item.title, gap }))).map((entry, index) => `<article class="launch-card" data-launch-gap-item="${escapeHtml(entry.item.id)}" data-launch-gap-area="${escapeHtml(entry.gap.area)}"><span>${escapeHtml(entry.gap.area)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.gap.task)}</p>${workflowRecommendationControls(entry.item, `launch-gap-${entry.item.id}-${entry.gap.area}`, entry.gap.actions)}</article>`).join("") || emptyState("No readiness gaps detected.")}</div></section><section class="panel launch-memo"><div class="panel-header"><h3>Launch Memo</h3><button class="secondary" id="copyLaunchMemoButton" type="button">Copy Memo</button></div><textarea id="launchMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 
 function enablementView(items) {
-  const plan = buildEnablementPlan(items, new Date(), state.prioritization);
-  const memo = scopeGeneratedText(buildEnablementMemo(items, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Candidates", plan.metrics.candidates)}${metric("Ready", plan.metrics.ready)}${metric("Gaps", plan.metrics.gaps)}${metric("Blocked", plan.metrics.blocked)}</section><section class="enablement-grid"><section class="panel"><div class="panel-header"><h3>Launch Handoffs</h3><span class="muted">Docs, support, sales, training</span></div><div class="enablement-list">${plan.candidates.map(enablementCard).join("") || emptyState("No launch candidates need enablement.")}</div></section><section class="panel"><div class="panel-header"><h3>Top Enablement Gaps</h3><span class="muted">What teams need before rollout</span></div><div class="enablement-list">${plan.candidates.flatMap((entry) => entry.gaps.slice(0, 2).map((gap) => ({ entry, gap }))).slice(0, 8).map((item, index) => `<article class="enablement-card warning"><span>${escapeHtml(item.gap.area)} | ${escapeHtml(item.entry.owner)}</span><h4>${escapeHtml(item.entry.item.title)}</h4><p>${escapeHtml(item.gap.task)}</p>${initiativeReferenceActions(item.entry.item, `enablement-gap-${index}`)}</article>`).join("") || emptyState("No enablement gaps detected.")}</div></section><section class="panel enablement-memo"><div class="panel-header"><h3>Enablement Memo</h3><button class="secondary" id="copyEnablementMemoButton" type="button">Copy Memo</button></div><textarea id="enablementMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  const plan = buildEnablementPlan(items, new Date(), state.prioritization, state.insightRecords);
+  const memo = scopeGeneratedText(buildEnablementMemo(items, new Date(), state.prioritization, state.insightRecords), items);
+  const itemIds = new Set(items.map((item) => item.id));
+  const history = state.insightRecords.filter((record) => record.type === "action" && record.enablementArea && itemIds.has(record.initiativeId) && ["done", "deferred"].includes(record.status));
+  return `<section class="metrics reporting-metrics">${metric("Candidates", plan.metrics.candidates)}${metric("Recorded complete", plan.metrics.ready)}${metric("Incomplete areas", plan.metrics.gaps)}${metric("Not completed", plan.metrics.blocked)}</section><section class="enablement-grid"><section class="panel"><div class="panel-header"><h3>Launch Handoffs</h3><span class="muted">Saved work and completion evidence</span></div><p>Initiative details inform suggestions. Mark an action Done only after the work is complete, with an owner and evidence. Deferred work stays incomplete.</p><div class="enablement-list">${plan.candidates.map(enablementCard).join("") || emptyState("No launch candidates need enablement.")}</div></section><section class="panel"><div class="panel-header"><h3>Top Enablement Gaps</h3><span class="muted">All incomplete areas</span></div><div class="enablement-list">${plan.candidates.flatMap((entry) => entry.gaps.map((gap) => ({ entry, gap }))).map(({ entry, gap }) => `<article class="enablement-card warning" data-enablement-item="${escapeHtml(entry.item.id)}" data-enablement-area="${gap.area}"><span>${gap.area} | ${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.item.title)}</h4><p>Suggested work: ${escapeHtml(gap.task)}</p>${enablementActionControls(entry.item, gap)}</article>`).join("") || emptyState("All candidate enablement areas have saved completion evidence.")}</div></section><section class="panel"><div class="panel-header"><h3>Action history</h3><span class="muted">Done and deferred work</span></div><div class="enablement-list">${history.map((record) => `<article class="enablement-card" data-enablement-history="${escapeHtml(record.id)}"><span>${escapeHtml(record.enablementArea)} | ${escapeHtml(INSIGHT_STATUS_LABELS[record.status])}</span><h4>${escapeHtml(record.title)}</h4><p>${escapeHtml(record.completionEvidence || "No completion evidence recorded.")}</p>${insightRecordLink(record, "enablement-history")}</article>`).join("") || emptyState("No completed or deferred enablement actions yet.")}</div></section><section class="panel enablement-memo"><div class="panel-header"><h3>Enablement Memo</h3><button class="secondary" id="copyEnablementMemoButton" type="button">Copy Memo</button></div><textarea id="enablementMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
+
+function enablementActionControls(item, check) {
+  const context = `enablement-${item.id}-${check.area}`;
+  const records = check.actions.map((record) => `<span>${escapeHtml(INSIGHT_STATUS_LABELS[record.status])} · ${escapeHtml(record.owner || organizationPersonName(record.ownerPersonId) || "Unassigned")}</span>${insightRecordLink(record, context)}`).join("");
+  return `<div class="contextual-card-actions workflow-recommendation-controls">${initiativeDetailButton(item, context)}${records || `<button class="secondary small" type="button" id="${escapeHtml(context)}" data-plan-enablement="${escapeHtml(item.id)}" data-enablement-area="${check.area}" ${teamEditorReadOnlyReason() ? "disabled" : ""}>Plan ${check.area.toLowerCase()} action</button>`}</div>`;
+}
+
+function planEnablementAction(trigger) {
+  if (teamEditorReadOnlyReason()) return;
+  const item = state.items.find((entry) => entry.id === trigger.dataset.planEnablement);
+  if (!item) return;
+  const check = buildEnablementPlan([item], new Date(), state.prioritization, state.insightRecords).candidates[0]?.checks.find((entry) => entry.area === trigger.dataset.enablementArea);
+  if (!check) return;
+  if (check.actions.length) { openInsightEditor("view", trigger, check.actions[0].id); return; }
+  state.insightEditor = createInsightEditorState({ mode: "new", type: "action", triggerId: trigger.id,
+    draft: { ...blankInsightValues("action"), title: `${check.area}: ${item.title}`, description: check.task, initiativeId: item.id, enablementArea: check.area, owner: item.owner, ownerPersonId: item.pocPersonId || "", customerIds: item.customerIds, segmentIds: item.segmentIds }
+  });
+  render();
+}
+
+function generatedAskControls(entry, context) {
+  if (!entry.sourceKey || !entry.ask) return "";
+  const sourceRecordId = entry.target?.recordId || `suggested:${entry.sourceKey}`;
+  const saved = state.insightRecords.filter(record => record.type === "action"
+    && record.sourceRecordId === sourceRecordId
+    && (!entry.itemId || record.initiativeId === entry.itemId));
+  const id = `plan-ask-${context}`;
+  state.generatedAskTargets.set(id, { ...entry, sourceRecordId });
+  return `<div class="contextual-card-actions generated-ask-actions" data-generated-ask="${escapeHtml(entry.sourceKey)}">
+    ${saved.map(record => `<span>Saved action · ${escapeHtml(INSIGHT_STATUS_LABELS[record.status])}</span>${insightRecordLink(record, context)}`).join("")}
+    <button class="secondary small" id="${escapeHtml(id)}" data-plan-generated-ask type="button" ${teamEditorReadOnlyReason() ? "disabled" : ""}>${saved.length ? "Plan another action" : "Plan action"}</button>
+  </div>`;
+}
+
+function planGeneratedAsk(trigger) {
+  if (teamEditorReadOnlyReason()) return;
+  const entry = state.generatedAskTargets.get(trigger.id);
+  if (!entry) return;
+  const item = state.items.find(candidate => candidate.id === entry.itemId);
+  if (entry.itemId && !item) return;
+  state.insightEditor = createInsightEditorState({ mode: "new", type: "action", triggerId: trigger.id,
+    draft: { ...blankInsightValues("action"),
+      title: `${entry.audience || "Follow-up"}: ${item?.title || "Audience follow-up"}`.slice(0, 500),
+      description: entry.ask, sourceRecordId: entry.sourceRecordId,
+      initiativeId: item?.id || "", owner: item?.owner || "",
+      ownerPersonId: item?.pocPersonId || "", customerIds: item?.customerIds || [], segmentIds: item?.segmentIds || []
+    }
+  });
+  render();
+}
+
 function capacityComparisonMarkup(items) {
-  const active = buildCapacityPlan(items, CAPACITY_BENCHMARKS.active, state.prioritization);
-  const selection = buildPeriodPlan(items, state.periodSelection, state.planningCalendar, new Date(), CAPACITY_BENCHMARKS.period, state.prioritization);
-  return `<section class="panel capacity-comparison" aria-label="Compare planning benchmarks"><h3>Two planning benchmarks</h3><p>Active workload: <strong>${active.totalEffort} / ${active.capacity} effort (${active.utilization}%)</strong> counts all committed and discovery work in this scope. Plan selection: <strong>${selection.used} / ${selection.capacity} effort (${selection.metrics.utilization}%)</strong> includes intake candidates that fit its larger allowance.</p><p>These are fixed scenario allowances, not measured team availability. A Plan that fits can still exceed the active workload benchmark.</p><p>Fit and deferred lists simulate the current order and available allowance; they do not change commitments. Unranked work has no business priority assigned; manual ties use title order. Review priority and effort before acting on a suggested cut.</p></section>`;
+  const context = currentPlanningCapacity();
+  const active = buildCapacityPlan(items, context.capacity, state.prioritization);
+  const selection = buildPeriodPlan(items, state.periodSelection, state.planningCalendar, new Date(), context.capacity, state.prioritization);
+  return `<section class="panel capacity-comparison" aria-label="Compare planning capacity"><h3>One budget, two work populations</h3><p>Active workload: <strong>${active.totalEffort} effort</strong> counts committed and discovery work in this scope. Plan candidates: <strong>${selection.candidateEffort} effort across ${selection.candidateCount} initiatives</strong> also include intake.</p>${context.available ? `<p>Both use the saved <strong>${context.capacity}-effort budget</strong>. Active workload: <strong>${active.totalEffort} / ${active.capacity} effort (${capacityNumber(active.utilization, true, "%")})</strong>. Plan selection: <strong>${selection.used} / ${selection.capacity} effort (${capacityNumber(selection.metrics.utilization, true, "%")})</strong>.</p>` : `<p>${escapeHtml(planningCapacityMessage(context))}</p>`}<p>Fit and deferred lists simulate the current priority order and saved allowance; they do not change commitments or infer team availability. Unranked work has no business priority assigned; manual ties use title order. Review priority and effort before acting on a suggested cut.</p></section>`;
 }
 
 function capacityView(items) {
-  const plan = buildCapacityPlan(items, CAPACITY_BENCHMARKS.active, state.prioritization);
-  return `<section class="metrics reporting-metrics">${metric("Capacity", plan.capacity)}${metric("Used", plan.totalEffort)}${metric("Active utilization", `${plan.utilization}%`, `${plan.totalEffort} / ${plan.capacity} effort · committed + discovery. Active capacity benchmark.`)}${metric("Overage", plan.overage)}</section>${capacityComparisonMarkup(items)}<section class="capacity-grid"><section class="panel"><div class="panel-header"><h3>Capacity Mix</h3><span class="muted">Committed and discovery load</span></div><div class="capacity-bars"><p><span>Committed</span><strong>${plan.committedEffort}</strong></p><p><span>Discovery</span><strong>${plan.discoveryEffort}</strong></p><p><span>Remaining</span><strong>${plan.remaining}</strong></p></div></section><section class="panel"><div class="panel-header"><h3>Suggested Scope Cuts</h3><span class="muted">Review candidates from the end of the current order</span></div><div class="capacity-list">${plan.suggestedCuts.map((item) => `<article class="capacity-card"><h4>${escapeHtml(item.title)}</h4><p>Effort ${item.effort} | ${escapeHtml(workspacePriorityLabel())} ${escapeHtml(workspacePriorityValue(item))}</p><div class="contextual-card-actions">${initiativeDetailButton(item, 'capacity-cuts')}</div></article>`).join("") || emptyState("No cuts needed for this capacity.")}</div></section><section class="panel"><div class="panel-header"><h3>Fits In Capacity</h3><span class="muted">Adds work in priority order when it fits</span></div><div class="capacity-list">${plan.scenario.selected.map((item) => `<article class="capacity-card"><h4>${escapeHtml(item.title)}</h4><p>Effort ${item.effort} | ${statusLabels[item.status]}</p><div class="contextual-card-actions">${initiativeDetailButton(item, 'capacity-selected')}</div></article>`).join("") || emptyState("No selected work.")}</div></section><section class="panel"><div class="panel-header"><h3>Deferred</h3><span class="muted">Work outside the scenario</span></div><div class="capacity-list">${plan.scenario.deferred.slice(0, 8).map((item) => `<article class="capacity-card"><h4>${escapeHtml(item.title)}</h4><p>Effort ${item.effort} | ${statusLabels[item.status]}</p><div class="contextual-card-actions">${initiativeDetailButton(item, 'capacity-deferred')}</div></article>`).join("") || emptyState("No deferred work.")}</div></section></section>`;
+  const context = currentPlanningCapacity();
+  const plan = buildCapacityPlan(items, context.capacity, state.prioritization);
+  return `${dependencyCycleWarnings(items, "capacityView")}${planningCapacitySettingsMarkup()}<section class="metrics reporting-metrics">${metric("Capacity", capacityNumber(plan.capacity, context.available), context.available && context.capacity === 0 ? "No capacity" : "Saved effort budget")}${metric("Used", plan.totalEffort)}${metric("Active utilization", capacityNumber(plan.utilization, context.available, "%"), `${plan.totalEffort} / ${capacityNumber(plan.capacity, context.available)} effort · committed + discovery.`)}${metric("Overage", capacityNumber(plan.overage, context.available))}</section>${capacityComparisonMarkup(items)}<section class="capacity-grid"><section class="panel"><div class="panel-header"><h3>Capacity Mix</h3><span class="muted">Committed and discovery load</span></div><div class="capacity-bars"><p><span>Committed</span><strong>${plan.committedEffort}</strong></p><p><span>Discovery</span><strong>${plan.discoveryEffort}</strong></p><p><span>Remaining</span><strong>${capacityNumber(plan.remaining, context.available)}</strong></p></div></section><section class="panel"><div class="panel-header"><h3>Suggested Scope Cuts</h3><span class="muted">Review candidates from the end of the current order</span></div><div class="capacity-list">${plan.suggestedCuts.map((item) => `<article class="capacity-card"><h4>${escapeHtml(item.title)}</h4><p>Effort ${item.effort} | ${escapeHtml(workspacePriorityLabel())} ${escapeHtml(workspacePriorityValue(item))}</p><div class="contextual-card-actions">${initiativeDetailButton(item, 'capacity-cuts')}</div></article>`).join("") || emptyState(context.available ? "No cuts needed for this capacity." : planningCapacityMessage(context))}</div></section><section class="panel"><div class="panel-header"><h3>Fits In Capacity</h3><span class="muted">Adds work in priority order when it fits</span></div><div class="capacity-list">${plan.scenario.selected.map((item) => `<article class="capacity-card"><h4>${escapeHtml(item.title)}</h4><p>Effort ${item.effort} | ${escapeHtml(initiativeReportingContext(state.workflow, item))}</p><div class="contextual-card-actions">${initiativeDetailButton(item, 'capacity-selected')}</div></article>`).join("") || emptyState(context.available ? "No selected work." : planningCapacityMessage(context))}</div></section><section class="panel"><div class="panel-header"><h3>Deferred</h3><span class="muted">Work outside the scenario</span></div><div class="capacity-list">${plan.scenario.deferred.slice(0, 8).map((item) => `<article class="capacity-card"><h4>${escapeHtml(item.title)}</h4><p>Effort ${item.effort} | ${escapeHtml(initiativeReportingContext(state.workflow, item))}</p><div class="contextual-card-actions">${initiativeDetailButton(item, 'capacity-deferred')}</div></article>`).join("") || emptyState(context.available ? "No deferred work." : planningCapacityMessage(context))}</div></section></section>`;
 }
+function dependencyCycleWarnings(items, context, links = true) {
+  const ids = new Set(items.map((item) => item.id));
+  const cycles = findDependencyCycles(state.items).filter((cycle) => cycle.itemIds.some((id) => ids.has(id)));
+  if (!cycles.length) return "";
+  const byId = new Map(state.items.map((item) => [item.id, item]));
+  return `<aside class="panel dependency-cycle-warning" aria-label="Circular dependencies"><h3>Circular dependencies</h3><p>These unresolved dependencies form a loop. Review and change or resolve the relevant dependencies before committing to this plan. Saved statuses and readiness scores do not account for this loop.</p><p>Includes connected initiatives outside the current filters, including parked or shipped work with unresolved dependencies.</p>${cycles.map((cycle, index) => `<ul>${cycle.edges.map((edge, edgeIndex) => `<li><strong>${escapeHtml(byId.get(edge.itemId)?.title || edge.itemId)}</strong> depends on <strong>${escapeHtml(byId.get(edge.targetItemId)?.title || edge.targetItemId)}</strong>: ${escapeHtml(edge.description)}${links ? initiativeDetailButton(byId.get(edge.itemId), `${context}-cycle-${index}-${edgeIndex}`, `Review dependency: ${edge.description}`, "dependencies", edge.recordId) : ""}</li>`).join("")}</ul>`).join("")}</aside>`;
+}
+
 function dependenciesView(items) {
-  const map = buildDependencyMap(items, new Date(), state.prioritization);
-  const memo = scopeGeneratedText(buildDependencyMemo(items, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Blockers", map.metrics.blockers)}${metric("Unassigned", map.metrics.unassigned)}${metric("High urgency", map.metrics.highUrgency)}${metric("Dated", map.metrics.upcoming)}</section><section class="dependencies-grid"><section class="panel"><div class="panel-header"><h3>Blocker Queue</h3><span class="muted">Explicit at-risk and blocked dependencies</span></div><div class="dependency-list">${map.blockers.map(dependencyBlockerCard).join("") || emptyState("No blockers detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Owner Load</h3><span class="muted">Where dependency pressure clusters</span></div><div class="dependency-list">${map.owners.map((owner, ownerIndex) => `<article class="dependency-card"><span>${owner.count} dependencies | urgency ${owner.urgency}</span><h4>${escapeHtml(owner.owner)}</h4>${owner.references.map((reference, index) => initiativeReferenceActions(reference.itemId, `dependency-owner-${ownerIndex}-${index}`, "dependencies", reference.recordId, reference.title)).join("")}</article>`).join("") || emptyState("No dependency owners detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Upcoming Dependencies</h3><span class="muted">Needed-by dates</span></div><div class="dependency-list">${map.upcoming.map((entry, index) => `<article class="dependency-card"><span>${escapeHtml(entry.record.neededBy)} · ${escapeHtml(dependencyStatusLabels[entry.record.status])}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.record.description)} · ${escapeHtml(entry.owner)}</p><div class="contextual-card-actions">${initiativeDetailButton(entry.item, `dependency-upcoming-${index}`, "Manage dependency", "dependencies", entry.record.id)}</div></article>`).join("") || emptyState("No dated dependencies captured.")}</div></section><section class="panel"><div class="panel-header"><h3>Dependency Memo</h3><button class="secondary" id="copyDependencyMemoButton" type="button">Copy Memo</button></div><textarea id="dependencyMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  const map = buildDependencyMap(items, new Date(), state.prioritization, state.items);
+  const memo = scopeGeneratedText(buildDependencyMemo(items, new Date(), state.prioritization, state.items), items);
+  return `${dependencyCycleWarnings(items, "dependenciesView")}<section class="metrics reporting-metrics">${metric("Blockers", map.metrics.blockers)}${metric("Unassigned", map.metrics.unassigned)}${metric("High urgency", map.metrics.highUrgency)}${metric("Dated", map.metrics.upcoming)}</section><section class="dependencies-grid"><section class="panel"><div class="panel-header"><h3>Blocker Queue</h3><span class="muted">Explicit at-risk and blocked dependencies</span></div><div class="dependency-list">${map.blockers.map(dependencyBlockerCard).join("") || emptyState("No blockers detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Owner Load</h3><span class="muted">Where dependency pressure clusters</span></div><div class="dependency-list">${map.owners.map((owner, ownerIndex) => `<article class="dependency-card"><span>${owner.count} active ${owner.count === 1 ? "dependency" : "dependencies"} · ${owner.pendingCount} pending · ${owner.blockerCount} ${owner.blockerCount === 1 ? "blocker" : "blockers"} | urgency ${owner.urgency}</span><h4>${escapeHtml(owner.owner)}</h4>${owner.references.map((reference, index) => initiativeReferenceActions(reference.itemId, `dependency-owner-${ownerIndex}-${index}`, "dependencies", reference.recordId, reference.label || reference.title)).join("")}</article>`).join("") || emptyState("No dependency owners detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Upcoming Dependencies</h3><span class="muted">Needed-by dates</span></div><div class="dependency-list">${map.upcoming.map((entry, index) => `<article class="dependency-card"><span>${escapeHtml(entry.record.neededBy)} · ${escapeHtml(dependencyStatusLabels[entry.record.status])}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.record.description)} · ${escapeHtml(entry.owner)}</p><div class="contextual-card-actions">${initiativeDetailButton(entry.item, `dependency-upcoming-${index}`, "Manage dependency", "dependencies", entry.record.id)}</div></article>`).join("") || emptyState("No dated dependencies captured.")}</div></section><section class="panel"><div class="panel-header"><h3>Dependency Memo</h3><button class="secondary" id="copyDependencyMemoButton" type="button">Copy Memo</button></div><textarea id="dependencyMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 function outcomesView(items) {
   const alignment = buildOutcomeAlignment(items, state.prioritization);
   const memo = scopeGeneratedText(buildOutcomeMemo(items, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Objectives", alignment.coverage.length)}${metric("Metric gaps", alignment.missingMetrics.length)}${metric("At risk", alignment.atRiskObjectives.length)}${metric("KR drafts", alignment.keyResults.length)}</section><section class="outcomes-grid"><section class="panel"><div class="panel-header"><h3>Objective Coverage</h3><span class="muted">Active work by outcome</span></div><div class="outcome-list">${alignment.coverage.map((entry, index) => `<article class="outcome-card"><span>${entry.count} initiatives | ${entry.effort} effort</span><h4>${escapeHtml(entry.objective)}</h4>${initiativeReferenceList(entry.topItems, `outcome-coverage-${index}`)}</article>`).join("") || emptyState("No active objectives yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Key Result Drafts</h3><span class="muted">Suggested measurable outcomes</span></div><div class="outcome-list">${alignment.keyResults.map((kr) => `<article class="outcome-card"><span>Confidence ${kr.confidence}</span><h4>${escapeHtml(kr.objective)}</h4><p>${escapeHtml(kr.result)}</p></article>`).join("") || emptyState("No key results suggested yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Missing Metrics</h3><span class="muted">Work needing a success measure</span></div><div class="outcome-list">${alignment.missingMetrics.map((item) => `<article class="outcome-card"><span>${statusLabels[item.status]}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.nextStep || "Add an experiment, target metric, or decision note.")}</p>${initiativeReferenceActions(item, "outcome-metric-gap")}</article>`).join("") || emptyState("Every active initiative has a metric or decision note.")}</div></section><section class="panel"><div class="panel-header"><h3>Outcome Memo</h3><button class="secondary" id="copyOutcomeMemoButton" type="button">Copy Memo</button></div><textarea id="outcomeMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  return `<section class="metrics reporting-metrics">${metric("Objectives", alignment.coverage.length)}${metric("Metric gaps", alignment.missingMetrics.length)}${metric("At risk", alignment.atRiskObjectives.length)}${metric("Measures", alignment.keyResults.length)}</section><section class="outcomes-grid"><section class="panel"><div class="panel-header"><h3>Objective Coverage</h3><span class="muted">Active work by outcome</span></div><div class="outcome-list">${alignment.coverage.map((entry, index) => `<article class="outcome-card"><span>${entry.count} initiatives | ${entry.effort} effort · ${entry.objectiveOrigin === "captured" ? "Authored objective" : "Suggested grouping"}</span><h4>${escapeHtml(entry.objective)}</h4>${initiativeReferenceList(entry.topItems, `outcome-coverage-${index}`)}</article>`).join("") || emptyState("No active objectives yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Objectives and measures</h3><span class="muted">Authored targets and suggestions</span></div><div class="outcome-list">${alignment.keyResults.map(keyResultCard).join("") || emptyState("No key results suggested yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Missing measures</h3><span class="muted">Work needing an authored outcome</span></div><div class="outcome-list">${alignment.missingMetrics.map((item) => `<article class="outcome-card"><span>${escapeHtml(initiativeReportingContext(state.workflow, item))}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.primaryMetric || "Record an objective, primary metric and your target.")}</p>${initiativeContextualEditButton(item, "outcome-metric-gap", "primaryMetric", "Define measure")}${initiativeReferenceActions(item, "outcome-metric-gap")}</article>`).join("") || emptyState("Every active initiative has an objective, primary metric and target.")}</div></section><section class="panel"><div class="panel-header"><h3>Outcome Memo</h3><button class="secondary" id="copyOutcomeMemoButton" type="button">Copy Memo</button></div><textarea id="outcomeMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+}
+
+function keyResultCard(entry, index) {
+  const id = `author-measure-${encodeURIComponent(entry.sourceKey || entry.id || String(index))}`;
+  state.measureTargets.set(id, entry);
+  const sources = (entry.sourceIds || []).map(sourceId => state.items.find(item => item.id === sourceId)).filter(Boolean);
+  const captured = entry.origin === "captured";
+  return `<article class="outcome-card" data-key-result="${escapeHtml(entry.sourceKey || entry.id || id)}">
+    <span>${captured ? entry.status === "adopted" ? "Saved measure" : "Saved measure · incomplete" : "Suggested measure"}</span>
+    <h4>${escapeHtml(entry.objective || "Objective not recorded")}</h4>
+    <p>${escapeHtml(entry.primaryMetric || "Choose a primary metric.")}</p>
+    <p>Target: ${escapeHtml(entry.metricTarget || "Not recorded")}</p>
+    <p>Review date: ${escapeHtml(entry.metricReviewDate || "Not recorded")}</p>
+    <small>${captured ? "This records intent. Achievement requires observed results." : "Review this suggestion and write your own target before saving."}</small>
+    ${initiativeReferenceList(sources, `measure-sources-${index}`)}
+    ${!captured && sources.length ? `<label class="generated-measure-picker"><span>Initiative to measure</span><select id="${id}-initiative" required ${teamEditorReadOnlyReason() ? "disabled" : ""}><option value="">Choose an initiative</option>${sources.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.title)} · ${escapeHtml(item.owner || "Unassigned")}</option>`).join("")}</select></label>` : ""}
+    ${sources.length ? `<button class="secondary small" id="${id}" data-author-measure type="button" ${teamEditorReadOnlyReason() ? "disabled" : ""}>${captured ? "Edit measure" : "Define measure"}</button>` : ""}
+  </article>`;
+}
+
+function authorMeasure(trigger) {
+  if (teamEditorReadOnlyReason()) return;
+  const entry = state.measureTargets.get(trigger.id);
+  if (!entry) return;
+  const picker = document.getElementById(`${trigger.id}-initiative`);
+  const itemId = entry.initiativeId || picker?.value;
+  if (!itemId) { picker?.reportValidity(); picker?.focus(); return; }
+  if (!(entry.sourceIds || []).includes(itemId)) return;
+  const item = state.items.find(candidate => candidate.id === itemId);
+  if (!item) return;
+  state.initiativeEditor = createInitiativeEditorState({
+    mode: "edit", selectedId: item.id, selectedFromCard: true, triggerId: trigger.id,
+    focusField: "objective", moreDetailsOpen: true, measureContext: entry.origin,
+    draft: { ...blankInitiativeValues(), ...item,
+      objective: item.objective || entry.objective || "", primaryMetric: item.primaryMetric || entry.primaryMetric || "",
+      metricTarget: item.metricTarget || "", metricReviewDate: item.metricReviewDate || ""
+    }
+  });
+  render();
 }
 
 function metricsView(items) {
-  const plan = buildMetricsPlan(items, new Date(), state.prioritization);
-  const memo = scopeGeneratedText(buildMetricsMemo(items, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Measured", `${plan.metrics.tracked}/${plan.metrics.total}`)}${metric("Tracking gaps", plan.metrics.gaps)}${metric("Launch gaps", plan.metrics.launchGaps)}${metric("Dashboards", plan.dashboard.length)}</section><section class="metrics-grid"><section class="panel"><div class="panel-header"><h3>Measurement Plan</h3><span class="muted">Primary metric by initiative</span></div><div class="metric-plan-list">${plan.plans.slice(0, 8).map(metricPlanCard).join("") || emptyState("No active initiatives to measure.")}</div></section><section class="panel"><div class="panel-header"><h3>Tracking Gaps</h3><span class="muted">Before launch or review</span></div><div class="metric-plan-list">${plan.gaps.slice(0, 8).map((entry, index) => `<article class="metric-plan-card warning"><span>${escapeHtml(entry.item.title)}</span><h4>${escapeHtml(entry.gaps[0])}</h4><p>${escapeHtml(entry.instrumentation)}</p>${initiativeReferenceActions(entry.item, `metric-gap-${index}`)}</article>`).join("") || emptyState("No tracking gaps detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Outcome Dashboards</h3><span class="muted">Where measurement rolls up</span></div><div class="metric-plan-list">${plan.dashboard.map((entry) => `<article class="metric-plan-card"><span>${entry.count} initiatives</span><h4>${escapeHtml(entry.objective)}</h4><p>${escapeHtml(summarizeDashboard(plan.plans, entry.objective))}</p></article>`).join("") || emptyState("No dashboard groups yet.")}</div></section><section class="panel metrics-memo"><div class="panel-header"><h3>Metrics Memo</h3><button class="secondary" id="copyMetricsMemoButton" type="button">Copy Memo</button></div><textarea id="metricsMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  const evidence = { insightRecords: state.insightRecords };
+  const plan = buildMetricsPlan(items, new Date(), state.prioritization, evidence);
+  const memo = scopeGeneratedText(buildMetricsMemo(items, new Date(), state.prioritization, evidence), items);
+  return `<section class="metrics reporting-metrics">${metric("Saved measures", `${plan.metrics.tracked}/${plan.metrics.total}`)}${metric("Tracking gaps", plan.metrics.gaps)}${metric("Launch instrumentation gaps", plan.metrics.launchGaps)}${metric("Dashboards", plan.dashboard.length)}</section><section class="metrics-grid"><section class="panel"><div class="panel-header"><h3>Measurement Plan</h3><span class="muted">Primary metric by initiative</span></div><div class="metric-plan-list">${plan.plans.slice(0, 8).map(metricPlanCard).join("") || emptyState("No active initiatives to measure.")}</div></section><section class="panel"><div class="panel-header"><h3>Tracking Gaps</h3><span class="muted">Before launch or review</span></div><div class="metric-plan-list">${plan.gaps.map(metricGapCard).join("") || emptyState("No metric definition gaps detected. Instrumentation and achievement remain unverified.")}</div></section><section class="panel"><div class="panel-header"><h3>Outcome Dashboards</h3><span class="muted">Where measurement rolls up</span></div><div class="metric-plan-list">${plan.dashboard.map((entry) => `<article class="metric-plan-card"><span>${entry.count} initiatives</span><h4>${escapeHtml(entry.objective)}</h4><p>${escapeHtml(summarizeDashboard(plan.plans, entry.objective))}</p></article>`).join("") || emptyState("No dashboard groups yet.")}</div></section><section class="panel metrics-memo"><div class="panel-header"><h3>Metrics Memo</h3><button class="secondary" id="copyMetricsMemoButton" type="button">Copy Memo</button></div><textarea id="metricsMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 
 function stakeholdersView(items) {
-  const governance = buildStakeholderGovernance(items, new Date(), state.prioritization);
-  const memo = scopeGeneratedText(buildStakeholderMemo(items, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Owners", governance.metrics.owners)}${metric("Unowned", governance.metrics.unowned)}${metric("Asks", governance.metrics.asks)}${metric("Escalations", governance.metrics.escalations)}</section><section class="stakeholders-grid"><section class="panel"><div class="panel-header"><h3>Owner Load</h3><span class="muted">Accountability pressure</span></div><div class="stakeholder-list">${governance.ownerLoad.map((owner, index) => `<article class="stakeholder-card"><span>Pressure ${owner.pressure}</span><h4>${escapeHtml(owner.name)}</h4>${initiativeReferenceList(owner.items, `stakeholder-owner-${index}`) || "No assigned work."}</article>`).join("") || emptyState("No owner load detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Segment Attention</h3><span class="muted">Customer groups needing follow-up</span></div><div class="stakeholder-list">${governance.segmentAttention.map((segment, index) => `<article class="stakeholder-card"><span>${segment.count} initiatives | ${segment.risks} risks</span><h4>${escapeHtml(segment.name)}</h4><p>${escapeHtml(segment.ask)}</p>${initiativeReferenceList(segment.items, `stakeholder-segment-${index}`)}</article>`).join("") || emptyState("No segment attention needed.")}</div></section><section class="panel"><div class="panel-header"><h3>Open Asks</h3><span class="muted">Who needs to respond</span></div><div class="stakeholder-list">${governance.openAsks.map((entry, index) => `<article class="stakeholder-card"><span>${escapeHtml(entry.audience)} | urgency ${entry.urgency}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.ask)}</p>${initiativeReferenceActions(entry.itemId, `stakeholder-ask-${index}`, entry.target?.kind === "risk" ? "risks" : "", entry.target?.recordId || "")}</article>`).join("") || emptyState("No open asks.")}</div></section><section class="panel"><div class="panel-header"><h3>Escalations</h3><span class="muted">Leadership attention</span></div><div class="stakeholder-list">${governance.escalations.map((entry, index) => `<article class="stakeholder-card warning"><span>${escapeHtml(entry.owner)} | severity ${entry.severity}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.ask)}</p>${initiativeReferenceActions(entry.itemId, `stakeholder-escalation-${index}`, "risks", entry.recordId, "View risk")}</article>`).join("") || emptyState("No escalations.")}</div></section><section class="panel stakeholders-memo"><div class="panel-header"><h3>Stakeholder Memo</h3><button class="secondary" id="copyStakeholderMemoButton" type="button">Copy Memo</button></div><textarea id="stakeholderMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  const governance = buildStakeholderGovernance(items, new Date(), state.prioritization, themeEvidenceOptions());
+  const memo = scopeGeneratedText(buildStakeholderMemo(items, new Date(), state.prioritization, themeEvidenceOptions()), items);
+  return `<section class="metrics reporting-metrics">${metric("Owners", governance.metrics.owners)}${metric("Unowned", governance.metrics.unowned)}${metric("Asks", governance.metrics.asks)}${metric("Escalations", governance.metrics.escalations)}</section><section class="stakeholders-grid"><section class="panel"><div class="panel-header"><h3>Owner Load</h3><span class="muted">Accountability pressure</span></div><div class="stakeholder-list">${governance.ownerLoad.map((owner, index) => `<article class="stakeholder-card"><span>Pressure ${owner.pressure}</span><h4>${escapeHtml(owner.name)}</h4>${initiativeReferenceList(owner.items, `stakeholder-owner-${index}`) || "No assigned work."}</article>`).join("") || emptyState("No owner load detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Segment Attention</h3><span class="muted">Customer groups needing follow-up</span></div><div class="stakeholder-list">${governance.segmentAttention.map((segment, index) => `<article class="stakeholder-card"><span>${segment.count} initiatives | ${segment.risks} risks</span><h4>${escapeHtml(segment.name)}</h4><p>${escapeHtml(segment.ask)}</p>${initiativeReferenceList(segment.items, `stakeholder-segment-${index}`)}</article>`).join("") || emptyState("No segment attention needed.")}</div></section><section class="panel"><div class="panel-header"><h3>Open Asks</h3><span class="muted">Who needs to respond</span></div><div class="stakeholder-list">${governance.openAsks.map((entry, index) => `<article class="stakeholder-card"><span>${escapeHtml(entry.audience)} | urgency ${entry.urgency}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.ask)}</p>${generatedAskControls(entry, `stakeholder-ask-${index}`)}${initiativeReferenceActions(entry.itemId, `stakeholder-ask-${index}`, entry.target?.kind === "risk" ? "risks" : entry.target?.kind === "dependency" ? "dependencies" : "", entry.target?.recordId || "")}</article>`).join("") || emptyState("No open asks.")}</div></section><section class="panel"><div class="panel-header"><h3>Escalations</h3><span class="muted">Leadership attention</span></div><div class="stakeholder-list">${governance.escalations.map((entry, index) => `<article class="stakeholder-card warning"><span>${escapeHtml(entry.owner)} | severity ${entry.severity}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.ask)}</p>${initiativeReferenceActions(entry.itemId, `stakeholder-escalation-${index}`, "risks", entry.recordId, "View risk")}</article>`).join("") || emptyState("No escalations.")}</div></section><section class="panel stakeholders-memo"><div class="panel-header"><h3>Stakeholder Memo</h3><button class="secondary" id="copyStakeholderMemoButton" type="button">Copy Memo</button></div><textarea id="stakeholderMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 function escalationsView(items) {
   const board = buildEscalationBoard(items, new Date(), state.prioritization);
@@ -2116,47 +2825,57 @@ function escalationsView(items) {
 }
 function updatesView(items) {
   const update = buildStakeholderUpdate(items, new Date(), state.prioritization);
-  const outcome = buildOutcomeReport(items, state.prioritization);
+  const outcome = buildOutcomeReport(items, state.prioritization, themeEvidenceOptions());
   const releaseNotes = scopeGeneratedText(buildReleaseNotes(items, new Date(), state.prioritization), items);
   const launchCandidates = prioritizeItems(items, state.prioritization).filter((item) => item.status === "committed" || item.status === "discovery").slice(0, 4);
-  return `<section class="metrics reporting-metrics">${metric("Shipped", outcome.shipped)}${metric("Committed", outcome.committed)}${metric("Readiness", `${outcome.averageReadiness}%`)}${metric("High risk", outcome.highRisk)}</section><section class="updates-grid"><section class="panel"><div class="panel-header"><h3>Stakeholder Brief</h3><span class="muted">Generated from current work</span></div><article class="brief"><h4>${escapeHtml(update.headline)}</h4><div><strong>Now:</strong> ${initiativeReferenceList(update.now, "update-now") || "No committed initiatives."}</div><div><strong>Next:</strong> ${initiativeReferenceList(update.next, "update-next") || "No discovery initiatives."}</div><div><strong>Risks:</strong> ${initiativeReferenceList(update.risks, "update-risks") || "No major risks captured."}</div><div><strong>Asks:</strong> ${initiativeReferenceList(update.asks, "update-asks") || "No open operational asks."}</div></article></section><section class="panel"><div class="panel-header"><h3>Launch Readiness</h3><span class="muted">Top active initiatives</span></div><div class="readiness-list">${launchCandidates.map((item) => `<article class="readiness"><div><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.nextStep || "No next step captured.")}</p>${initiativeReferenceActions(item, "update-launch")}</div><strong>${calculateLaunchReadiness(item)}%</strong></article>`).join("") || emptyState("No active launch candidates.")}</div></section><section class="panel"><div class="panel-header"><h3>Customer Themes</h3><span class="muted">From current work</span></div><div class="theme-list">${outcome.topThemes.map((theme) => `<span>${escapeHtml(theme.theme)} <strong>${theme.count}</strong></span>`).join("") || emptyState("No themes yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Release Notes</h3><button class="secondary" id="copyReleaseNotesButton" type="button">Copy Notes</button></div><textarea id="releaseNotesDraft" readonly>${escapeHtml(releaseNotes)}</textarea></section></section>`;
+  return `<section class="metrics reporting-metrics">${metric("Shipped", outcome.shipped)}${metric("Committed category", outcome.committed)}${metric("Readiness", `${outcome.averageReadiness}%`)}${metric("High risk", outcome.highRisk)}</section><section class="updates-grid"><section class="panel"><div class="panel-header"><h3>Stakeholder Brief</h3><span class="muted">Generated from current work</span></div><article class="brief"><h4>${escapeHtml(update.headline)}</h4><div><strong>Now:</strong> ${initiativeReferenceList(update.now, "update-now") || "No committed initiatives."}</div><div><strong>Next:</strong> ${initiativeReferenceList(update.next, "update-next") || "No discovery initiatives."}</div><div><strong>Risks:</strong> ${initiativeReferenceList(update.risks, "update-risks") || "No major risks captured."}</div><div><strong>Asks:</strong> ${initiativeReferenceList(update.asks, "update-asks") || "No open operational asks."}</div></article></section><section class="panel"><div class="panel-header"><h3>Launch Readiness</h3><span class="muted">Top active initiatives</span></div><div class="readiness-list">${launchCandidates.map((item) => `<article class="readiness"><div><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.nextStep || "No next step captured.")}</p>${initiativeReferenceActions(item, "update-launch")}</div><strong>${calculateLaunchReadiness(item)}%</strong></article>`).join("") || emptyState("No active launch candidates.")}</div></section><section class="panel"><div class="panel-header"><h3>Customer Themes</h3><span class="muted">From current work</span></div><div class="theme-list">${outcome.topThemes.map((theme) => `<span>${escapeHtml(theme.theme)} <strong>${theme.count}</strong></span>`).join("") || emptyState("No themes yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Release Notes</h3><button class="secondary" id="copyReleaseNotesButton" type="button">Copy Notes</button></div><textarea id="releaseNotesDraft" readonly>${escapeHtml(releaseNotes)}</textarea></section></section>`;
 }
 function commsView(items) {
-  const plan = buildCommunicationPlan(items, new Date(), state.prioritization);
-  const memo = scopeGeneratedText(buildCommunicationMemo(items, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Audiences", plan.metrics.audiences)}${metric("Escalations", plan.metrics.escalations)}${metric("Active work", plan.metrics.active)}${metric("Owners", plan.metrics.owners)}</section><section class="comms-grid"><section class="panel"><div class="panel-header"><h3>Audience Plan</h3><span class="muted">Who needs what update</span></div><div class="comms-list">${plan.audiences.map((entry) => `<article class="comms-card"><span>${escapeHtml(entry.cadence)}</span><h4>${escapeHtml(entry.audience)}</h4><p>${escapeHtml(entry.focus)}</p><small>${escapeHtml(entry.message)}</small><strong>${escapeHtml(entry.ask)}</strong></article>`).join("")}</div></section><section class="panel"><div class="panel-header"><h3>Escalations</h3><span class="muted">Asks that need attention</span></div><div class="comms-list">${plan.escalation.map((entry, index) => `<article class="comms-card"><span>Severity ${entry.severity} | ${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.ask)}</p>${initiativeReferenceActions(entry.itemId, `comms-escalation-${index}`, "risks", entry.recordId, "View risk")}</article>`).join("") || emptyState("No escalations captured.")}</div></section><section class="panel comms-memo"><div class="panel-header"><h3>Comms Memo</h3><button class="secondary" id="copyCommsMemoButton" type="button">Copy Memo</button></div><textarea id="commsMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  const plan = buildCommunicationPlan(items, new Date(), state.prioritization, themeEvidenceOptions());
+  const memo = scopeGeneratedText(buildCommunicationMemo(items, new Date(), state.prioritization, themeEvidenceOptions()), items);
+  return `<section class="metrics reporting-metrics">${metric("Audiences", plan.metrics.audiences)}${metric("Escalations", plan.metrics.escalations)}${metric("Active work", plan.metrics.active)}${metric("Owners", plan.metrics.owners)}</section><section class="comms-grid"><section class="panel"><div class="panel-header"><h3>Audience Plan</h3><span class="muted">Who needs what update</span></div><div class="comms-list">${plan.audiences.map((entry) => `<article class="comms-card"><span>${escapeHtml(entry.cadence)}</span><h4>${escapeHtml(entry.audience)}</h4><p>${escapeHtml(entry.focus)}</p><small>${escapeHtml(entry.message)}</small><strong>${escapeHtml(entry.ask)}</strong>${generatedAskControls(entry, entry.sourceKey)}${entry.itemId ? initiativeReferenceActions(entry.itemId, `comms-${entry.sourceKey}`, entry.target?.kind === "risk" ? "risks" : "dependencies", entry.target?.recordId || "") : ""}</article>`).join("")}</div></section><section class="panel"><div class="panel-header"><h3>Escalations</h3><span class="muted">Asks that need attention</span></div><div class="comms-list">${plan.escalation.map((entry, index) => `<article class="comms-card"><span>Severity ${entry.severity} | ${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.ask)}</p>${initiativeReferenceActions(entry.itemId, `comms-escalation-${index}`, "risks", entry.recordId, "View risk")}</article>`).join("") || emptyState("No escalations captured.")}</div></section><section class="panel comms-memo"><div class="panel-header"><h3>Comms Memo</h3><button class="secondary" id="copyCommsMemoButton" type="button">Copy Memo</button></div><textarea id="commsMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+}
+function synthesisSourceActions(entry, context) {
+  const records = state.insightRecords.filter(record => (entry.sourceIds || [entry.recordId]).includes(record.id));
+  return `${records.map((record, index) => insightRecordLink(record, `${context}-${index}`)).join("")}${initiativeReferenceActions(entry.itemId, context)}`;
+}
+function synthesisDecisionCards(entries, context) {
+  return entries.map((entry, index) => `<article class="review-card" data-decision-source="${escapeHtml(entry.recordId || entry.itemId)}"><span>${entry.origin === "suggested" ? "Suggested decision" : escapeHtml(INSIGHT_STATUS_LABELS[entry.status] || "Captured decision")}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.ask)}</p><p class="muted">${escapeHtml(entry.initiativeTitle || "")} · ${escapeHtml(entry.owner)} · ${escapeHtml(entry.dueDate)}</p>${synthesisSourceActions(entry, `${context}-${index}`)}</article>`).join("") || emptyState("No pending decisions captured.");
+}
+function synthesisEvidenceCards(entries, context) {
+  return entries.map((entry, index) => `<article class="review-card" data-evidence-source="${escapeHtml(entry.recordId || entry.itemId)}"><span>Captured finding</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.evidence)}</p><p class="muted">${escapeHtml(entry.initiativeTitle || "")}</p>${synthesisSourceActions(entry, `${context}-${index}`)}</article>`).join("") || emptyState("No captured findings yet.");
 }
 function reviewView(items) {
-  const review = buildReviewLoop(items, new Date(), state.prioritization);
-  const memo = scopeGeneratedText(buildReviewMemo(items, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Shipped", review.metrics.shipped)}${metric("Overdue", review.metrics.overdue)}${metric("Decisions", review.metrics.decisionNeeds)}${metric("Learnings", review.metrics.learningItems)}</section><section class="review-grid"><section class="panel"><div class="panel-header"><h3>Shipped Work</h3><span class="muted">Closed-loop outcomes</span></div><div class="review-list">${review.shipped.map((item) => `<article class="review-card"><span>${escapeHtml(item.customer || "No segment")}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.decision || item.experiment || "Capture the launch result.")}</p>${initiativeReferenceActions(item, "review-shipped")}</article>`).join("") || emptyState("No shipped initiatives yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Slipped Commitments</h3><span class="muted">Active work past due date</span></div><div class="review-list">${review.overdue.map((item) => `<article class="review-card"><span>Due ${escapeHtml(item.dueDate)}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.nextStep || "No recovery step captured.")}</p>${initiativeReferenceActions(item, "review-overdue")}</article>`).join("") || emptyState("No overdue active initiatives.")}</div></section><section class="panel"><div class="panel-header"><h3>Decision Review</h3><span class="muted">Escalations and ambiguity</span></div><div class="review-list">${review.decisionsNeeded.map((item) => `<article class="review-card"><span>${statusLabels[item.status]}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(primaryRiskText(item) || "Needs an explicit commit / kill / continue decision.")}</p>${initiativeReferenceActions(item, "review-decision")}</article>`).join("") || emptyState("No decision escalations detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Retro Prompts</h3><span class="muted">Use in weekly or monthly review</span></div><div class="review-list">${review.retroPrompts.map((prompt) => `<article class="review-card"><p>${escapeHtml(prompt)}</p></article>`).join("")}</div></section><section class="panel review-memo"><div class="panel-header"><h3>Review Memo</h3><button class="secondary" id="copyReviewMemoButton" type="button">Copy Memo</button></div><textarea id="reviewMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  const review = buildReviewLoop(items, new Date(), state.prioritization, themeEvidenceOptions());
+  const memo = scopeGeneratedText(buildReviewMemo(items, new Date(), state.prioritization, themeEvidenceOptions()), items);
+  return `<section class="metrics reporting-metrics">${metric("Shipped", review.metrics.shipped)}${metric("Overdue", review.metrics.overdue)}${metric("Pending decisions", review.metrics.pendingDecisions)}${metric("Captured findings", review.metrics.learningEvidence)}</section><section class="review-grid"><section class="panel"><div class="panel-header"><h3>Shipped Work</h3><span class="muted">Showing ${review.shipped.length} of ${review.metrics.shipped} outcomes</span></div><div class="review-list">${review.shipped.map((item) => `<article class="review-card"><span>${escapeHtml(item.customer || "No segment")}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(review.learningEvidence.filter(entry => entry.itemId === item.id).map(entry => entry.evidence).join(" · ") || item.decision || item.experiment || "Capture the launch result.")}</p>${initiativeReferenceActions(item, "review-shipped")}</article>`).join("") || emptyState("No shipped initiatives yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Slipped Commitments</h3><span class="muted">Showing ${review.overdue.length} of ${review.metrics.overdue} overdue initiatives</span></div><div class="review-list">${review.overdue.map((item) => `<article class="review-card"><span>Due ${escapeHtml(item.dueDate)}</span><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.nextStep || "No recovery step captured.")}</p>${initiativeReferenceActions(item, "review-overdue")}</article>`).join("") || emptyState("No overdue active initiatives.")}</div></section><section class="panel"><div class="panel-header"><h3>Decision Review</h3><span class="muted">Escalations and ambiguity</span></div><div class="review-list">${synthesisDecisionCards(review.decisionEntries, "review-decision")}${review.decisionSuggestions.length ? `<h4>Suggested decisions</h4>${synthesisDecisionCards(review.decisionSuggestions, "review-suggestion")}` : ""}${review.riskEscalations.length ? `<h4>Risk escalations</h4>${review.riskEscalations.map((entry, index) => `<article class="review-card"><span>Suggested escalation</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.context)}</p><p>${escapeHtml(entry.ask)}</p>${synthesisSourceActions(entry, `review-risk-${index}`)}</article>`).join("")}` : ""}</div></section><section class="panel"><div class="panel-header"><h3>Captured Findings</h3><span class="muted">${review.learningEvidence.length} recorded outcomes</span></div><div class="review-list">${synthesisEvidenceCards(review.learningEvidence, "review-finding")}${review.learningPrompts.length ? `<h4>Learning prompts</h4>${review.learningPrompts.map((entry, index) => `<article class="review-card"><span>Suggested prompt</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.prompt)}</p>${synthesisSourceActions(entry, `review-prompt-${index}`)}</article>`).join("")}` : ""}</div></section><section class="panel"><div class="panel-header"><h3>Retro Prompts</h3><span class="muted">Use in weekly or monthly review</span></div><div class="review-list">${review.retroPrompts.map((prompt) => `<article class="review-card"><p>${escapeHtml(prompt)}</p></article>`).join("")}</div></section><section class="panel review-memo"><div class="panel-header"><h3>Review Memo</h3><button class="secondary" id="copyReviewMemoButton" type="button">Copy Memo</button></div><textarea id="reviewMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 function retrosView(items) {
   const scopedIds = new Set(items.map((item) => item.id));
   const scopedActivity = state.activity.filter((entry) => !entry.itemId || scopedIds.has(entry.itemId));
-  const retro = buildRetrospective(items, scopedActivity, new Date(), state.prioritization);
-  const memo = scopeGeneratedText(buildRetrospectiveMemo(items, scopedActivity, new Date(), state.prioritization), items);
-  return `<section class="metrics reporting-metrics">${metric("Wins", retro.metrics.wins)}${metric("Learnings", retro.metrics.learnings)}${metric("Misses", retro.metrics.misses)}${metric("Follow-ups", retro.metrics.followUps)}</section><section class="retro-grid"><section class="panel"><div class="panel-header"><h3>Wins</h3><span class="muted">Shipped outcomes</span></div><div class="retro-list">${retro.wins.map((entry, index) => `<article class="retro-card"><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.evidence)}</p>${initiativeReferenceActions(entry.itemId, `retro-win-${index}`)}</article>`).join("") || emptyState("No shipped wins captured yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Learnings</h3><span class="muted">Signals to preserve</span></div><div class="retro-list">${retro.learnings.map((entry, index) => `<article class="retro-card"><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.prompt)}</p>${initiativeReferenceActions(entry.itemId, `retro-learning-${index}`)}</article>`).join("") || emptyState("No learning candidates captured yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Misses</h3><span class="muted">Slips and recovery</span></div><div class="retro-list">${retro.misses.map((entry, index) => `<article class="retro-card warning"><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.recovery)}</p>${initiativeReferenceActions(entry.itemId, `retro-miss-${index}`)}</article>`).join("") || emptyState("No slipped commitments detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Follow-Ups</h3><span class="muted">Actions for next cycle</span></div><div class="retro-list">${retro.followUps.map((entry, index) => `<article class="retro-card"><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.action)}</p>${initiativeReferenceActions(entry.itemId, `retro-follow-up-${index}`)}</article>`).join("") || emptyState("No follow-up actions generated.")}</div></section><section class="panel"><div class="panel-header"><h3>Recent Activity</h3><span class="muted">Latest workspace changes</span></div><div class="retro-list">${retro.activity.map((entry, index) => `<article class="retro-card"><span>${escapeHtml(new Date(entry.createdAt).toLocaleString())}</span><h4>${escapeHtml(entry.action)} ${escapeHtml(entry.itemTitle)}</h4><p>${escapeHtml(formatActivityChanges(entry.changes))}</p>${initiativeReferenceActions(entry.itemId, `retro-activity-${index}`)}</article>`).join("") || emptyState("No recent activity captured.")}</div></section><section class="panel retro-memo"><div class="panel-header"><h3>Retro Memo</h3><button class="secondary" id="copyRetroMemoButton" type="button">Copy Memo</button></div><textarea id="retroMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
+  const retro = buildRetrospective(items, scopedActivity, new Date(), state.prioritization, themeEvidenceOptions());
+  const memo = scopeGeneratedText(buildRetrospectiveMemo(items, scopedActivity, new Date(), state.prioritization, themeEvidenceOptions()), items);
+  return `<section class="metrics reporting-metrics">${metric("Wins", retro.metrics.wins)}${metric("Learnings", retro.metrics.learnings)}${metric("Misses", retro.metrics.misses)}${metric("Follow-ups", retro.metrics.followUps)}</section><section class="retro-grid"><section class="panel"><div class="panel-header"><h3>Wins</h3><span class="muted">Showing ${retro.wins.length} of ${retro.metrics.wins} shipped outcomes</span></div><div class="retro-list">${retro.wins.map((entry, index) => `<article class="retro-card"><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.evidence)}</p>${synthesisSourceActions(entry, `retro-win-${index}`)}</article>`).join("") || emptyState("No shipped wins captured yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Learnings</h3><span class="muted">Showing ${retro.learnings.length} of ${retro.metrics.learnings} findings and prompts</span></div><div class="retro-list">${retro.learnings.map((entry, index) => `<article class="retro-card"><span>${entry.origin === "captured" ? "Captured finding" : "Suggested prompt"}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.prompt)}</p>${synthesisSourceActions(entry, `retro-learning-${index}`)}</article>`).join("") || emptyState("No learning candidates captured yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Misses</h3><span class="muted">Showing ${retro.misses.length} of ${retro.metrics.misses} overdue initiatives</span></div><div class="retro-list">${retro.misses.map((entry, index) => `<article class="retro-card warning"><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.recovery)}</p>${initiativeReferenceActions(entry.itemId, `retro-miss-${index}`)}</article>`).join("") || emptyState("No slipped commitments detected.")}</div></section><section class="panel"><div class="panel-header"><h3>Follow-Ups</h3><span class="muted">Actions for next cycle</span></div><div class="retro-list">${retro.followUps.map(retrospectiveFollowUpCard).join("") || emptyState("No follow-up actions generated.")}</div></section><section class="panel"><div class="panel-header"><h3>Recent Activity</h3><span class="muted">Latest workspace changes</span></div><div class="retro-list">${retro.activity.map((entry, index) => `<article class="retro-card"><span>${escapeHtml(new Date(entry.createdAt).toLocaleString())}</span><h4>${escapeHtml(entry.action)} ${escapeHtml(entry.itemTitle)}</h4><p>${escapeHtml(formatActivityChanges(entry.changes))}</p>${initiativeReferenceActions(entry.itemId, `retro-activity-${index}`)}</article>`).join("") || emptyState("No recent activity captured.")}</div></section><section class="panel retro-memo"><div class="panel-header"><h3>Retro Memo</h3><button class="secondary" id="copyRetroMemoButton" type="button">Copy Memo</button></div><textarea id="retroMemoDraft" readonly>${escapeHtml(memo)}</textarea></section></section>`;
 }
 function operationsView(items) {
   const risks = buildRiskRegister(items, state.prioritization);
   const stakeholderMap = buildStakeholderMap(items);
   const cadence = buildOperatingCadence(items, state.prioritization);
   const hygiene = buildBacklogHygiene(items, new Date(), state.prioritization);
-  const weekly = buildWeeklyPlan(items, state.prioritization);
-  return `<section class="metrics reporting-metrics">${metric("Hygiene", hygiene.score)}${metric("Stale", hygiene.stale.length)}${metric("Missing owner", hygiene.missingOwner.length)}${metric("Missing next", hygiene.missingNextStep.length)}</section><section class="operations-grid"><section class="panel"><div class="panel-header"><h3>Risk Register</h3><span class="muted">Prioritized by likelihood and impact</span></div><div class="ops-list">${risks.slice(0, 6).map((risk, index) => `<article class="ops-row"><div><h4>${escapeHtml(risk.item.title)}</h4><p>${escapeHtml(risk.record.description)}</p><span>${escapeHtml(risk.mitigation)}</span>${initiativeDetailButton(risk.item, `risk-register-${index}`, "Manage risk", "risks", risk.record.id)}</div><strong aria-label="${escapeHtml(risk.status)} severity ${risk.severity}">${risk.severity}</strong></article>`).join("") || emptyState("No active risks captured.")}</div></section><section class="panel"><div class="panel-header"><h3>Weekly Plan</h3><span class="muted">Focus, decisions, and unblockers</span></div><div class="weekly-plan"><h4>Focus</h4>${listPlanItems(weekly.focus, "weekly-focus")}<h4>Discover</h4>${listPlanItems(weekly.discover, "weekly-discover")}<h4>Decide</h4>${listPlanItems(weekly.decide, "weekly-decide")}<h4>Unblock</h4>${listPlanItems(weekly.unblock, "weekly-unblock")}</div></section><section class="panel"><div class="panel-header"><h3>Backlog Hygiene</h3><span class="muted">Operational cleanup</span></div><div class="hygiene-list"><h4>Suggested actions</h4>${weekly.actions.map((action) => `<p>${escapeHtml(action)}</p>`).join("") || emptyState("No cleanup actions right now.")}<h4>Parking candidates</h4>${initiativeReferenceList(hygiene.parkingCandidates, "parking-candidate") || emptyState("No parking candidates.")}</div></section><section class="panel"><div class="panel-header"><h3>Stakeholder Map</h3><span class="muted">Owners and customer segments</span></div><div class="stakeholder-columns"><div><h4>Owners</h4>${stakeholderMap.owners.map((entry) => `<p><strong>${entry.count}</strong> ${escapeHtml(entry.name)}</p>`).join("")}</div><div><h4>Segments</h4>${stakeholderMap.segments.map((entry) => `<p><strong>${entry.count}</strong> ${escapeHtml(entry.name)}</p>`).join("")}</div></div></section><section class="panel cadence-panel"><div class="panel-header"><h3>Operating Cadence</h3><span class="muted">Suggested PM rituals</span></div><div class="cadence-list">${cadence.map((ritual) => `<article class="cadence-card"><span>${escapeHtml(ritual.cadence)}</span><h4>${escapeHtml(ritual.name)}</h4><p>${escapeHtml(ritual.focus)}</p><small>${escapeHtml(ritual.agenda.join(" | ") || "No agenda items yet.")}</small></article>`).join("")}</div></section></section>`;
+  const weekly = buildWeeklyPlan(items, state.prioritization, themeEvidenceOptions());
+  return `<section class="metrics reporting-metrics">${metric("Hygiene", formatOperationalScore(hygiene.score))}${metric("Stale", hygiene.stale.length)}${metric("Missing owner", hygiene.missingOwner.length)}${metric("Missing next", hygiene.missingNextStep.length)}</section><section class="operations-grid"><section class="panel"><div class="panel-header"><h3>Risk Register</h3><span class="muted">Prioritized by likelihood and impact</span></div><div class="ops-list">${risks.slice(0, 6).map((risk, index) => `<article class="ops-row"><div><h4>${escapeHtml(risk.item.title)}</h4><p>${escapeHtml(risk.record.description)}</p><span>${escapeHtml(risk.mitigation)}</span>${initiativeDetailButton(risk.item, `risk-register-${index}`, "Manage risk", "risks", risk.record.id)}</div><strong aria-label="${escapeHtml(risk.status)} severity ${risk.severity}">${risk.severity}</strong></article>`).join("") || emptyState("No active risks captured.")}</div></section><section class="panel"><div class="panel-header"><h3>Weekly Plan</h3><span class="muted">Focus, decisions, and unblockers</span></div><div class="weekly-plan"><h4>Focus</h4>${listPlanItems(weekly.focus, "weekly-focus")}<h4>Discover</h4>${listPlanItems(weekly.discover, "weekly-discover")}<h4>Decide</h4>${synthesisDecisionCards(weekly.decisionEntries, "weekly-decide")}${weekly.decisionSuggestions.length ? `<h4>Suggested decisions</h4>${synthesisDecisionCards(weekly.decisionSuggestions, "weekly-suggested")}` : ""}<h4>Unblock</h4>${listPlanItems(weekly.unblock, "weekly-unblock")}</div></section><section class="panel"><div class="panel-header"><h3>Backlog Hygiene</h3><span class="muted">Operational cleanup</span></div><div class="hygiene-list"><h4>Suggested actions</h4>${weekly.actionTargets.map(operationsRecommendationCard).join("") || emptyState("No cleanup actions right now.")}<h4>Parking candidates</h4>${initiativeReferenceList(hygiene.parkingCandidates, "parking-candidate") || emptyState("No parking candidates.")}</div></section><section class="panel"><div class="panel-header"><h3>Stakeholder Map</h3><span class="muted">Owners and customer segments</span></div><div class="stakeholder-columns"><div><h4>Owners</h4>${stakeholderMap.owners.map((entry) => `<p><strong>${entry.count}</strong> ${escapeHtml(entry.name)}</p>`).join("")}</div><div><h4>Segments</h4>${stakeholderMap.segments.map((entry) => `<p><strong>${entry.count}</strong> ${escapeHtml(entry.name)}</p>`).join("")}</div></div></section><section class="panel cadence-panel"><div class="panel-header"><h3>Operating Cadence</h3><span class="muted">Suggested PM rituals</span></div><div class="cadence-list">${cadence.map((ritual) => `<article class="cadence-card"><span>${escapeHtml(ritual.cadence)}</span><h4>${escapeHtml(ritual.name)}</h4><p>${escapeHtml(ritual.focus)}</p><small>${escapeHtml(ritual.agenda.join(" | ") || "No agenda items yet.")}</small></article>`).join("")}</div></section></section>`;
 }
 function specsView(items) {
   const candidates = prioritizeItems(items, state.prioritization).filter((item) => item.status !== "shipped" && item.status !== "parked");
   const selected = candidates.find((item) => item.id === state.selectedSpecId) || candidates[0];
   const spec = selected ? buildProductSpec(selected, items, state.prioritization) : null;
   const draft = scopeGeneratedText(selected ? buildProductSpecMarkdown(selected, items, new Date(), state.prioritization) : "No active initiatives available for spec generation.", items);
-  return `<section class="specs-grid"><section class="panel"><div class="panel-header"><h3>Spec Candidates</h3><span class="muted">Prioritized active work</span></div><div class="spec-list">${candidates.map((item) => `<button class="spec-option ${selected?.id === item.id ? "active" : ""}" data-spec="${item.id}" type="button"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(workspacePriorityLabel())} ${escapeHtml(workspacePriorityValue(item))} | ${statusLabels[item.status]}</span></button>`).join("") || emptyState("No active initiatives to specify.")}</div></section><section class="panel"><div class="panel-header"><h3>Spec Readiness</h3><span class="muted">${spec ? `${spec.readiness}% ready` : "No spec"}</span></div>${spec ? `<div class="spec-summary">${initiativeReferenceActions(selected, "spec-selected")}<p><strong>Owner</strong><span>${escapeHtml(spec.owner)}</span></p><p><strong>Objective</strong><span>${escapeHtml(spec.objective)}</span></p><p><strong>Metric</strong><span>${escapeHtml(spec.successMetric)}</span></p><p><strong>Gaps</strong><span>${spec.readinessGaps.length}</span></p></div>` : emptyState("Select an initiative.")}</section><section class="panel spec-draft"><div class="panel-header"><h3>PRD Draft</h3><button class="secondary" id="copySpecButton" type="button">Copy PRD</button></div><textarea id="specDraft" readonly>${escapeHtml(draft)}</textarea></section></section>`;
+  return `<section class="specs-grid"><section class="panel"><div class="panel-header"><h3>Spec Candidates</h3><span class="muted">Prioritized active work</span></div><div class="spec-list">${candidates.map((item) => `<button class="spec-option ${selected?.id === item.id ? "active" : ""}" data-spec="${item.id}" type="button"><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(workspacePriorityLabel())} ${escapeHtml(workspacePriorityValue(item))} | ${escapeHtml(initiativeReportingContext(state.workflow, item))}</span></button>`).join("") || emptyState("No active initiatives to specify.")}</div></section><section class="panel"><div class="panel-header"><h3>Spec Readiness</h3><span class="muted">${spec ? `${spec.readiness}% ready` : "No spec"}</span></div>${spec ? `<div class="spec-summary">${initiativeReferenceActions(selected, "spec-selected")}<p><strong>Owner</strong><span>${escapeHtml(spec.owner)}</span></p><p><strong>Objective</strong><span>${escapeHtml(spec.objective)}</span></p><p><strong>Metric</strong><span>${escapeHtml(spec.successMetric)}</span></p><p><strong>Gaps</strong><span>${spec.readinessGaps.length}</span></p></div>` : emptyState("Select an initiative.")}</section><section class="panel spec-draft"><div class="panel-header"><h3>PRD Draft</h3><button class="secondary" id="copySpecButton" type="button">Copy PRD</button></div><textarea id="specDraft" readonly>${escapeHtml(draft)}</textarea></section></section>`;
 }
 function meetingsView(items) {
   const meetingTypes = ["weekly-review", "daily-triage", "launch-review", "decision-review"];
-  const agendas = meetingTypes.map((type) => buildMeetingAgenda(items, type, new Date(), state.prioritization));
-  const selected = scopeGeneratedText(buildMeetingAgendaMarkdown(items, state.selectedMeeting, new Date(), state.prioritization), items);
+  const agendas = meetingTypes.map((type) => buildMeetingAgenda(items, type, new Date(), state.prioritization, themeEvidenceOptions()));
+  const selected = scopeGeneratedText(buildMeetingAgendaMarkdown(items, state.selectedMeeting, new Date(), state.prioritization, themeEvidenceOptions()), items);
   return `<section class="meetings-grid"><section class="panel"><div class="panel-header"><h3>Meeting Agendas</h3><span class="muted">Generated from current work</span></div><div class="meeting-list">${agendas.map((agenda) => `<button class="meeting-option ${state.selectedMeeting === agenda.id ? "active" : ""}" data-meeting="${agenda.id}" type="button"><strong>${escapeHtml(agenda.title)}</strong><span>${agenda.duration} min | ${agenda.sections.length} sections</span></button>`).join("")}</div></section><section class="panel"><div class="panel-header"><h3>Agenda Draft</h3><button class="secondary" id="copyMeetingAgendaButton" type="button">Copy Agenda</button></div><textarea id="meetingAgendaDraft" readonly>${escapeHtml(selected)}</textarea></section></section>`;
 }
 function templatesView(items) {
@@ -2165,12 +2884,46 @@ function templatesView(items) {
 }
 
 function decisionsView(items) {
-  const decisionItems = items.filter((item) => item.decision || item.experiment || activeRisks(item).length);
-  return `<section class="panel"><div class="panel-header"><h3>Decision Log</h3><span class="muted">Risks, experiments, and calls</span></div><div class="decision-list">${decisionItems.map(decisionCard).join("") || emptyState("No decisions or experiments captured yet.")}</div></section>`;
+  return savedDecisionsMarkup(savedDecisionsForView(items));
+}
+
+function savedDecisionsForView(items) {
+  const itemIds = new Set(items.map((item) => item.id));
+  const scopeIds = new Set((timelineScopeApplies() ? filterItemsByPeriod(state.items, state.periodSelection, state.planningCalendar) : state.items).map((item) => item.id));
+  const matching = new Set(filterInsightRecords(state.insightRecords, { type: "decision", query: state.query }).map((record) => record.id));
+  return state.insightRecords.filter((record) => record.type === "decision"
+    && (record.initiativeId ? scopeIds.has(record.initiativeId) : !timelineScopeApplies() || state.periodSelection.kind === "all")
+    && (matching.has(record.id) || itemIds.has(record.initiativeId)));
+}
+
+function savedDecisionLists(records, context) {
+  const card = (record) => `<article class="action-card compact" data-saved-decision="${escapeHtml(record.id)}"><span>${escapeHtml(INSIGHT_STATUS_LABELS[record.status])} · ${escapeHtml(record.owner || organizationPersonName(record.ownerPersonId) || "Unassigned")}</span><h5>${escapeHtml(record.title)}</h5><p>${escapeHtml(record.question || "Question not captured.")}</p><p>${escapeHtml(record.outcome || "Outcome not captured.")}</p><div class="contextual-card-actions">${insightRecordLink(record, context)}</div></article>`;
+  return `<section data-decision-state="pending"><h4>Pending and revisit</h4><div class="action-list">${records.filter((record) => record.status !== "decided").map(card).join("") || emptyState("No pending decisions saved.")}</div></section><section data-decision-state="history"><h4>Decision history</h4><div class="action-list">${records.filter((record) => record.status === "decided").map(card).join("") || emptyState("No decided outcomes saved.")}</div></section>`;
+}
+
+function savedDecisionsMarkup(records) {
+  return `<section class="panel" data-saved-decisions aria-labelledby="savedDecisionsTitle"><div class="panel-header"><h3 id="savedDecisionsTitle">Saved decisions</h3><button class="primary" id="newSavedDecisionButton" data-new-insight="decision" type="button" ${teamEditorReadOnlyReason() ? "disabled" : ""}>New decision</button></div><p>Keep the question, outcome and rationale together. Revisit a decision when it needs another review.</p>${savedDecisionLists(records, "saved-decisions")}</section>`;
+}
+
+function initiativeSavedDecisionsMarkup(item) {
+  const records = state.insightRecords.filter((record) => record.type === "decision" && record.initiativeId === item.id);
+  return `<section class="initiative-detail-section" aria-label="Saved decisions"><div class="initiative-detail-section-heading"><h4>Saved decisions</h4><button class="secondary small" id="addInitiativeDecision-${elementIdToken(item.id)}" data-add-initiative-decision="${escapeHtml(item.id)}" type="button" ${teamEditorReadOnlyReason() ? "disabled" : ""}>Record decision</button></div>${savedDecisionLists(records, `initiative-decisions-${item.id}`)}</section>`;
+}
+
+function openInitiativeWorkRecord(itemId, type, trigger, actionContext = null, forceNew = false) {
+  if (teamEditorReadOnlyReason()) return;
+  const item = state.items.find((entry) => entry.id === itemId);
+  if (!item) return;
+  const recordId = forceNew ? "" : type === "action" ? item.currentActionId : type === "validation" ? item.currentValidationId : item.currentDecisionId;
+  const record = state.insightRecords.find((entry) => entry.id === recordId && entry.type === type && entry.initiativeId === itemId);
+  state.insightEditor = createInsightEditorState({ mode: record ? "edit" : "new", type, selectedId: record?.id || "", triggerId: trigger?.id || "viewTitle", actionContext, focusField: type === "validation" && !forceNew ? "method" : "",
+    draft: record ? null : { ...blankInsightValues(type), ...(type === "validation" && !forceNew ? { title: `Experiment: ${item.title}` } : {}), initiativeId: item.id, owner: item.owner, ownerPersonId: item.pocPersonId || "", customerIds: item.customerIds, segmentIds: item.segmentIds }
+  });
+  render();
 }
 
 function activityView() {
-  const digest = buildActivityDigest(state.activity);
+  const digest = buildActivityDigest(state.activity, new Date(), state);
   return `<section class="activity-layout"><section class="panel"><div class="panel-header"><h3>Activity Trail</h3><span class="muted">${state.activity.length} events</span></div><div class="activity-list">${state.activity.slice(0, 80).map((entry) => `<article class="activity-card"><span>${escapeHtml(new Date(entry.createdAt).toLocaleString())} | ${escapeHtml(entry.actor)}</span><h4>${escapeHtml(entry.action)} ${escapeHtml(entry.itemTitle)}</h4><p>${escapeHtml(formatActivityChanges(entry.changes))}</p></article>`).join("") || emptyState("No activity recorded yet.")}</div></section><section class="panel"><div class="panel-header"><h3>Digest</h3><button class="secondary" id="copyActivityDigestButton" type="button">Copy Digest</button></div><textarea id="activityDigestDraft" readonly>${escapeHtml(digest)}</textarea></section></section>`;
 }
 function dataView() {
@@ -2186,20 +2939,26 @@ function dataView() {
   const exportScope = periodSelectionLabel(state.periodSelection, state.planningCalendar);
   const exportRange = periodSelectionRangeLabel(state.periodSelection, state.planningCalendar);
   return `<section class="source-grid" id="dataRegion" aria-busy="${state.dataBusy}">
+    ${dataOverviewMarkup()}
+    <section class="panel data-panel data-backup-panel">
+      <div class="panel-header"><h3>Backup and restore</h3><span class="muted">Keep a copy of your work</span></div>
+      <p>Download a complete workspace backup, or import saved work. Keep downloaded backups somewhere safe; PM OS cannot check whether a downloaded file was saved or deleted.</p>
+      <div class="data-actions"><button class="primary" id="exportButton" ${teamActive ? teamExportDisabled : busyDisabled} type="button">Download backup</button><button class="file-button" id="importButton" ${importDisabled} type="button">Import saved work</button><input class="sr-only" id="importInput" ${importDisabled} type="file" tabindex="-1" aria-label="Choose workspace data file" accept=".json,.csv,.md,application/json,text/csv,text/markdown"><button class="danger" id="resetButton" ${importDisabled} type="button">${demoMode ? "Reset demo data" : "Clear workspace"}</button></div>
+      <p>Backups use JSON and contain the complete workspace. You can also import initiative CSV files or GitHub issue drafts. CSV and issue files add selected initiatives after preview; JSON backups replace the workspace after confirmation.</p>
+      <p class="data-status" id="dataStatus" tabindex="-1" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.dataStatus)}</p>
+      <details class="data-advanced" id="dataAdvanced" ${state.dataAdvancedOpen ? "open" : ""}><summary>Advanced / inspect export</summary>
+      <div class="export-scope-note"><div><p class="panel-kicker">Current export scope</p><strong>${escapeHtml(exportScope)}</strong><span>${escapeHtml(exportRange)} · ${exportItems.length} initiative${exportItems.length === 1 ? "" : "s"}</span></div><p>CSV and GitHub Issues use this scope. JSON, recovery, imports, Drive sync, and Team snapshots always retain the complete workspace.</p></div>
+      <div class="data-actions"><button class="secondary" id="exportCsvButton" ${teamActive ? teamExportDisabled : busyDisabled} type="button">Export CSV</button><button class="secondary" id="exportIssuesButton" ${teamActive ? teamExportDisabled : busyDisabled} type="button">Export GitHub Issues</button></div>
+      <label for="exportPreview">Complete workspace JSON</label><textarea id="exportPreview" readonly>${escapeHtml(exportPortableWorkspace())}</textarea></details>
+      ${teamActive ? `<p class="data-boundary-note">Team exports contain portable workspace and activity data only. Team membership, configuration, and session data are excluded.</p>` : ""}
+    </section>
     ${workspaceModeSettingsMarkup()}
     <section class="panel data-panel source-panel">
       <div class="panel-header"><div><p class="panel-kicker">Storage and sync</p><h3>Choose where PM OS saves</h3></div><span class="muted">${escapeHtml(sourceLabel)}</span></div>
       ${sourceCardsMarkup()}
-      <label class="sr-only"><span>Selected source</span><select id="sourceType" ${demoMode || state.dataBusy ? "disabled" : ""}><option value="local" ${state.sourceSelection === "local" ? "selected" : ""}>Local workspace</option><option value="local-file" ${state.sourceSelection === "local-file" ? "selected" : ""}>Linked workspace file</option><option value="drive-folder" ${state.sourceSelection === "drive-folder" ? "selected" : ""}>Google Drive</option><option value="local-server" ${state.sourceSelection === "local-server" ? "selected" : ""}>PM OS Local Server</option><option value="team" ${state.sourceSelection === "team" ? "selected" : ""}>Team Server</option></select></label>
+      <label class="sr-only"><span>Save location</span><select id="sourceType" ${demoMode || state.dataBusy ? "disabled" : ""}><option value="local" ${state.sourceSelection === "local" ? "selected" : ""}>Local workspace</option><option value="local-file" ${state.sourceSelection === "local-file" ? "selected" : ""}>Linked workspace file</option><option value="drive-folder" ${state.sourceSelection === "drive-folder" ? "selected" : ""}>Google Drive</option><option value="local-server" ${state.sourceSelection === "local-server" ? "selected" : ""}>PM OS Local Server</option><option value="team" ${state.sourceSelection === "team" ? "selected" : ""}>Team Server</option></select></label>
       <div class="source-setup" aria-label="${escapeHtml(sourceChoiceLabel(state.sourceSelection))} setup">${sourceSetupMarkup()}</div>
       <div class="source-note"><strong>${escapeHtml(sourceLabel)}</strong><p>${escapeHtml(sourceHelpText())}</p><p id="syncStatus" tabindex="-1" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.syncStatus)}</p></div>
-    </section>
-    <section class="panel data-panel">
-      <div class="panel-header"><h3>Workspace Data</h3><span class="muted">Portable JSON, CSV, and GitHub issues</span></div>
-      <div class="export-scope-note"><div><p class="panel-kicker">Current export scope</p><strong>${escapeHtml(exportScope)}</strong><span>${escapeHtml(exportRange)} · ${exportItems.length} initiative${exportItems.length === 1 ? "" : "s"}</span></div><p>CSV and GitHub Issues use this scope. JSON, recovery, imports, Drive sync, and Team snapshots always retain the complete workspace.</p></div>
-      <div class="data-actions"><button class="secondary" id="exportButton" ${teamActive ? teamExportDisabled : busyDisabled} type="button">Export JSON</button><button class="secondary" id="exportCsvButton" ${teamActive ? teamExportDisabled : busyDisabled} type="button">Export CSV</button><button class="secondary" id="exportIssuesButton" ${teamActive ? teamExportDisabled : busyDisabled} type="button">Export GitHub Issues</button><button class="file-button" id="importButton" ${importDisabled} type="button">Import JSON, CSV, or Issues</button><input class="sr-only" id="importInput" ${importDisabled} type="file" tabindex="-1" aria-label="Choose workspace data file" accept=".json,.csv,.md,application/json,text/csv,text/markdown"><button class="danger" id="resetButton" ${importDisabled} type="button">${demoMode ? "Reset demo data" : "Clear workspace"}</button></div>
-      <textarea id="exportPreview" readonly>${escapeHtml(exportPortableWorkspace())}</textarea>
-      ${teamActive ? `<p class="data-boundary-note">Team exports contain portable workspace and activity data only. Team membership, configuration, and session data are excluded.</p>` : ""}
     </section>
     ${teamMembersMarkup()}
     ${tutorialSettingsPanelMarkup()}
@@ -2210,9 +2969,8 @@ function dataView() {
       <p class="sr-only" id="usageStatus" role="status" aria-live="polite" aria-atomic="true"></p>
     </section>
     <section class="panel data-panel recovery-panel" aria-labelledby="recoveryTitle">
-      <div class="panel-header"><h3 id="recoveryTitle">Browser Recovery Snapshots</h3><span class="muted">${state.backups.length} of 5 saved</span></div>
-      <p class="recovery-disclosure">Recovery applies only to Browser memory and Google Drive. Team workspace content is never stored here.</p>
-      <p class="data-status" id="dataStatus" tabindex="-1" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.dataStatus)}</p>
+      <div class="panel-header"><h3 id="recoveryTitle">Recovery copies on this device</h3><span class="muted">${state.backups.length} of 5 saved</span></div>
+      <p class="recovery-disclosure">${demoMode ? "Demo keeps up to five recovery copies until this page reloads. Download a backup to keep a separate copy." : "PM OS keeps up to five copies before replacing local work. These copies stay in this browser and can be lost if browser data is cleared. Team workspace content is never stored here."}</p>
       <div class="recovery-list">${recoveryRows}</div>
     </section>
   </section>
@@ -2221,10 +2979,10 @@ function dataView() {
 
 function sourceCardsMarkup() {
   const choices = [
-    { id: "local", title: "Local workspace", description: "Browser storage or a linked JSON file on this device.", meta: "Zero setup" },
-    { id: "drive-folder", title: "Google Drive", description: "A portable workspace file with guarded sync.", meta: "Google account" },
-    { id: "local-server", title: "PM OS Local Server", description: "Your own loopback or LAN Supabase backend.", meta: "Docker" },
-    { id: "team", title: "Team Server", description: "Supabase Cloud or a remote self-hosted backend.", meta: "Shared workspace" }
+    { id: "local", title: "On this device", description: "Save in this browser or in a workspace file you choose.", meta: "No account needed" },
+    { id: "drive-folder", title: "Google Drive", description: "A workspace file with checks before combining changes.", meta: "Google account" },
+    { id: "local-server", title: "PM OS Local Server", description: "Shared storage on your computer or local network.", meta: "Docker" },
+    { id: "team", title: "Team Server", description: "Shared storage on a server your team manages.", meta: "Shared workspace" }
   ];
   const selected = state.sourceSelection === "local-file" ? "local" : state.sourceSelection;
   return `<div class="source-cards" role="group" aria-label="Workspace storage choices">${choices.map((choice) => {
@@ -2244,12 +3002,12 @@ function localSourceSetupMarkup() {
   const supported = linkedFileSupported();
   const linked = state.sourceSelection === "local-file";
   const disabled = demoMode || state.dataBusy ? "disabled" : "";
-  return `<div class="local-source-setup"><div class="source-choice-row"><button class="${linked ? "secondary" : "primary"}" id="useBrowserStorageButton" ${disabled} type="button">Use browser storage</button><button class="secondary" id="createWorkspaceFileButton" ${disabled || !supported ? "disabled" : ""} type="button">Create workspace file</button><button class="${linked ? "primary" : "secondary"}" id="linkWorkspaceFileButton" ${disabled || !supported ? "disabled" : ""} type="button">${linked ? "Open another file" : "Open existing file"}</button></div>${supported ? "" : `<p class="source-disabled-reason">Workspace files need Chromium's File System Access API. This browser can still use browser storage, JSON export, and import.</p>`}${linked ? `<div class="source-readiness"><p><span>Linked file</span><strong>${escapeHtml(state.linkedFile.name || state.source.fileName || "Permission needed")}</strong></p><p><span>Permission</span><strong>${escapeHtml(state.linkedFile.permission)}</strong></p><div class="source-choice-row"><button class="secondary" id="saveLinkedFileButton" ${disabled || !state.linkedFile.handle || state.sync.fileConflicts.length ? "disabled" : ""} type="button">Save now</button><button class="secondary" id="requestLinkedFilePermissionButton" ${disabled || !state.linkedFile.handle ? "disabled" : ""} type="button">Check permission</button><button class="secondary" id="unlinkWorkspaceFileButton" ${disabled ? "disabled" : ""} type="button">Unlink file</button></div></div>${linkedFileConflictMarkup()}` : `<p class="source-readiness-copy">Changes save immediately in this browser. Recovery snapshots stay on this device.</p>`}</div>`;
+  return `<div class="local-source-setup"><div class="source-choice-row"><button class="${linked ? "secondary" : "primary"}" id="useBrowserStorageButton" ${disabled} type="button">Save on this device</button><button class="secondary" id="createWorkspaceFileButton" ${disabled || !supported ? "disabled" : ""} type="button">Create workspace file</button><button class="${linked ? "primary" : "secondary"}" id="linkWorkspaceFileButton" ${disabled || !supported ? "disabled" : ""} type="button">${linked ? "Open another file" : "Open existing file"}</button></div>${supported ? "" : `<p class="source-disabled-reason">Workspace files need Chromium's File System Access API. You can still save on this device, download backups, and import saved work.</p>`}${linked ? `<div class="source-readiness"><p><span>Linked file</span><strong>${escapeHtml(state.linkedFile.name || state.source.fileName || "Permission needed")}</strong></p><p><span>Permission</span><strong>${escapeHtml(state.linkedFile.permission)}</strong></p><div class="source-choice-row"><button class="secondary" id="saveLinkedFileButton" ${disabled || !state.linkedFile.handle || state.sync.fileConflicts.length ? "disabled" : ""} type="button">Save now</button><button class="secondary" id="requestLinkedFilePermissionButton" ${disabled || !state.linkedFile.handle ? "disabled" : ""} type="button">Check permission</button><button class="secondary" id="unlinkWorkspaceFileButton" ${disabled ? "disabled" : ""} type="button">Unlink file</button></div></div>${linkedFileConflictMarkup()}` : `<p class="source-readiness-copy">${demoMode ? "Demo changes and recovery snapshots reset whenever this page reloads." : "Changes save immediately in this browser. Recovery snapshots stay on this device."}</p>`}</div>`;
 }
 
 function linkedFileConflictMarkup() {
   if (!state.sync.fileConflicts.length) return "";
-  return `<div class="linked-file-conflicts" role="alert"><h4>Choose each conflicting field</h4><p>The linked file will stay unchanged until every field is resolved.</p><ul>${state.sync.fileConflicts.map((conflict) => `<li><code>${escapeHtml(conflict.path || "workspace")}</code><div class="source-choice-row"><button class="secondary" data-file-conflict-path="${escapeHtml(conflict.path)}" data-file-conflict-choice="local" type="button">Keep browser</button><button class="secondary" data-file-conflict-path="${escapeHtml(conflict.path)}" data-file-conflict-choice="remote" type="button">Use file</button></div></li>`).join("")}</ul></div>`;
+  return `<div class="linked-file-conflicts" role="alert"><h4>Choose each conflicting field</h4><p>The linked file will stay unchanged until every field is resolved.</p><ul>${state.sync.fileConflicts.map((conflict) => `<li><code>${escapeHtml(conflict.path || "workspace")}</code><dl><dt>Browser version</dt><dd><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${escapeHtml(JSON.stringify(conflict.local, null, 2) ?? "(deleted)")}</pre></dd><dt>File version</dt><dd><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${escapeHtml(JSON.stringify(conflict.remote, null, 2) ?? "(deleted)")}</pre></dd></dl><div class="source-choice-row"><button class="secondary" data-file-conflict-path="${escapeHtml(conflict.path)}" data-file-conflict-choice="local" type="button">Keep browser</button><button class="secondary" data-file-conflict-path="${escapeHtml(conflict.path)}" data-file-conflict-choice="remote" type="button">Use file</button></div></li>`).join("")}</ul></div>`;
 }
 
 function driveSourceSetupMarkup() {
@@ -2271,22 +3029,67 @@ function driveSourceSetupMarkup() {
   </div>
   <div class="drive-actions"><button class="${state.driveToken ? "secondary" : "primary"}" id="connectDriveButton" ${connectDisabled} type="button">${state.driveToken ? "Reconnect Drive" : "Connect Drive"}</button>${pickerReady ? `<button class="secondary" id="chooseDriveFileButton" ${driveActionDisabled} type="button">Choose Drive file</button>` : ""}<button class="primary" id="syncDriveButton" ${driveActionDisabled || conflict ? "disabled" : ""} type="button">Sync now</button></div>
   ${disabledReason ? `<p class="source-disabled-reason">${escapeHtml(disabledReason)}</p>` : ""}
-  <div class="sync-facts"><p><strong>Last download</strong><span>${escapeHtml(formatSyncTime(state.sync.lastPulledAt))}</span></p><p><strong>Last upload</strong><span>${escapeHtml(formatSyncTime(state.sync.lastPushedAt))}</span></p><p><strong>Baseline</strong><span>${escapeHtml(formatSyncTime(state.sync.baseRemote?.modifiedTime))}</span></p><p><strong>Remote observed</strong><span>${escapeHtml(formatSyncTime(state.sync.remote?.modifiedTime))}</span></p></div>
+  <div class="sync-facts"><p><strong>Last download</strong><span>${escapeHtml(formatSyncTime(state.sync.lastPulledAt))}</span></p><p><strong>Last upload</strong><span>${escapeHtml(formatSyncTime(state.sync.lastPushedAt))}</span></p><p><strong>Saved Drive version</strong><span>${escapeHtml(formatSyncTime(state.sync.baseRemote?.modifiedTime))}</span></p><p><strong>Latest Drive version checked</strong><span>${escapeHtml(formatSyncTime(state.sync.remote?.modifiedTime))}</span></p></div>
+  <p class="muted">Dates show when each Drive file version was last changed. PM OS compares the saved version with the latest version it checked before uploading.</p>
   ${conflictMarkup}
-  <details class="source-advanced" ${state.driveAdvancedOpen ? "open" : ""}><summary>Advanced directional actions</summary><p>Use these only when you intentionally want one side to replace the other.</p><div class="drive-actions"><button class="secondary" id="checkDriveButton" ${driveActionDisabled} type="button">Inspect Drive</button><button class="secondary" id="${conflict ? "advancedPullDriveButton" : "pullDriveButton"}" ${driveActionDisabled} type="button">Remote → browser</button><button class="secondary" id="pushDriveButton" ${driveActionDisabled} type="button">Browser → remote</button></div></details>`;
+  <details class="source-advanced" ${state.driveAdvancedOpen ? "open" : ""}><summary>Replace one copy with another</summary><p>Use these only when you intentionally want one side to replace the other.</p><div class="drive-actions"><button class="secondary" id="checkDriveButton" ${driveActionDisabled} type="button">Inspect Drive</button><button class="secondary" id="${conflict ? "advancedPullDriveButton" : "pullDriveButton"}" ${driveActionDisabled} type="button">Use Drive copy on this device</button><button class="secondary" id="pushDriveButton" ${driveActionDisabled} type="button">Upload this device's copy</button></div></details>`;
 }
 
 function sourceChoiceLabel(selection) {
-  return ({ local: "Browser storage", "local-file": "Linked workspace file", "drive-folder": "Google Drive", "local-server": "PM OS Local Server", team: "Team Server" })[selection] || "Browser storage";
+  return ({ local: "Saved on this device", "local-file": "Linked workspace file", "drive-folder": "Google Drive", "local-server": "PM OS Local Server", team: "Team Server" })[selection] || "Saved on this device";
+}
+
+function dataOverviewMarkup() {
+  const team = state.team.active;
+  const source = demoMode ? "Demo only — resets on reload" : team ? state.team.workspace?.name || "Team workspace"
+    : state.source.type === "google-drive" ? `Google Drive · ${state.source.fileName || "Workspace file"}${driveSourceReady({ ...state.source, clientId: state.source.clientId || normalizeDriveRuntimeConfig(globalThis.PM_OS_DRIVE_CONFIG)?.clientId || "" }) ? "" : " · setup incomplete"}`
+      : state.source.type === "local-file" ? `Linked workspace file · ${state.linkedFile.name || state.source.fileName || "File not selected"}`
+        : state.source.type.startsWith("supabase-") ? "Team server · workspace not open" : "Browser storage on this device";
+  let browserCopy = false;
+  let browserStorageAvailable = true;
+  if (!demoMode && !team) {
+    try { browserCopy = Boolean(localStorage.getItem(storageKey)); }
+    catch { browserStorageAvailable = false; }
+  }
+  const device = demoMode ? "Temporary demo data; not saved" : team ? "Team workspace is held in memory; no browser recovery copy"
+    : !browserStorageAvailable ? "Browser storage could not be checked"
+      : state.storageWarning ? "Browser copy needs recovery; current work is not confirmed saved"
+        : !browserCopy ? "No saved browser copy yet"
+          : state.localWriteConflict ? "Browser copy exists; a save failed — review saved work"
+            : "Browser copy saved on this device; not a separate backup";
+  let history = "Not applicable — browser storage only";
+  if (demoMode) history = "Demo changes are not synced";
+  else if (team) history = "Server workspace opened; last successful save time is not recorded here";
+  else if (state.source.type === "google-drive") {
+    const baselineKnown = driveFingerprintComplete(state.sync.baseRemote) && Boolean(state.sync.baseDocument);
+    const transfers = baselineKnown ? [
+      state.sync.lastPushedAt && `Uploaded ${formatSyncTime(state.sync.lastPushedAt)}`,
+      state.sync.lastPulledAt && `Downloaded ${formatSyncTime(state.sync.lastPulledAt)}`
+    ].filter(Boolean) : [];
+    history = transfers.length ? `${transfers.join(" · ")}. History does not confirm later device changes are synced.`
+      : "No successful Drive upload or download recorded with a matching saved file version";
+  } else if (state.source.type === "local-file") {
+    history = state.sync.fileBaselineDocument && state.sync.fileLastModified
+      ? `Known file version modified ${formatSyncTime(state.sync.fileLastModified)}. This is the file modification time, not the last save time; later device changes may be pending.`
+      : "No linked file version confirmed";
+  } else if (state.source.type.startsWith("supabase-")) history = "No server workspace open in this view";
+  const sharing = demoMode ? "Sample data; no sharing" : team ? `${state.team.role || "viewer"} access · Team workspace`
+    : state.source.type === "google-drive" ? "Drive file access controls sharing; no live collaboration" : "Not shared with a Team workspace";
+  const latest = !team && state.backups[0];
+  const recovery = team ? "Ask your administrator about server backups; download a workspace backup here."
+    : latest ? `${state.backups.length} recovery ${state.backups.length === 1 ? "copy" : "copies"} · latest ${formatSyncTime(latest.createdAt)}` : "No recovery copies yet. Download a backup to keep a separate copy.";
+  const unsavedBrowser = !demoMode && !team && state.source.type === "browser" && !browserCopy && !state.storageWarning && !state.localWriteConflict;
+  const status = demoMode ? "Demo changes and recovery copies reset on reload" : !browserStorageAvailable ? "Browser storage could not be checked" : unsavedBrowser ? "No browser save confirmed" : globalSyncLabel();
+  return `<section class="panel data-overview" aria-labelledby="dataOverviewTitle"><div class="panel-header"><div><p class="panel-kicker">Your work</p><h3 id="dataOverviewTitle">Where your work is saved</h3></div></div><dl><div><dt>Configured destination</dt><dd>${escapeHtml(source)}</dd></div><div><dt>This device</dt><dd>${escapeHtml(device)}</dd></div><div><dt>Save status</dt><dd ${unsavedBrowser ? "" : "data-save-status"}>${escapeHtml(status)}</dd></div><div><dt>Confirmed destination history</dt><dd>${escapeHtml(history)}</dd></div><div><dt>Sharing</dt><dd>${escapeHtml(sharing)}</dd></div><div><dt>Latest recovery copy</dt><dd>${escapeHtml(recovery)}</dd></div></dl>${!demoMode && !team && state.source.type === "browser" ? `<p>Browser storage stays on this device. Clearing browser data can remove your work and recovery copies. A downloaded backup gives you a separate copy.</p>` : ""}</section>`;
 }
 
 function workspaceModeSettingsMarkup() {
-  const activeLabel = demoMode ? "Demo mode" : "Operation mode";
+  const activeLabel = demoMode ? "Demo mode" : "My workspace";
   const activeDescription = demoMode
-    ? "Sample initiatives are active. Changes stay in this session and external data sources are disabled."
+    ? "Sample initiatives are active. Demo changes and recovery copies reset whenever this page reloads. External data sources are disabled."
     : "Your saved Browser, Drive, or Team workspace is active. Demo data remains separate.";
   return `<section class="panel data-panel workspace-mode-panel" aria-labelledby="workspaceModeTitle">
-    <div class="workspace-mode-copy"><p class="panel-kicker">Environment</p><h3 id="workspaceModeTitle">Workspace mode</h3><p>Switch between a safe sample workspace and your operational data. PM OS reloads to keep the two environments isolated.</p></div>
+    <div class="workspace-mode-copy"><p class="panel-kicker">Environment</p><h3 id="workspaceModeTitle">Workspace mode</h3><p>Explore sample data or return to your saved work. PM OS reloads when you switch; demo changes stay separate.</p></div>
     <div class="workspace-mode-control">
       <span class="workspace-mode-status ${demoMode ? "is-demo" : ""}">${activeLabel}</span>
       <label class="workspace-mode-toggle" for="demoModeToggle">
@@ -2305,8 +3108,8 @@ function workspaceModeChoiceMarkup() {
   return `<dialog class="workspace-mode-dialog" id="workspaceModeDialog" aria-labelledby="workspaceModeChoiceTitle" aria-describedby="workspaceModeChoiceDescription">
     <div class="workspace-mode-dialog-header"><p class="eyebrow">Welcome to PM OS</p><h2 id="workspaceModeChoiceTitle">How would you like to start?</h2><p id="workspaceModeChoiceDescription">Start a real workspace with no records, or explore PM OS using clearly identified sample data. You can switch anytime in Settings.</p></div>
     <div class="workspace-mode-options">
-      <button class="workspace-mode-option is-recommended" id="chooseOperationModeButton" type="button" autofocus><span class="workspace-mode-option-label">Recommended</span><strong>Start with an empty workspace</strong><span>Create your first real initiative in a blank operational workspace. Saved Browser, Drive, and Team workspaces remain available.</span><span class="workspace-mode-option-action">Start working <span aria-hidden="true">&rarr;</span></span></button>
-      <button class="workspace-mode-option" id="chooseDemoModeButton" type="button"><span class="workspace-mode-option-label">Sample workspace</span><strong>Explore with sample data</strong><span>Use ready-made examples in a visibly marked demo. Demo changes stay temporary and never touch operational data.</span><span class="workspace-mode-option-action">Explore demo <span aria-hidden="true">&rarr;</span></span></button>
+      <button class="workspace-mode-option is-recommended" id="chooseOperationModeButton" type="button" autofocus><span class="workspace-mode-option-label">Recommended</span><strong>Start with an empty workspace</strong><span>Create your first real initiative in a blank workspace. Saved Browser, Drive, and Team workspaces remain available.</span><span class="workspace-mode-option-action">Start working <span aria-hidden="true">&rarr;</span></span></button>
+      <button class="workspace-mode-option" id="chooseDemoModeButton" type="button"><span class="workspace-mode-option-label">Sample workspace</span><strong>Explore with sample data</strong><span>Use ready-made examples in a visibly marked demo. Demo changes stay temporary and never touch saved work.</span><span class="workspace-mode-option-action">Explore demo <span aria-hidden="true">&rarr;</span></span></button>
     </div>
     <p class="workspace-mode-dialog-note">This choice is stored only in this browser.</p>
   </dialog>`;
@@ -2316,13 +3119,13 @@ function initialStorageChoiceMarkup() {
   if (!state.storageChoiceOpen) return "";
   const supported = linkedFileSupported();
   return `<dialog class="workspace-mode-dialog" id="initialStorageDialog" aria-labelledby="initialStorageTitle" aria-describedby="initialStorageDescription initialStorageStatus">
-    <div class="workspace-mode-dialog-header"><p class="eyebrow">Your workspace</p><h2 id="initialStorageTitle">Where should PM OS save?</h2><p id="initialStorageDescription">Create a portable workspace file, open one you already have, or keep your workspace private in this browser. You can change this later in Settings.</p></div>
+    <div class="workspace-mode-dialog-header"><p class="eyebrow">Your workspace</p><h2 id="initialStorageTitle">Where should PM OS save?</h2><p id="initialStorageDescription">${supported ? "Create a portable workspace file, open one you already have, or keep your workspace private in this browser." : "Keep your workspace private in this browser and export a portable JSON backup whenever you need one."} You can change this later in Settings.</p></div>
     <div class="workspace-mode-options storage-mode-options">
       ${supported ? `<button class="workspace-mode-option is-recommended" id="initialCreateWorkspaceFileButton" type="button" autofocus><span class="workspace-mode-option-label">Recommended</span><strong>Create a workspace file</strong><span>Choose a location for a new pm-os-workspace.json file. PM OS will link it and autosave future changes.</span><span class="workspace-mode-option-action">Create file <span aria-hidden="true">&rarr;</span></span></button>
       <button class="workspace-mode-option" id="initialOpenWorkspaceFileButton" type="button"><span class="workspace-mode-option-label">Existing workspace</span><strong>Open an existing file</strong><span>Load and link a PM OS workspace JSON file. Your current browser workspace is backed up before it is replaced.</span><span class="workspace-mode-option-action">Open file <span aria-hidden="true">&rarr;</span></span></button>` : ""}
-      <button class="workspace-mode-option ${supported ? "" : "is-recommended"}" id="initialUseBrowserStorageButton" type="button" ${supported ? "" : "autofocus"}><span class="workspace-mode-option-label">${supported ? "No file needed" : "Available here"}</span><strong>Keep saving in this browser</strong><span>Changes save immediately on this device. You can export JSON or create a linked file later.</span><span class="workspace-mode-option-action">Use browser storage <span aria-hidden="true">&rarr;</span></span></button>
+      <button class="workspace-mode-option ${supported ? "" : "is-recommended"}" id="initialUseBrowserStorageButton" type="button" ${supported ? "" : "autofocus"}><span class="workspace-mode-option-label">${supported ? "No file needed" : "Available here"}</span><strong>Keep saving in this browser</strong><span>Changes save immediately on this device. ${supported ? "You can export JSON or create a linked file later." : "You can export a portable JSON backup from Data at any time."}</span><span class="workspace-mode-option-action">Use browser storage <span aria-hidden="true">&rarr;</span></span></button>
     </div>
-    ${supported ? "" : `<p class="workspace-mode-dialog-note">Creating and linking files requires Chromium's File System Access API, which is unavailable in this browser.</p>`}
+    ${supported ? "" : `<p class="workspace-mode-dialog-note">Linked-file autosave requires a Chromium browser and is unavailable in this browser.</p>`}
     <p class="workspace-mode-dialog-note" id="initialStorageStatus" tabindex="-1" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.storageChoiceStatus)}</p>
   </dialog>`;
 }
@@ -2334,15 +3137,15 @@ function demoConversionDialogMarkup() {
   const selection = new Set(state.demoConversionSelection);
   let body;
   if (saved.corrupted) {
-    body = `<p class="demo-conversion-warning" role="alert">Your saved operational workspace cannot be read. Return to operation mode to download the unreadable data, import a backup, or deliberately clear it. PM OS will not overwrite it from the demo.</p><div class="confirmation-actions"><button class="secondary" id="cancelDemoConversionButton" type="button">Cancel</button><button class="primary" id="returnToOperationWorkspaceButton" type="button">Return to operation mode</button></div>`;
+    body = `<p class="demo-conversion-warning" role="alert">Your saved workspace cannot be read. Return to my workspace to download the unreadable data, import a backup, or deliberately clear it. PM OS will not overwrite it from the demo.</p><div class="confirmation-actions"><button class="secondary" id="cancelDemoConversionButton" type="button">Cancel</button><button class="primary" id="returnToOperationWorkspaceButton" type="button">Return to my workspace</button></div>`;
   } else if (hasSavedWorkspace) {
-    body = `<p>Your operational workspace is already saved. Returning to it will leave these demo samples behind and preserve your workspace exactly.</p><div class="confirmation-actions"><button class="secondary" id="cancelDemoConversionButton" type="button">Cancel</button><button class="primary" id="returnToOperationWorkspaceButton" type="button">Return to my workspace</button></div>`;
+    body = `<p>Your workspace is already saved. Returning to it will leave these demo samples behind and preserve your workspace exactly.</p><div class="confirmation-actions"><button class="secondary" id="cancelDemoConversionButton" type="button">Cancel</button><button class="primary" id="returnToOperationWorkspaceButton" type="button">Return to my workspace</button></div>`;
   } else {
     body = `<p>Start clean, or copy only the example initiatives you want. Demo customers, insights, organization records, workflow settings, and prioritization settings are never copied.</p>
       <fieldset class="demo-conversion-list"><legend>Example initiatives to copy</legend>${demoWorkspace.items.map((item) => `<label><input type="checkbox" data-demo-conversion-item="${escapeHtml(item.id)}" ${selection.has(item.id) ? "checked" : ""}><span>${escapeHtml(item.title)}</span></label>`).join("")}</fieldset>
       <div class="confirmation-actions"><button class="secondary" id="cancelDemoConversionButton" type="button">Cancel</button><button class="secondary" id="startEmptyOperationButton" type="button">Start empty workspace</button><button class="primary" id="copyDemoExamplesButton" type="button" ${selection.size ? "" : "disabled"}>Copy selected examples</button></div>`;
   }
-  return `<dialog class="workspace-mode-dialog demo-conversion-dialog" id="demoConversionDialog" aria-labelledby="demoConversionTitle" aria-describedby="demoConversionDescription"><div class="workspace-mode-dialog-header"><p class="eyebrow">Demo workspace</p><h2 id="demoConversionTitle">Convert demo to my workspace</h2><p id="demoConversionDescription">Demo data is separate from operational data. Choose what your new operational workspace should contain.</p></div><div class="demo-conversion-body">${body}</div></dialog>`;
+  return `<dialog class="workspace-mode-dialog demo-conversion-dialog" id="demoConversionDialog" aria-labelledby="demoConversionTitle" aria-describedby="demoConversionDescription"><div class="workspace-mode-dialog-header"><p class="eyebrow">Demo workspace</p><h2 id="demoConversionTitle">Convert demo to my workspace</h2><p id="demoConversionDescription">Demo data is separate from saved work. Choose what your new workspace should contain.</p></div><div class="demo-conversion-body">${body}</div></dialog>`;
 }
 
 function loadWorkspaceModePreference() {
@@ -2425,11 +3228,11 @@ async function changeWorkspaceMode(event) {
 async function requestWorkspaceModeChange(nextMode, trigger) {
   if ((nextMode === "demo") === demoMode) return;
   const confirmed = await requestDataConfirmation({
-    title: nextMode === "demo" ? "Switch to demo mode?" : "Switch to operation mode?",
+    title: nextMode === "demo" ? "Switch to demo mode?" : "Return to my workspace?",
     description: nextMode === "demo"
-      ? "PM OS will reload with sample data. Your operational workspace stays saved and unchanged; any connected Team session will close."
-      : "PM OS will reload your saved operational workspace. Changes made in this demo session are temporary and will be cleared.",
-    confirmLabel: nextMode === "demo" ? "Open Demo" : "Open Operation Mode",
+      ? "PM OS will reload with sample data. Your workspace stays saved and unchanged; any connected Team session will close."
+      : "PM OS will reload your saved workspace. Changes made in this demo session are temporary and will be cleared.",
+    confirmLabel: nextMode === "demo" ? "Open Demo" : "Open my workspace",
     trigger
   });
   if (confirmed) {
@@ -2477,13 +3280,14 @@ function copyDemoInitiativeForOperation(item) {
   });
 }
 
-function createOperationalWorkspaceFromDemo(copyExamples) {
+async function createOperationalWorkspaceFromDemo(copyExamples) {
   const emptyWorkspace = createEmptyWorkspaceDocument();
   const items = copyExamples
     ? demoWorkspace.items.filter((item) => state.demoConversionSelection.includes(item.id)).map(copyDemoInitiativeForOperation)
     : [];
-  const payload = exportPortableWorkspace(items, [], emptyWorkspace.organization, emptyWorkspace.customerDirectory, emptyWorkspace.planningCalendar, emptyWorkspace.workflow, emptyWorkspace.prioritization, [], [], [], emptyWorkspace.experience);
-  runStorageTransaction(localStorage, [storageKey, activityKey, syncKey], () => {
+  const records = migrateLegacyWorkRecords(items);
+  const payload = exportPortableWorkspace(items, [], emptyWorkspace.organization, emptyWorkspace.customerDirectory, emptyWorkspace.planningCalendar, emptyWorkspace.workflow, emptyWorkspace.prioritization, records, [], [], emptyWorkspace.experience, []);
+  await runLocalStorageTransaction([storageKey, activityKey, syncKey], () => {
     localStorage.setItem(storageKey, payload);
     localStorage.setItem(activityKey, JSON.stringify({ activity: [] }));
     localStorage.setItem(syncKey, JSON.stringify(defaultSyncState()));
@@ -2504,8 +3308,8 @@ function bindWorkspaceModeEvents() {
   document.querySelector("#convertDemoWorkspaceButton")?.addEventListener("click", openDemoConversion);
   document.querySelector("#cancelDemoConversionButton")?.addEventListener("click", closeDemoConversion);
   document.querySelector("#returnToOperationWorkspaceButton")?.addEventListener("click", () => navigateToWorkspaceMode("operation"));
-  document.querySelector("#startEmptyOperationButton")?.addEventListener("click", () => createOperationalWorkspaceFromDemo(false));
-  document.querySelector("#copyDemoExamplesButton")?.addEventListener("click", () => createOperationalWorkspaceFromDemo(true));
+  document.querySelector("#startEmptyOperationButton")?.addEventListener("click", async () => createOperationalWorkspaceFromDemo(false));
+  document.querySelector("#copyDemoExamplesButton")?.addEventListener("click", async () => createOperationalWorkspaceFromDemo(true));
   document.querySelectorAll("[data-demo-conversion-item]").forEach((input) => input.addEventListener("change", captureDemoConversionSelection));
   const conversionDialog = document.querySelector("#demoConversionDialog");
   conversionDialog?.addEventListener("cancel", (event) => { event.preventDefault(); closeDemoConversion(); });
@@ -2884,14 +3688,14 @@ function teamSourceMarkup() {
   const team = state.team;
   const disabled = state.dataBusy ? "disabled" : "";
   const localServer = state.sourceSelection === "local-server";
-  if (team.mode === "loading") return `<div class="team-setup" role="status"><strong>Loading Team workspace...</strong><p>Browser memory stays active while Team setup loads.</p></div>`;
+  if (team.mode === "loading") return `<div class="team-setup" role="status"><strong>Loading Team workspace...</strong><p>Your work on this device stays active while Team setup loads.</p></div>`;
   if (team.mode === "unavailable") return `<div class="team-setup team-error" role="alert"><strong>Team workspace is unavailable in this build.</strong><p>${escapeHtml(team.status)}</p><button class="secondary" id="retryTeamLoadButton" ${disabled} type="button">Try again</button></div>`;
   if (team.mode === "choose-setup") {
     const managed = team.managedConfig;
-    return `<div class="team-setup"><p>Browser memory stays active until a server workspace opens successfully.</p><div class="team-deployment-note"><strong>${localServer ? "Run your PM OS Local Server" : "Connect an existing Supabase backend"}</strong><p>${localServer ? "From this repository, run npm run local:prepare and npm run local:up. Refresh PM OS after the health check passes." : "Use Supabase Cloud or a self-hosted Supabase stack. PM OS never asks for a secret or service-role key."}</p><a class="team-guide-link" href="${localServer ? "deploy/local/index.html" : "deploy/self-host/index.html"}" target="_blank" rel="noreferrer">${localServer ? "Open local server guide" : "Self-host PM OS and Supabase"}</a></div><div class="team-actions">${managed ? `<button class="primary" id="teamManagedButton" ${disabled} type="button">Sign in to ${escapeHtml(managed.label)}</button>` : ""}<button class="${managed ? "secondary" : "primary"}" id="teamByoButton" ${disabled} type="button">${localServer ? "Connect local endpoint" : "Connect Supabase Cloud or self-hosted"}</button><button class="secondary" id="cancelTeamSetupButton" ${disabled} type="button">Cancel</button></div></div>${teamStatusMarkup()}`;
+    return `<div class="team-setup"><p>Your work on this device stays active until a server workspace opens successfully.</p>${managed ? `<p><strong>${escapeHtml(managed.label)}</strong> is configured for your team. Sign in with your account to open your shared work.</p><details><summary>Connect a different server</summary>` : ""}<div class="team-deployment-note"><strong>${localServer ? "Run your PM OS Local Server" : "Connect your Team server"}</strong><p>${localServer ? "From this repository, run npm run local:prepare and npm run local:up. Refresh PM OS after the health check passes." : "Supabase provides Team sign-in and shared storage. Ask your administrator for the server address and public connection key."}</p><a class="team-guide-link" href="${localServer ? "deploy/local/index.html" : "deploy/self-host/index.html"}" target="_blank" rel="noreferrer">${localServer ? "Open local server guide" : "Self-host PM OS and Supabase"}</a></div>${managed ? "</details>" : ""}<div class="team-actions">${managed ? `<button class="primary" id="teamManagedButton" ${disabled} type="button">Sign in to ${escapeHtml(managed.label)}</button>` : ""}<button class="${managed ? "secondary" : "primary"}" id="teamByoButton" ${disabled} type="button">${localServer ? "Connect local server" : "Enter server details"}</button><button class="secondary" id="cancelTeamSetupButton" ${disabled} type="button">Cancel</button></div></div>${teamStatusMarkup()}`;
   }
-  if (team.mode === "byo") return `<form class="team-form" id="teamSetupForm"><p class="team-endpoint-hint" id="teamEndpointHelp">${localServer ? "Use http://127.0.0.1 only for a personal local server. LAN servers require HTTPS." : "Use the HTTPS API URL from Supabase Cloud or your self-hosted stack. Remote public settings stay only in memory."}</p><label><span>Supabase API URL</span><input id="teamProjectUrl" name="url" type="url" inputmode="url" autocomplete="off" aria-describedby="teamEndpointHelp" placeholder="${localServer ? "http://127.0.0.1:4173" : "https://api.example.com"}" ${disabled} required></label><label><span>Publishable or anon key</span><input id="teamPublishableKey" name="publishableKey" type="password" autocomplete="off" aria-describedby="teamKeyHelp" ${disabled} required></label><p class="team-endpoint-hint" id="teamKeyHelp">Use only a browser-safe publishable or legacy anon key. Secret and service-role keys are rejected.</p><div class="team-actions"><button class="primary" id="checkTeamSetupButton" ${disabled} type="submit">Run diagnostics</button><button class="secondary" id="cancelTeamSetupButton" ${disabled} type="button">Cancel</button></div><a class="team-guide-link" href="${localServer ? "deploy/local/index.html" : "deploy/self-host/index.html"}" target="_blank" rel="noreferrer">Open the ${localServer ? "local server" : "self-hosting"} guide</a></form>${teamStatusMarkup()}`;
-  if (team.mode === "signed-out" && team.authMode === "password") return `<form class="team-form" id="teamPasswordForm"><p class="team-hint">Use a local password account. Email confirmation is automatic only in local and LAN profiles.</p><label><span>Email</span><input id="teamEmail" name="email" type="email" autocomplete="username" value="${escapeHtml(team.email)}" ${disabled} required></label><label><span>Password</span><input id="teamPassword" name="password" type="password" minlength="8" maxlength="128" autocomplete="current-password" ${disabled} required></label><div class="team-actions"><button class="primary" name="authAction" value="sign-in" ${disabled} type="submit">Sign in</button><button class="secondary" name="authAction" value="create" ${disabled} type="submit">Create local account</button><button class="secondary" id="changeTeamProjectButton" ${disabled} type="button">Change server</button></div></form>${teamStatusMarkup()}`;
+  if (team.mode === "byo") return `<form class="team-form" id="teamSetupForm"><p class="team-endpoint-hint" id="teamEndpointHelp">${localServer ? "Use http://127.0.0.1 only for a personal local server. LAN servers require HTTPS." : "Enter the server address supplied by your administrator (the Supabase API URL). It must start with https://. Choose the sign-in method supported by your account."}</p><label><span>Supabase API URL</span><input id="teamProjectUrl" name="url" type="url" inputmode="url" autocomplete="off" aria-describedby="teamEndpointHelp" placeholder="${localServer ? "http://127.0.0.1:4173" : "https://api.example.com"}" ${disabled} required></label><label><span>Publishable or anon key</span><input id="teamPublishableKey" name="publishableKey" type="password" autocomplete="off" aria-describedby="teamKeyHelp" ${disabled} required></label><p class="team-endpoint-hint" id="teamKeyHelp">This public connection key identifies your Team server; signing in determines your access. Ask your administrator for the Supabase publishable or legacy anon key. Secret and service-role keys are rejected.</p>${localServer ? "" : `<label><span>Sign-in method</span><select id="teamAuthMode" name="authMode" aria-describedby="teamAuthHelp" ${disabled}><option value="otp" ${team.authMode !== "password" ? "selected" : ""}>Email code</option><option value="password" ${team.authMode === "password" ? "selected" : ""}>Password</option></select></label><p class="team-endpoint-hint" id="teamAuthHelp">Choose Email code if your server sends a numeric sign-in code, or Password if your account already has one.</p>`}<div class="team-actions"><button class="primary" id="checkTeamSetupButton" ${disabled} type="submit">Run diagnostics</button><button class="secondary" id="cancelTeamSetupButton" ${disabled} type="button">Cancel</button></div><a class="team-guide-link" href="${localServer ? "deploy/local/index.html" : "deploy/self-host/index.html"}" target="_blank" rel="noreferrer">Open the ${localServer ? "local server" : "self-hosting"} guide</a></form>${teamStatusMarkup()}`;
+  if (team.mode === "signed-out" && team.authMode === "password") return `<form class="team-form" id="teamPasswordForm"><p class="team-hint">${team.backendMode === "remote" ? "Sign in with your existing server account." : "Use a local password account. Email confirmation is automatic only in local and LAN profiles."}</p><label><span>Email</span><input id="teamEmail" name="email" type="email" autocomplete="username" value="${escapeHtml(team.email)}" ${disabled} required></label><label><span>Password</span><input id="teamPassword" name="password" type="password" minlength="8" maxlength="128" autocomplete="current-password" ${disabled} required></label><div class="team-actions"><button class="primary" name="authAction" value="sign-in" ${disabled} type="submit">Sign in</button>${team.backendMode === "remote" ? "" : `<button class="secondary" name="authAction" value="create" ${disabled} type="submit">Create local account</button>`}<button class="secondary" id="changeTeamProjectButton" ${disabled} type="button">Change server</button></div></form>${teamStatusMarkup()}`;
   if (team.mode === "signed-out") return `<form class="team-form" id="teamEmailForm"><label><span>Email</span><input id="teamEmail" name="email" type="email" autocomplete="email" value="${escapeHtml(team.email)}" ${disabled} required></label><div class="team-actions"><button class="primary" id="sendTeamCodeButton" ${disabled} type="submit">Send code</button><button class="secondary" id="changeTeamProjectButton" ${disabled} type="button">Change project</button></div></form>${teamStatusMarkup()}`;
   if (team.mode === "code-sent") return `<form class="team-form" id="teamCodeForm"><p class="team-hint">Enter the six-digit code sent to ${escapeHtml(team.email)}.</p><label><span>Sign-in code</span><input id="teamCode" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" ${disabled} required></label><div class="team-actions"><button class="primary" id="verifyTeamCodeButton" ${disabled} type="submit">Verify</button><button class="secondary" id="resendTeamCodeButton" ${disabled} type="button">Resend code</button><button class="secondary" id="changeTeamEmailButton" ${disabled} type="button">Change email</button></div></form>${teamStatusMarkup()}`;
   if (team.mode === "workspaces") return `${teamWorkspaceChooserMarkup()}${teamStatusMarkup()}`;
@@ -2938,13 +3742,26 @@ function teamMembersMarkup() {
     const controls = owner && !self ? `<div class="team-member-actions"><label><span class="sr-only">Role for ${escapeHtml(member.displayName)}</span><select data-team-member-role="${escapeHtml(member.userId)}" ${disabled}><option value="viewer" ${member.role === "viewer" ? "selected" : ""}>Viewer</option><option value="editor" ${member.role === "editor" ? "selected" : ""}>Editor</option><option value="owner" ${member.role === "owner" ? "selected" : ""}>Owner</option></select></label><button class="danger" data-remove-team-member="${escapeHtml(member.userId)}" ${disabled} type="button">Remove</button></div>` : "";
     return `<li class="team-member-row"><div><strong>${escapeHtml(member.displayName)}</strong><span>${escapeHtml(member.role)}${self ? " | You" : ""}</span></div>${controls}</li>`;
   }).join("") || `<li class="empty">No members are available.</li>`;
-  const invite = owner ? `<form class="team-inline-form team-invite-form" id="createTeamInviteForm"><label><span>Invite role</span><select id="teamInviteRole" name="role" ${disabled}><option value="editor">Editor</option><option value="viewer">Viewer</option></select></label><button class="secondary" ${disabled} type="submit">Create invite code</button></form>` : "";
+  const invitationRows = state.team.invitations.map(invitation => {
+    const closed = invitation.acceptedAt || invitation.revokedAt;
+    return `<li class="team-member-row"><div><strong>${escapeHtml(invitation.email)}</strong><span>${escapeHtml(invitation.role)} · ${escapeHtml(invitationDeliveryLabel(invitation))}</span></div>${closed ? "" : `<div class="team-member-actions"><button class="secondary" data-resend-team-invite="${escapeHtml(invitation.id)}" ${disabled} type="button">Resend email</button><button class="danger" data-revoke-team-invite="${escapeHtml(invitation.id)}" ${disabled} type="button">Revoke</button></div>`}</li>`;
+  }).join("");
+  const invite = owner ? state.team.capabilities?.emailInvitations ? `<form class="team-inline-form team-invite-form" id="createTeamInviteForm"><label><span>Colleague’s email</span><input name="email" id="teamInviteEmail" type="email" autocomplete="off" value="${escapeHtml(state.team.inviteEmail)}" ${disabled} required></label><label><span>Invite role</span><select id="teamInviteRole" name="role" ${disabled}><option value="viewer">Viewer — can view work</option><option value="editor">Editor — can edit work</option></select></label><button class="secondary" ${disabled} type="submit">Send invitation</button></form><p>Only the recipient can join. Email links expire after 72 hours.</p><button class="secondary" id="refreshTeamInvitesButton" ${disabled} type="button">Refresh invitations</button><ul class="team-member-list" aria-label="Invitations">${invitationRows}</ul>` : '<p>Email invitations require the latest Team server setup. Ask your administrator to update this server.</p>' : "";
   return `<section class="panel data-panel team-members-panel" aria-labelledby="teamMembersTitle"><div class="panel-header"><h3 id="teamMembersTitle">Team Members</h3><span class="muted">${state.team.members.length} members | ${escapeHtml(state.team.role)}</span></div><ul class="team-member-list">${rows}</ul>${invite}</section>`;
 }
 
+function invitationDeliveryLabel(invitation) {
+  if (invitation.acceptedAt) return "Accepted";
+  if (invitation.revokedAt) return "Revoked";
+  if (new Date(invitation.expiresAt).getTime() <= Date.now()) return "Expired";
+  return ({ sent: "Email submitted", failed: "Email not sent", pending: "Delivery pending", unknown: "Delivery unconfirmed" })[invitation.deliveryState] || "Delivery unconfirmed";
+}
+
 function teamInviteDialogMarkup() {
-  if (!state.team.invite) return "";
-  return `<dialog class="confirmation-dialog team-invite-dialog" id="teamInviteDialog" aria-labelledby="teamInviteTitle"><form method="dialog"><h3 id="teamInviteTitle">Invite code created</h3><p>This one-use ${escapeHtml(state.team.invite.role)} code expires ${escapeHtml(formatSyncTime(state.team.invite.expiresAt))}.</p><output id="teamInviteCode">${escapeHtml(state.team.invite.code)}</output><div class="confirmation-actions"><button class="secondary" id="copyTeamInviteButton" type="button">Copy code</button><button class="primary" id="closeTeamInviteButton" value="close">Close</button></div></form></dialog>`;
+  const invitation = state.team.invite;
+  if (!invitation) return "";
+  const submitted = invitation.deliveryState === "sent";
+  return `<dialog class="confirmation-dialog team-invite-dialog" id="teamInviteDialog" aria-labelledby="teamInviteTitle"><form method="dialog"><h3 id="teamInviteTitle">${escapeHtml(invitationDeliveryLabel(invitation))}</h3><p>${escapeHtml(invitation.email)} · ${escapeHtml(invitation.role)}</p><p>${submitted ? "The email service accepted the invitation. Ask your colleague to open the link and choose Join workspace. Check spam if it does not arrive." : "The email has not been confirmed sent. Close this message to refresh, resend or revoke the invitation."}</p><p>Expires ${escapeHtml(formatSyncTime(invitation.expiresAt))}.</p><div class="confirmation-actions"><button class="primary" id="closeTeamInviteButton" value="close">Close</button></div></form></dialog>`;
 }
 
 function recoverySnapshotRow(snapshot, index) {
@@ -2958,9 +3775,9 @@ function recoverySnapshotRow(snapshot, index) {
 
 function driveConflictStatus(kind) {
   kind = typeof kind === "string" ? kind : kind?.kind;
-  if (kind === "deleted") return "The canonical Drive file was deleted after the last pull or push. Pull Remote before writing again.";
-  if (kind === "mismatch") return "The canonical Drive file changed after the last pull or push. Pull Remote or preserve this browser workspace as a conflict copy.";
-  return "This Drive file has no trusted local baseline or its metadata is incomplete. Pull Remote before writing to the canonical file.";
+  if (kind === "deleted") return "The Drive workspace file was deleted since your last sync. Save your work as a separate copy, then choose an existing Drive file or create a new project.";
+  if (kind === "mismatch") return "The Drive file changed since your last sync. Download the Drive copy or save this device's work as a separate conflict copy before continuing.";
+  return "PM OS cannot compare this device's copy with the Drive file yet. Download the Drive copy before uploading changes.";
 }
 
 function itemCard(item) {
@@ -2988,9 +3805,59 @@ function validationCard(entry, options = {}) {
 function supportCard(entry) { return `<article class="support-card ${entry.status === "Critical" ? "critical" : entry.status === "Watch" ? "watch" : ""}"><span>${escapeHtml(entry.status)} | severity ${entry.severity} | ${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.response)}</p><small>${escapeHtml(entry.segment)} | ${escapeHtml(entry.followUp)}</small></article>`; }
 function escalationCard(entry, context) { return `<article class="escalation-card ${entry.status.toLowerCase()}"><span>${escapeHtml(entry.status)} | severity ${entry.severity} | ${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.ask)}</p><small>${escapeHtml(entry.segment)} | ${escapeHtml(entry.dueDate)}</small>${initiativeReferenceActions(entry.item, `escalation-${context}`, "risks", entry.recordId, "View risk")}</article>`; }
 function deliveryCard(entry, context) { return `<article class="delivery-card ${entry.state.toLowerCase().replace(" ", "-")}"><span>${escapeHtml(entry.state)} | ${entry.readiness}% | ${escapeHtml(entry.dueDate)}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.nextStep)}</p><small>${escapeHtml(entry.owner)} | ${escapeHtml(entry.milestone)}</small>${initiativeReferenceActions(entry.item, `delivery-${context}`)}</article>`; }
-function rolloutCard(entry, context) { return `<article class="rollout-card ${entry.status.toLowerCase()}"><span>${escapeHtml(entry.status)} | ${entry.readiness}% | ${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.stage)} to ${escapeHtml(entry.audience)}</p><small>${escapeHtml(entry.nextStep)}</small>${initiativeReferenceActions(entry.item, `rollout-${context}`)}</article>`; }
-function enablementCard(entry, context) { return `<article class="enablement-card ${entry.status === "Blocked" ? "warning" : ""}"><span>${escapeHtml(entry.status)} | ${entry.readiness}% | ${escapeHtml(entry.launchDate)}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.handoff)}</p><small>${entry.checks.filter((check) => check.done).length}/${entry.checks.length} checks ready</small>${initiativeReferenceActions(entry.item, `enablement-${context}`)}</article>`; }
-function metricPlanCard(entry, context) { return `<article class="metric-plan-card ${entry.status === "Tracked" ? "" : "warning"}"><span>${escapeHtml(entry.status)} | ${escapeHtml(entry.reviewDate)}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.primaryMetric)}</p><small>${escapeHtml(entry.leadingIndicator)}</small>${initiativeReferenceActions(entry.item, `metric-${context}`)}</article>`; }
+function rolloutCard(entry, context) { return `<article class="rollout-card ${entry.status.toLowerCase()}"><span>${escapeHtml(entry.status)} | ${entry.readiness}% | ${escapeHtml(entry.owner)}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.stage)}</p><p>${escapeHtml(entry.audience)}</p><small>${escapeHtml(entry.nextStep)}</small>${initiativeReferenceActions(entry.item, `rollout-${context}`)}</article>`; }
+function enablementCard(entry, context) { return `<article class="enablement-card ${entry.gaps.length ? "warning" : ""}"><span>${escapeHtml(entry.status)} | ${entry.readiness}% | ${escapeHtml(entry.launchDate)}</span><h4>${escapeHtml(entry.item.title)}</h4><p>${escapeHtml(entry.handoff)}</p><small>${entry.checks.filter((check) => check.done).length}/${entry.checks.length} areas recorded complete</small>${initiativeReferenceActions(entry.item, `enablement-${context}`)}</article>`; }
+function retrospectiveFollowUpCard(entry) {
+  const item = state.items.find((candidate) => candidate.id === entry.itemId);
+  if (!item) return "";
+  return `<article class="retro-card" data-retro-follow-up="${escapeHtml(item.id)}"><h4>${escapeHtml(entry.title)}</h4><p>${escapeHtml(entry.action)}</p>${workflowRecommendationControls(item, `retro-follow-up-${item.id}`, entry.targets)}</article>`;
+}
+function workflowRecommendationControls(item, context, actions = [], blockers = []) {
+  const recordActions = blockers.map((blocker) => ({ section: "dependencies", recordId: blocker.record.id, label: `Review dependency: ${blocker.record.description}` }));
+  return `<div class="contextual-card-actions workflow-recommendation-controls">${initiativeDetailButton(item, context)}${[...actions, ...recordActions].map((action, index) => action.section
+    ? initiativeDetailButton(item, `${context}-${index}`, action.label, action.section, action.recordId)
+    : initiativeContextualEditButton(item, `${context}-${action.field}`, action.field, action.label)).join("")}</div>`;
+}
+function operationsRecommendationCard(action) {
+  const item = state.items.find((candidate) => candidate.id === action.itemId);
+  if (!item) return "";
+  return `<article class="operations-recommendation" data-operations-item="${escapeHtml(item.id)}" data-operations-field="${escapeHtml(action.field)}"><p>${escapeHtml(action.text)}</p>${workflowRecommendationControls(item, `operations-${item.id}-${action.field}`, [action])}</article>`;
+}
+function metricGapCard(entry) {
+  const context = `metric-gap-${entry.item.id}`;
+  return `<article class="metric-plan-card warning" data-metric-gap-item="${escapeHtml(entry.item.id)}">
+    <h4>${escapeHtml(entry.item.title)}</h4>
+    <p>${escapeHtml(entry.instrumentation)}</p>
+    <ul class="measurement-gap-actions">${entry.gapActions.map((action) => `<li data-metric-gap-field="${escapeHtml(action.field)}"><p>${escapeHtml(action.description)}</p>${initiativeContextualEditButton(entry.item, `${context}-${action.field}`, action.field, action.label)}</li>`).join("")}</ul>
+    ${initiativeReferenceActions(entry.item, context)}
+  </article>`;
+}
+function metricPlanCard(entry, context) {
+  const evidence = entry.measurementEvidence || [];
+  const linkedEvidence = evidence.map(record => {
+    const source = record.sourceAvailability === "available" && state.insightRecords.find(candidate => candidate.id === record.recordId && candidate.initiativeId === entry.item.id);
+    return `<article class="review-card" data-measurement-evidence="${escapeHtml(record.recordId)}">
+      <h5>${escapeHtml(record.title)}</h5><p>${escapeHtml(INSIGHT_STATUS_LABELS[record.status] || record.status)}</p>
+      ${record.successMetric ? `<p>Experiment success metric: ${escapeHtml(record.successMetric)}</p>` : ""}
+      ${record.result ? `<p>Reported result: ${escapeHtml(record.result)}</p>` : ""}
+      ${record.learning ? `<p>Learning context: ${escapeHtml(record.learning)}</p>` : ""}
+      ${source ? insightRecordLink(source, `metric-evidence-${entry.item.id}`) : "<p>Source record is unavailable in this workspace.</p>"}
+    </article>`;
+  }).join("");
+  return `<article class="metric-plan-card ${entry.status === "Saved measure" ? "" : "warning"}" data-metric-plan-item="${escapeHtml(entry.item.id)}">
+    <span>${escapeHtml(entry.status)} · ${entry.reviewDate ? `Review ${escapeHtml(entry.reviewDate)}` : "Review date not recorded"}</span>
+    <h4>${escapeHtml(entry.item.title)}</h4>
+    <p>${entry.origin === "captured" ? "Saved primary metric" : "Suggested primary metric"}: ${escapeHtml(entry.primaryMetric)}</p>
+    <p>${entry.metricTarget ? `Authored target: ${escapeHtml(entry.metricTarget)}` : "Target not recorded."}</p>
+    <p>Instrumentation is unverified. Achievement has not been assessed.</p>
+    <small>${escapeHtml(entry.leadingIndicator)}</small>
+    ${evidence.length ? `<details class="metric-linked-evidence"><summary>Linked evidence (${evidence.length})</summary>
+      <p>These records support review. They do not change the saved primary metric or verify telemetry or achievement.</p>
+      ${(entry.evidenceReviewReasons || []).map(reason => `<p>${escapeHtml(reason)}</p>`).join("")}
+      ${linkedEvidence}</details>` : "<p>No linked measurement evidence recorded.</p>"}
+    ${initiativeReferenceActions(entry.item, `metric-${context}`)}
+  </article>`;
+}
 function groupActionQueueEntries(entries) {
   const groups = new Map();
   entries.forEach((entry, index) => {
@@ -3020,9 +3887,10 @@ function actionIssueLabel(entry) {
 }
 function actionQueueGroupCard(group, groupIndex) {
   const count = group.actions.length;
+  const countLabel = group.totalCount > count ? `${count} of ${actionCountLabel(group.totalCount)} shown` : `${actionCountLabel(count)} needed`;
   const context = `actions-group-${groupIndex}-${group.item.id}`;
   const headingId = `actionGroupTitle-${elementIdToken(group.item.id)}`;
-  return `<article class="action-card action-initiative-card" data-item-id="${escapeHtml(group.item.id)}" aria-labelledby="${headingId}"><header class="action-initiative-header"><div class="action-initiative-heading"><span>${escapeHtml(actionCountLabel(count))} needed · ${escapeHtml(workspacePriorityLabel())} ${escapeHtml(workspacePriorityValue(group.item))}</span><h4 id="${headingId}">${escapeHtml(group.item.title)}</h4></div><div class="action-initiative-tools"><span class="action-urgency" aria-label="Highest urgency ${group.priority}">Urgency ${group.priority}</span>${initiativeDetailButton(group.item, context)}</div></header><div class="action-gap-list">${group.actions.map(actionQueueRow).join("")}</div></article>`;
+  return `<article class="action-card action-initiative-card" data-item-id="${escapeHtml(group.item.id)}" aria-labelledby="${headingId}"><header class="action-initiative-header"><div class="action-initiative-heading"><span>${escapeHtml(countLabel)} · ${escapeHtml(workspacePriorityLabel())} ${escapeHtml(workspacePriorityValue(group.item))}</span><h4 id="${headingId}">${escapeHtml(group.item.title)}</h4></div><div class="action-initiative-tools"><span class="action-urgency" aria-label="Highest urgency ${group.priority}">Urgency ${group.priority}</span>${initiativeDetailButton(group.item, context)}</div></header><div class="action-gap-list">${group.actions.map(actionQueueRow).join("")}</div></article>`;
 }
 function actionQueueRow({ entry, index }) {
   const context = `actions-${index}`;
@@ -3040,6 +3908,18 @@ function decisionCard(item, index) {
   const actionLabel = item.decision ? "Edit decision" : "Record decision";
   return `<article class="decision" data-item-id="${escapeHtml(item.id)}"><div><h4>${escapeHtml(item.title)}</h4><p>${escapeHtml(item.problem || "No problem statement yet.")}</p><div class="contextual-card-actions">${initiativeDetailButton(item, context)}${initiativeContextualEditButton(item, context, "decision", actionLabel)}</div></div><dl><dt>Experiment</dt><dd>${escapeHtml(item.experiment || "Not defined")}</dd><dt>Decision</dt><dd>${escapeHtml(item.decision || "Pending")}</dd><dt>Active risk</dt><dd>${escapeHtml(primaryRiskText(item) || "None captured")}</dd></dl></article>`;
 }
+function portfolioRecommendationCard(recommendation) {
+  return `<article class="portfolio-card portfolio-recommendation" data-recommendation="${escapeHtml(recommendation.id)}"><p>${escapeHtml(recommendation.text)}</p><details ${portfolioOpenRecommendations.has(recommendation.id) ? "open" : ""}><summary>Choose work to act on (${recommendation.targets.length})</summary><ul class="portfolio-recommendation-targets">${recommendation.targets.map((target, index) => {
+    const item = state.items.find(item => item.id === target.itemId);
+    if (!item) return "";
+    const context = `portfolio-${recommendation.id}-${index}`;
+    const disabled = teamEditorReadOnlyReason() ? "disabled" : "";
+    const action = target.recordId ? `<button class="primary small" id="portfolioRisk-${elementIdToken(item.id)}-${elementIdToken(target.recordId)}" data-portfolio-risk="${escapeHtml(target.recordId)}" data-risk-item="${escapeHtml(item.id)}" data-detail-section="risks" data-detail-record="${escapeHtml(target.recordId)}" type="button" ${disabled}>Edit risk</button>` : initiativeContextualEditButton(item, context, target.field === "status" ? "statusId" : target.field, target.label);
+    const risk = target.recordId ? item.risks.find(record => record.id === target.recordId) : null;
+    return `<li><strong>${escapeHtml(item.title)}</strong><span class="muted">${escapeHtml(item.owner || "Unassigned")} · ${escapeHtml(item.id.slice(-6))}</span>${risk ? `<p>${escapeHtml(risk.description)}</p>` : ""}<div class="contextual-card-actions">${initiativeDetailButton(item, context, "View initiative", target.recordId ? "risks" : "", target.recordId)}${action}</div></li>`;
+  }).join("")}</ul></details></article>`;
+}
+
 function initiativeReferenceActions(reference, context, section = "", recordId = "", label = "View initiative") {
   const itemId = typeof reference === "string" ? reference : reference?.id;
   const item = state.items.find((candidate) => candidate.id === itemId);
@@ -3047,7 +3927,7 @@ function initiativeReferenceActions(reference, context, section = "", recordId =
   return `<div class="contextual-card-actions">${initiativeDetailButton(item, context, label, section, recordId)}</div>`;
 }
 function initiativeReferenceList(items, context) {
-  return items.map((item, index) => initiativeReferenceActions(item, `${context}-${index}`, "", "", item.title)).join("");
+  return items.map((item, index) => `<div>${initiativeReferenceActions(item, `${context}-${index}`, "", "", item.title)}<p class="muted">${escapeHtml(initiativeReportingContext(state.workflow, item))}</p></div>`).join("");
 }
 function initiativeDetailButton(item, context, label = "View initiative", section = "", recordId = "") {
   if (!item?.id) return "";
@@ -3111,7 +3991,7 @@ function openRiskActionEditor(actionContext) {
   const item = state.items.find((entry) => entry.id === actionContext.target.itemId);
   const record = item?.risks.find((entry) => entry.id === actionContext.target.recordId);
   if (!item || !record || teamEditorReadOnlyReason()) return;
-  const recordEditor = {
+  const recordEditor = prepareInitiativeRecordEditor({
     kind: "risk",
     recordId: record.id,
     convertFromRiskId: "",
@@ -3120,7 +4000,7 @@ function openRiskActionEditor(actionContext) {
     actionContext,
     draft: null,
     error: ""
-  };
+  }, item);
   if (actionContext.origin === "detail" && state.initiativeDetail.selectedId === item.id) {
     state.initiativeDetail.recordEditor = recordEditor;
     state.initiativeDetail.focusSection = "risks";
@@ -3151,6 +4031,7 @@ function listPlanItems(items, context) { return initiativeReferenceList(items, c
 function releaseBucket(title, subtitle, items) { return `<section class="panel release"><div class="panel-header"><div><h3>${title}</h3><span class="muted">${subtitle}</span></div></div>${items.map((item, index) => compactCard(item, `${title}-${index}`)).join("") || emptyState("No matching work.")}</section>`; }
 
 function copyDraftTargets() { return Object.freeze({
+  copyManagerBriefButton: "managerBriefDraft",
   copyWeeklyUpdateButton: "weeklyUpdateDraft",
   copyTemplateButton: "templateDraft",
   copyActionMemoButton: "actionMemoDraft",
@@ -3202,6 +4083,13 @@ function handleDelegatedNavigation(event) {
 }
 
 function bindEvents() {
+  document.querySelector("#checkHomeHealthButton")?.addEventListener("click", checkHomeHealth);
+  document.querySelector("#downloadManagerBriefButton")?.addEventListener("click", () => {
+    const draft = document.querySelector("#managerBriefDraft");
+    if (!draft) return;
+    downloadFile(draft.value, "text/markdown", `pm-os-manager-briefing-${todayStamp()}.md`);
+    document.querySelector("#copyStatus").textContent = "Briefing download requested. Check your browser's downloads.";
+  });
   document.querySelector("#openDataRecoveryButton")?.addEventListener("click", () => navigateToView("settings", "content", "data"));
   bindWorkspaceModeEvents();
   bindTutorialEvents();
@@ -3229,6 +4117,13 @@ function bindEvents() {
   document.querySelectorAll("[data-experience-bundle]").forEach((button) => button.addEventListener("click", toggleExperienceBundle));
   document.querySelectorAll("[data-experience-capability]").forEach((input) => input.addEventListener("change", toggleExperienceCapability));
   document.querySelector("#saveExperienceButton")?.addEventListener("click", saveWorkspaceExperience);
+  document.querySelector("#workspacePreset")?.addEventListener("change", event => {
+    if (!workflowCanManage()) return;
+    const presetId = event.currentTarget.value;
+    setExperienceDraft(workspaceExperienceForPreset(presetId, draftWorkspaceExperience()));
+    state.experiencePresetChoice = presetId;
+    renderAndFocus("workspacePreset");
+  });
   document.querySelectorAll("[data-priority-move]").forEach((button) => button.addEventListener("click", movePriorityItem));
   document.querySelectorAll('.priority-row[draggable="true"]').forEach((row) => {
     row.addEventListener("dragstart", startPriorityDrag);
@@ -3256,6 +4151,12 @@ function bindEvents() {
   document.querySelector("#nextPeriodButton")?.addEventListener("click", () => moveTimelinePeriod(1, "nextPeriodButton"));
   document.querySelector("#periodJumpDate")?.addEventListener("change", jumpTimelinePeriod);
   document.querySelector("#showUnscheduledButton")?.addEventListener("click", () => applyPeriodSelection({ kind: "unscheduled" }, "periodKind"));
+  document.querySelectorAll("[data-empty-period]").forEach((button) => button.addEventListener("click", () => applyPeriodSelection({ kind: button.dataset.emptyPeriod }, "periodKind")));
+  document.querySelector("#clearEmptyInitiativeSearch")?.addEventListener("click", () => {
+    state.query = "";
+    render();
+    document.querySelector("#searchInput")?.focus();
+  });
   document.querySelectorAll("[data-customer-view]").forEach((button) => button.addEventListener("click", () => selectCustomerView(button.dataset.customerView)));
   document.querySelector("#newCustomerButton")?.addEventListener("click", openNewCustomer);
   document.querySelector("#exportCustomersButton")?.addEventListener("click", exportCustomers);
@@ -3264,6 +4165,9 @@ function bindEvents() {
   document.querySelectorAll("[data-select-customer]").forEach((button) => button.addEventListener("click", () => selectCustomerAccount(button.dataset.selectCustomer)));
   document.querySelectorAll("[data-customer-page]").forEach((button) => button.addEventListener("click", () => changeCustomerPage(button.dataset.customerPage)));
   document.querySelector("#customerAccountForm")?.addEventListener("submit", saveCustomerAccount);
+  document.querySelector("#customerAccountForm")?.addEventListener("input", captureCustomerAccountDraft);
+  document.querySelector("#customerAccountForm")?.addEventListener("change", captureCustomerAccountDraft);
+  document.querySelector("#discardCustomerAccountDraft")?.addEventListener("click", discardCustomerAccountDraft);
   document.querySelector("#deleteCustomerButton")?.addEventListener("click", deleteCustomerAccount);
   document.querySelector("#customerCsvInput")?.addEventListener("change", previewCustomerImport);
   document.querySelector("#applyCustomerImport")?.addEventListener("click", applyCustomerImport);
@@ -3295,6 +4199,8 @@ function bindEvents() {
   document.querySelector("#editUnitForm")?.addEventListener("submit", editOrganizationUnit);
   document.querySelector("#removeUnitButton")?.addEventListener("click", removeOrganizationUnit);
   document.querySelector("#newInitiativeButton")?.addEventListener("click", (event) => openInitiativeEditor("new", event.currentTarget));
+  document.querySelectorAll("[data-plan-generated-ask]").forEach(button => button.addEventListener("click", event => planGeneratedAsk(event.currentTarget)));
+  document.querySelectorAll("[data-author-measure]").forEach(button => button.addEventListener("click", event => authorMeasure(event.currentTarget)));
   document.querySelector("#checklistCreateInitiative")?.addEventListener("click", (event) => openInitiativeEditor("new", event.currentTarget));
   document.querySelector("#startProjectImport")?.addEventListener("click", () => {
     navigateToView("settings", "context", "data");
@@ -3307,12 +4213,17 @@ function bindEvents() {
   });
   document.querySelector("#checklistCopyUpdate")?.addEventListener("click", (event) => copyDraft(event.currentTarget, "weeklyUpdateDraft"));
   document.querySelector("#editInitiativeButton")?.addEventListener("click", (event) => openInitiativeEditor("edit", event.currentTarget));
+  document.querySelectorAll("[data-add-initiative-decision]").forEach((button) => button.addEventListener("click", (event) => openInitiativeWorkRecord(event.currentTarget.dataset.addInitiativeDecision, "decision", event.currentTarget, null, true)));
+  document.querySelectorAll("[data-add-initiative-validation]").forEach(button => button.addEventListener("click", event => openInitiativeWorkRecord(event.currentTarget.dataset.addInitiativeValidation, "validation", event.currentTarget, null, true)));
+  document.querySelectorAll("[data-add-initiative-action]").forEach((button) => button.addEventListener("click", (event) => addInitiativeAction(event.currentTarget)));
+  document.querySelectorAll("[data-plan-enablement]").forEach((button) => button.addEventListener("click", (event) => planEnablementAction(event.currentTarget)));
   document.querySelectorAll("[data-new-insight]").forEach((button) => button.addEventListener("click", (event) => openInsightEditor("new", event.currentTarget, "", event.currentTarget.dataset.newInsight)));
   document.querySelectorAll("[data-view-insight]").forEach((button) => button.addEventListener("click", (event) => openInsightEditor("view", event.currentTarget, event.currentTarget.dataset.viewInsight)));
   document.querySelectorAll("[data-edit-insight]").forEach((button) => button.addEventListener("click", (event) => openInsightEditor("edit", event.currentTarget, event.currentTarget.dataset.editInsight)));
   document.querySelector("#insightStatusFilter")?.addEventListener("change", (event) => { state.insightStatusFilter = event.currentTarget.value; pushViewUrl(true); render(); document.querySelector("#insightStatusFilter")?.focus(); });
   document.querySelector("#insightEditorForm")?.addEventListener("submit", saveInsightEditor);
   document.querySelector("#insightEditorForm")?.addEventListener("input", captureInsightEditorDraft);
+  bindInsightRelationships();
   document.querySelector("#backToInsightButton")?.addEventListener("click", backToInsightRecord);
   document.querySelectorAll("[data-insight-initiative]").forEach((button) => button.addEventListener("click", () => {
     state.insightEditor = createInsightEditorState();
@@ -3330,6 +4241,14 @@ function bindEvents() {
   document.querySelector("#closeInitiativeDetailButton")?.addEventListener("click", requestInitiativeDetailClose);
   document.querySelector("#dismissUnavailableInitiativeButton")?.addEventListener("click", requestInitiativeDetailClose);
   document.querySelectorAll("[data-add-record]").forEach((button) => button.addEventListener("click", () => openInitiativeRecordEditor(button.dataset.addRecord, "", button)));
+  document.querySelectorAll("[data-recommendation] details").forEach(details => details.addEventListener("toggle", () => { const id = details.closest("[data-recommendation]").dataset.recommendation; if (details.open) portfolioOpenRecommendations.add(id); else portfolioOpenRecommendations.delete(id); }));
+  document.querySelectorAll("[data-portfolio-risk]").forEach(button => button.addEventListener("click", () => {
+    if (teamEditorReadOnlyReason()) return;
+    const item = state.items.find(item => item.id === button.dataset.riskItem);
+    if (!item?.risks.some(record => record.id === button.dataset.portfolioRisk)) return;
+    openInitiativeDetail(item.id, button);
+    openInitiativeRecordEditor("risk", button.dataset.portfolioRisk, button);
+  }));
   document.querySelectorAll("[data-edit-record]").forEach((button) => button.addEventListener("click", () => openInitiativeRecordEditor(button.dataset.editRecord, button.dataset.recordId, button)));
   document.querySelectorAll("[data-toggle-closed]").forEach((button) => button.addEventListener("click", () => toggleClosedInitiativeRecords(button.dataset.toggleClosed)));
   document.querySelectorAll("[data-set-record-status]").forEach((button) => button.addEventListener("click", () => setInitiativeRecordStatus(button.dataset.recordKind, button.dataset.recordId, button.dataset.setRecordStatus)));
@@ -3337,14 +4256,15 @@ function bindEvents() {
   document.querySelectorAll("[data-delete-record]").forEach((button) => button.addEventListener("click", () => deleteInitiativeRecord(button.dataset.deleteRecord, button.dataset.recordId, button)));
   document.querySelector("#initiativeRecordForm")?.addEventListener("submit", saveInitiativeRecord);
   document.querySelector("#initiativeRecordForm")?.addEventListener("input", captureInitiativeRecordDraft);
+  document.querySelector("#initiativeRecordForm")?.addEventListener("change", captureInitiativeRecordDraft);
   document.querySelector("#initiativeRecordForm")?.addEventListener("change", syncDependencyTargetFields);
   document.querySelector("#initiativeRecordForm")?.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
     event.preventDefault();
     event.stopPropagation();
-    cancelInitiativeRecordEditor();
+    cancelInitiativeRecordEditor(false);
   });
-  document.querySelector("#cancelInitiativeRecord")?.addEventListener("click", cancelInitiativeRecordEditor);
+  document.querySelector("#cancelInitiativeRecord")?.addEventListener("click", () => cancelInitiativeRecordEditor(true));
   document.querySelectorAll("[data-detail-view]").forEach((button) => button.addEventListener("click", (event) => navigateFromInitiativeDetail(event.currentTarget.dataset.detailView)));
   document.querySelector("#initiativeDetailDialog")?.addEventListener("close", finishInitiativeDetailClose);
   document.querySelectorAll("[data-complete-action]").forEach((button) => button.addEventListener("click", openActionQueueAction));
@@ -3356,6 +4276,13 @@ function bindEvents() {
   document.querySelector("#initiativeEditorForm")?.addEventListener("input", captureInitiativeEditorDraft);
   document.querySelector("#initiativeEditorForm")?.addEventListener("change", refreshInitiativePriorityFields);
   document.querySelector("#initiativeEditorSearch")?.addEventListener("input", filterInitiativeEditorOptions);
+  document.querySelector("#clearInitiativeEditorSearch")?.addEventListener("click", () => {
+    const search = document.querySelector("#initiativeEditorSearch");
+    if (!search) return;
+    search.value = "";
+    filterInitiativeEditorOptions({ currentTarget: search });
+    search.focus();
+  });
   document.querySelector("#initiativeEditorPicker")?.addEventListener("change", selectInitiativeForEditor);
   document.querySelector("#initiativeTargetAudience")?.addEventListener("click", handleInitiativeTargetClick);
   document.querySelector("#initiativeTargetAudience")?.addEventListener("change", handleInitiativeTargetChange);
@@ -3370,6 +4297,7 @@ function bindEvents() {
   document.querySelectorAll("[data-spec]").forEach((button) => button.addEventListener("click", () => { state.selectedSpecId = button.dataset.spec; pushViewUrl(true); render(); }));
   document.querySelector("#searchInput")?.addEventListener("input", updateSearch);
   document.querySelector("#exportButton")?.addEventListener("click", () => exportWorkspaceData("json"));
+  document.querySelector("#dataAdvanced")?.addEventListener("toggle", (event) => { state.dataAdvancedOpen = event.currentTarget.open; });
   document.querySelector("#exportCsvButton")?.addEventListener("click", () => exportWorkspaceData("csv"));
   document.querySelector("#exportIssuesButton")?.addEventListener("click", () => exportWorkspaceData("issues"));
   document.querySelector("#importButton")?.addEventListener("click", () => document.querySelector("#importInput")?.click());
@@ -3381,6 +4309,7 @@ function bindEvents() {
   document.querySelector("#useBrowserStorageButton")?.addEventListener("click", useBrowserStorage);
   document.querySelector("#linkWorkspaceFileButton")?.addEventListener("click", linkExistingWorkspaceFile);
   document.querySelector("#createWorkspaceFileButton")?.addEventListener("click", createNewWorkspaceFile);
+  document.querySelector("#reviewLinkedFileConflictButton")?.addEventListener("click", showProjectSyncReview);
   document.querySelector("#saveLinkedFileButton")?.addEventListener("click", saveLinkedWorkspaceNow);
   document.querySelector("#requestLinkedFilePermissionButton")?.addEventListener("click", requestLinkedWorkspacePermission);
   document.querySelector("#unlinkWorkspaceFileButton")?.addEventListener("click", unlinkWorkspaceFile);
@@ -3402,6 +4331,7 @@ function bindEvents() {
   document.querySelector("#teamByoButton")?.addEventListener("click", () => { state.team.mode = "byo"; state.team.error = false; state.team.status = state.sourceSelection === "local-server" ? "Enter the public endpoint generated by PM OS Local Server." : "Enter the public settings for Supabase Cloud or your self-hosted stack."; renderAndFocus("teamProjectUrl"); });
   document.querySelectorAll("#cancelTeamSetupButton").forEach((button) => button.addEventListener("click", cancelTeamSetup));
   document.querySelector("#teamSetupForm")?.addEventListener("submit", checkByoTeamSetup);
+  document.querySelector("#teamAuthMode")?.addEventListener("change", (event) => { state.team.authMode = event.target.value === "password" ? "password" : "otp"; });
   document.querySelector("#teamEmailForm")?.addEventListener("submit", sendTeamCode);
   document.querySelector("#teamCodeForm")?.addEventListener("submit", verifyTeamCode);
   document.querySelector("#teamPasswordForm")?.addEventListener("submit", authenticateTeamPassword);
@@ -3419,7 +4349,9 @@ function bindEvents() {
   document.querySelector("#createTeamInviteForm")?.addEventListener("submit", createTeamInvite);
   document.querySelectorAll("[data-team-member-role]").forEach((control) => control.addEventListener("change", changeTeamMemberRole));
   document.querySelectorAll("[data-remove-team-member]").forEach((button) => button.addEventListener("click", removeTeamMember));
-  document.querySelector("#copyTeamInviteButton")?.addEventListener("click", copyTeamInviteCode);
+  document.querySelector("#refreshTeamInvitesButton")?.addEventListener("click", refreshTeamInvitations);
+  document.querySelectorAll("[data-resend-team-invite]").forEach(button => button.addEventListener("click", () => resendTeamInvitation(button.dataset.resendTeamInvite)));
+  document.querySelectorAll("[data-revoke-team-invite]").forEach(button => button.addEventListener("click", () => revokeTeamInvitation(button.dataset.revokeTeamInvite)));
   document.querySelector("#teamInviteDialog")?.addEventListener("close", clearTeamInvite);
   document.querySelector("#reviewTeamConflictButton")?.addEventListener("click", reviewTeamConflict);
   document.querySelector("#retryTeamDraftButton")?.addEventListener("click", retryTeamDraft);
@@ -3447,6 +4379,7 @@ function bindEvents() {
   document.querySelector("#addPriorityCriterionButton")?.addEventListener("click", addPriorityCriterion);
   bindPriorityCriterionRemoveButtons();
   document.querySelector("#deletePriorityFrameworkButton")?.addEventListener("click", deletePriorityFramework);
+  bindPlanningCapacityEvents();
   document.querySelector("#planningCalendarForm")?.addEventListener("submit", savePlanningCalendar);
   document.querySelector("#planningCalendarForm")?.addEventListener("change", toggleSprintCalendarFields);
   bindCopyDraftControls();
@@ -3470,15 +4403,19 @@ function bindEvents() {
   if (editorDialog && !editorDialog.open) queueMicrotask(() => {
     if (!editorDialog.isConnected || editorDialog.open) return;
     editorDialog.showModal();
-    const requestedField = state.initiativeEditor.focusField ? `#initiativeEditorForm [name="${state.initiativeEditor.focusField}"]` : "";
+    const requestedField = state.initiativeEditor.focusField === "customer" ? "#openInitiativeTargetPicker" : state.initiativeEditor.focusField ? `#initiativeEditorForm [name="${state.initiativeEditor.focusField}"]` : "";
     const editorFocus = state.initiativeEditor.mode === "edit" && !state.initiativeEditor.selectedFromCard ? "#initiativeEditorSearch" : requestedField || "#initiativeTitle";
-    document.querySelector(editorFocus)?.focus();
+    const focusTarget = document.querySelector(editorFocus);
+    for (let parent = focusTarget?.parentElement; parent && parent !== editorDialog; parent = parent.parentElement) {
+      if (parent.tagName === "DETAILS") parent.open = true;
+    }
+    focusTarget?.focus();
   });
   const insightDialog = document.querySelector("#insightEditorDialog");
   if (insightDialog && !insightDialog.open) queueMicrotask(() => {
     if (!insightDialog.isConnected || insightDialog.open) return;
     insightDialog.showModal();
-    document.querySelector(state.insightEditor.mode === "view" ? "#closeInsightEditorButton" : "#insightTitle")?.focus();
+    (document.querySelector(state.insightEditor.mode === "view" ? "#closeInsightEditorButton" : state.insightEditor.focusField ? `#insightEditorForm [name="${state.insightEditor.focusField}"]` : "#insightTitle") || document.querySelector("#insightTitle"))?.focus();
   });
 }
 
@@ -3496,7 +4433,15 @@ function bindProjectSwitcherEvents() {
   document.querySelector("#manageProjectsButton")?.addEventListener("click", () => showProjectSurface("manage", "backToProjectSwitcherButton"));
   document.querySelector("#backToProjectSwitcherButton")?.addEventListener("click", () => showProjectSurface("switcher", "projectSwitcherSearch"));
   const wizardForm = document.querySelector("#projectWizardForm");
+  if (ui.busy) wizardForm?.querySelectorAll("input, select").forEach(control => { control.disabled = true; });
   wizardForm?.addEventListener("submit", advanceProjectWizard);
+  document.querySelector("#onboardingDemoButton")?.addEventListener("click", () => navigateToWorkspaceMode("demo"));
+  document.querySelector("#onboardingImportFile")?.addEventListener("change", readOnboardingImport);
+  document.querySelector("#onboardingPreset")?.addEventListener("change", updateProjectWizardChoice);
+  document.querySelectorAll('[name="entryMode"]').forEach(control => control.addEventListener("change", updateProjectWizardChoice));
+  document.querySelectorAll("[data-onboarding-capability]").forEach(control => control.addEventListener("change", () => {
+    ui.wizard.customCapabilities = [...document.querySelectorAll("[data-onboarding-capability]:checked")].map(input => input.dataset.onboardingCapability);
+  }));
   document.querySelector("#projectName")?.addEventListener("input", (event) => {
     ui.wizard.name = event.currentTarget.value;
     ui.wizard.error = "";
@@ -3508,7 +4453,7 @@ function bindProjectSwitcherEvents() {
   for (const id of ["projectDriveClientId", "projectDriveFileLink", "projectDriveFolderName"]) {
     document.querySelector(`#${id}`)?.addEventListener("input", captureServerWizardFields);
   }
-  for (const id of ["serverConnectorChoice", "serverConnectorMode", "serverConnectorLabel", "serverConnectorUrl", "serverConnectorKey", "serverPersistSession", "serverWorkspaceChoice"]) {
+  for (const id of ["serverConnectorChoice", "serverConnectorMode", "serverConnectorAuthMode", "serverConnectorLabel", "serverConnectorUrl", "serverConnectorKey", "serverPersistSession", "serverWorkspaceChoice"]) {
     document.querySelector(`#${id}`)?.addEventListener("change", () => {
       captureServerWizardFields();
       if (id === "serverConnectorChoice" || id === "serverConnectorMode") renderAndFocus(id);
@@ -3531,6 +4476,14 @@ function bindProjectSwitcherEvents() {
   document.querySelector("#cancelForgetProjectButton")?.addEventListener("click", () => showProjectSurface("manage", "backToProjectSwitcherButton"));
   document.querySelector("#forgetProjectForm")?.addEventListener("submit", confirmForgetProject);
   document.querySelector("#serverProjectAuthForm")?.addEventListener("submit", submitServerProjectAuth);
+  document.querySelector("#serverProjectUseEmailCode")?.addEventListener("click", () => {
+    const gate = state.projects?.serverGate;
+    if (!gate?.allowEmailCode || state.projects.busy) return;
+    gate.email = document.querySelector("#serverProjectEmail")?.value || gate.email;
+    gate.authMode = "otp";
+    gate.codeSent = false;
+    render();
+  });
   document.querySelector("#cancelServerProjectAuthButton")?.addEventListener("click", cancelServerProjectAuth);
   document.querySelectorAll("[data-signout-connector]").forEach((button) => button.addEventListener("click", signOutServerConnector));
   document.querySelectorAll("[data-remove-connector]").forEach((button) => button.addEventListener("click", removeServerConnectorFromUi));
@@ -3546,7 +4499,7 @@ function bindProjectSwitcherEvents() {
     if (!dialog.isConnected || dialog.open) return;
     dialog.showModal();
     const selector = ui.surface === "switcher" ? "#projectSwitcherSearch"
-      : ui.surface === "wizard" ? ui.wizard.step === 1 ? "#projectName" : '[name="provider"]:checked'
+      : ui.surface === "wizard" ? ui.wizard.step === 1 ? "#projectName" : ui.wizard.step === 3 || ui.wizard.error ? "#projectWizardContinueButton" : '[name="provider"]:checked'
         : ui.surface === "server-auth" ? "#serverProjectEmail"
         : ui.surface === "rename" ? "#renameProjectName"
           : ui.surface === "delete" ? ui.backupDownloaded ? "#forgetProjectName" : "#downloadProjectBackupButton"
@@ -3562,12 +4515,74 @@ function openProjectSwitcher(event) {
   ui.surface = "switcher";
   ui.error = "";
   ui.status = "";
+  refreshLocalProjectCatalog();
   render();
+  if (!ui.error) void refreshProjectCatalog();
+}
+
+function refreshLocalProjectCatalog() {
+  const ui = state.projects;
+  if (!ui?.persistent || ui.busy) return;
+  try {
+    ui.registry = readCurrentProjectRegistry(localStorage, ui.registry);
+    projectRegistry = ui.registry;
+  } catch (error) {
+    ui.error = error.message;
+  }
+}
+
+async function refreshProjectCatalog() {
+  const ui = state.projects;
+  if (!ui?.persistent || !serverConnectorPool || ui.surface !== "switcher") return;
+  const generation = ui.catalogGeneration = (ui.catalogGeneration || 0) + 1;
+  const poolRegistry = serverConnectorPool.registry;
+  const current = () => state.projects === ui && ui.catalogGeneration === generation
+    && ui.surface === "switcher" && !ui.busy && !ui.connectorBusyId && serverConnectorPool.registry === poolRegistry;
+  await Promise.allSettled(poolRegistry.connectors.map(async (connector) => {
+    if (!projectsForConnector(ui.registry, connector.id).some((project) => !project.archivedAt)) return;
+    try {
+      const client = serverConnectorPool.clientFor(connector.id);
+      const auth = await client.getAuthState();
+      if (!current()) return;
+      const authenticated = auth?.status === "authenticated" && auth.user;
+      const workspaces = authenticated
+        ? collectionFrom(await client.teamService.listWorkspaces(), "workspaces").map(normalizeTeamWorkspace) : [];
+      if (!current()) return;
+      let changed = false;
+      for (const project of projectsForConnector(ui.registry, connector.id)) {
+        if (project.archivedAt) continue;
+        const workspace = workspaces.find((entry) => entry.id === project.workspaceId);
+        const patch = !authenticated ? { serverStatus: "sign-in-required" }
+          : !workspace ? { serverStatus: "unavailable" }
+            : { name: workspace.name, serverRole: workspace.role, serverRevision: workspace.revision, serverStatus: "available" };
+        if (Object.entries(patch).every(([key, value]) => project[key] === value)) continue;
+        ui.registry = updateProjectMetadata(localStorage, ui.registry, project.id, patch);
+        projectRegistry = ui.registry;
+        changed = true;
+      }
+      if (changed && current()) {
+        const focused = document.activeElement;
+        const focusId = focused?.id;
+        const selection = focused?.id === "projectSwitcherSearch" ? [focused.selectionStart, focused.selectionEnd] : null;
+        render();
+        queueMicrotask(() => {
+          if (!current()) return;
+          const restored = focusId && document.getElementById(focusId);
+          restored?.focus();
+          if (selection) restored?.setSelectionRange(...selection);
+        });
+      }
+    } catch {
+      // Keep cached entries usable; opening a project still rechecks authorization.
+    }
+  }));
 }
 
 function closeProjectSwitcher() {
   const ui = state.projects;
   if (!ui || ui.busy) return;
+  ui.catalogGeneration = (ui.catalogGeneration || 0) + 1;
+  if (ui.wizard.firstRun && ui.surface === "wizard") return;
   ui.driveDeleteToken = "";
   ui.driveDeleteTicket = null;
   const focusId = ui.returnFocusId || "projectSwitcherButton";
@@ -3586,6 +4601,7 @@ function showProjectSurface(surface, focusId = "") {
   }
   state.projects.surface = surface;
   state.projects.error = "";
+  if (["switcher", "manage"].includes(surface)) refreshLocalProjectCatalog();
   render();
   if (focusId) document.querySelector(`#${cssEscape(focusId)}`)?.focus();
 }
@@ -3655,6 +4671,15 @@ async function approveProjectDeparture({ replaceUrl = false } = {}) {
   };
   ui.departurePending = true;
   try {
+    if (state.customerAccountDrafts.size) {
+      const choice = await chooseProjectDeparture({ title: "Discard account drafts and switch?", description: "Your unsaved customer account edits are only in this tab. Cancel to return and save them, or discard them when this project closes.", confirmLabel: "Discard drafts and switch" });
+      if (!stillCurrent() || choice === "cancel") return cancel();
+    }
+    if (documentComposer.hasEdits) {
+      const choice = await chooseProjectDeparture({ title: "Discard your document draft and switch?", description: "This draft is only in this tab. Cancel and download a copy from Documents to keep your edits.", confirmLabel: "Discard draft and switch" });
+      if (!stillCurrent() || choice === "cancel") return cancel();
+    }
+
     if (state.initiativeEditor.mode || (state.insightEditor.mode && state.insightEditor.mode !== "view")) {
       const choice = await chooseProjectDeparture({
         title: "Save your draft before switching?", description: "Save this draft in the current project, discard it, or cancel to keep editing.",
@@ -3763,7 +4788,7 @@ async function stageLocalProjectSwitch(projectId, { trigger = null, replaceUrl =
   if (!replaceUrl) ui.surface = "switcher";
   render();
   try {
-    projectRegistry = runStorageTransaction(localStorage, ["pm-os-staging.projects.v1", ...Object.values(prepared.keys)], () => {
+    projectRegistry = await prepared.writeScope.run(["pm-os-staging.projects.v1", ...Object.values(prepared.keys)], () => {
       if (prepared.cacheWorkspaceRaw) {
         if (prepared.previousWorkspaceRaw) storeWorkspaceSnapshot(localStorage, prepared.keys.backups, prepared.recovery.snapshots, prepared.previousWorkspaceRaw, backupReasons.import);
         localStorage.setItem(prepared.keys.workspace, prepared.cacheWorkspaceRaw);
@@ -3833,7 +4858,7 @@ async function stageServerProjectSwitch(projectId, { trigger = null, replaceUrl 
       ui.pendingProjectId = "";
       ui.serverGate = {
         intent: "switch", projectId: project.id, projectName: project.name, connectorId: connector.id,
-        connectorLabel: connector.label, authMode: connector.authMode, allowLocalAccount: connector.mode === "personal-local", codeSent: false, email: ""
+        connectorLabel: connector.label, authMode: connector.authMode, allowEmailCode: capabilities.emailInvitations === true, allowLocalAccount: connector.mode === "personal-local", codeSent: false, email: ""
       };
       ui.surface = "server-auth";
       ui.status = "";
@@ -3867,6 +4892,7 @@ async function stageServerProjectSwitch(projectId, { trigger = null, replaceUrl 
 
 async function prepareLocalProject(target, { requestPermission = true } = {}) {
   const bundle = readProjectBundle(localStorage, target.id);
+  const writeScope = createStorageWriteScope(localStorage, [bundle.keys.workspace, bundle.keys.activity, bundle.keys.sync, bundle.keys.source], { values: ["workspace", "activity", "sync", "source"].map(name => ({ key: bundle.keys[name], value: bundle[name] ?? null })) });
   let rawWorkspace = bundle.workspace || encodeWorkspaceDocument(createEmptyWorkspaceDocument());
   let workspace = importPortableWorkspace(rawWorkspace);
   const source = bundle.source ? loadSourceFromKey(bundle.keys.source) : sourceForProjectProvider(target.provider);
@@ -3892,7 +4918,7 @@ async function prepareLocalProject(target, { requestPermission = true } = {}) {
     }
     linkedFile = { handle, name: file.name, permission, lastModified: file.lastModified, status: "ready" };
   }
-  return { project: target, keys: bundle.keys, workspace, rawWorkspace, cacheWorkspaceRaw, previousWorkspaceRaw: bundle.workspace, source, sync, recovery, linkedFile };
+  return { project: target, writeScope, keys: bundle.keys, workspace, rawWorkspace, cacheWorkspaceRaw, previousWorkspaceRaw: bundle.workspace, source, sync, recovery, linkedFile };
 }
 
 function sourceForProjectProvider(provider) {
@@ -3913,6 +4939,7 @@ function applyPreparedLocalProject(prepared, target) {
   cachedOperationalWorkspaceRaw = undefined;
   cachedOperationalWorkspaceResult = undefined;
   applyTeamSnapshot({ ...prepared.workspace, activity: prepared.workspace.activity || [] });
+  rememberLocalWorkspaceRead(prepared.writeScope.values());
   resetWorkspaceUiState();
   state.source = prepared.source;
   state.sourceSelection = sourceSelectionFor(prepared.source);
@@ -3943,6 +4970,7 @@ function openProjectWizard() {
   ui.surface = "wizard";
   const drive = normalizeDriveRuntimeConfig(globalThis.PM_OS_DRIVE_CONFIG);
   ui.wizard = newProjectWizardState({
+    managedConfig: resolveBackendRuntimeConfig(globalThis),
     driveClientId: drive?.clientId || (state.source.type === "google-drive" ? state.source.clientId : ""),
     drivePickerAvailable: Boolean(drive?.pickerApiKey && drive?.appId)
   });
@@ -3954,6 +4982,14 @@ function updateProjectWizardChoice(event) {
   if (!ui) return;
   captureServerWizardFields();
   ui.wizard[event.currentTarget.name] = event.currentTarget.value;
+  if (ui.wizard.firstRun) {
+    ui.wizard.onboarding = ui.wizard.entryMode === "blank" ? "blank" : "guided";
+    if (event.currentTarget.name === "entryMode" || event.currentTarget.name === "provider") {
+      ui.wizard.sourceAction = ui.wizard.entryMode === "import" ? "existing" : "create";
+      ui.wizard.serverAction = ui.wizard.entryMode === "import" ? "existing" : "create";
+    }
+  }
+  if (projectWizardConnection(ui)?.allowWorkspaceCreation === false) ui.wizard.serverAction = "existing";
   const selector = `[name="${cssEscape(event.currentTarget.name)}"][value="${cssEscape(event.currentTarget.value)}"]`;
   render();
   queueMicrotask(() => document.querySelector(selector)?.focus());
@@ -3963,12 +4999,21 @@ function captureServerWizardFields() {
   const wizard = state.projects?.wizard;
   if (!wizard) return;
   const value = (id, fallback = "") => document.querySelector(`#${id}`)?.value ?? fallback;
+  const previousConnectorId = wizard.connectorId;
   wizard.connectorId = value("serverConnectorChoice", wizard.connectorId);
+  if (previousConnectorId !== wizard.connectorId) {
+    wizard.serverWorkspaceId = "";
+    wizard.serverWorkspaces = [];
+    wizard.createAttemptId = "";
+    wizard.createdServerWorkspaceId = "";
+  }
+  if (projectWizardConnection(state.projects)?.allowWorkspaceCreation === false) wizard.serverAction = "existing";
   wizard.connectorMode = value("serverConnectorMode", wizard.connectorMode);
+  wizard.connectorAuthMode = value("serverConnectorAuthMode", wizard.connectorAuthMode) === "password" ? "password" : "otp";
   wizard.connectorLabel = value("serverConnectorLabel", wizard.connectorLabel);
   wizard.connectorUrl = value("serverConnectorUrl", wizard.connectorUrl);
   wizard.connectorKey = value("serverConnectorKey", wizard.connectorKey);
-  wizard.serverWorkspaceId = value("serverWorkspaceChoice", wizard.serverWorkspaceId);
+  if (previousConnectorId === wizard.connectorId) wizard.serverWorkspaceId = value("serverWorkspaceChoice", wizard.serverWorkspaceId);
   const persist = document.querySelector("#serverPersistSession");
   if (persist) wizard.persistSession = persist.checked;
   wizard.driveClientId = value("projectDriveClientId", wizard.driveClientId);
@@ -3980,6 +5025,10 @@ async function advanceProjectWizard(event) {
   event.preventDefault();
   const ui = state.projects;
   if (!ui || ui.busy) return;
+  if (ui.wizard.firstRun && ui.wizard.step === 3) {
+    finishOnboarding(ui.wizard.readyCanCreate);
+    return;
+  }
   if (ui.wizard.step === 1) {
     const name = String(new FormData(event.currentTarget).get("name") || ui.wizard.name).trim();
     if (!name) {
@@ -4000,10 +5049,73 @@ async function advanceProjectWizard(event) {
 function stepBackProjectWizard() {
   const ui = state.projects;
   if (!ui || ui.busy) return;
+  if (ui.wizard.firstRun && ui.wizard.step === 3) { finishOnboarding(false); return; }
   if (ui.wizard.step === 1) ui.surface = "switcher";
   else ui.wizard.step -= 1;
   ui.wizard.error = "";
   render();
+}
+
+function onboardingExperience(wizard, current = { version: 1, enabledCapabilities: [] }) {
+  return wizard.presetId === "custom"
+    ? normalizeWorkspaceExperience({ version: current.version + 1, enabledCapabilities: wizard.customCapabilities })
+    : workspaceExperienceForPreset(wizard.presetId, current);
+}
+
+async function readOnboardingImport(event) {
+  const ui = state.projects;
+  const wizard = ui?.wizard;
+  const file = event.currentTarget.files?.[0];
+  if (!wizard?.firstRun || !file || ui.busy) return;
+  ui.busy = true;
+  wizard.importDocument = null;
+  wizard.importName = "";
+  wizard.error = "";
+  render();
+  try {
+    if (file.size > 10 * 1024 * 1024) throw new Error("Choose a workspace backup smaller than 10 MB.");
+    const imported = decodeWorkspaceDocument(JSON.parse(await file.text()));
+    if (state.projects?.wizard !== wizard) return;
+    wizard.importDocument = imported;
+    wizard.importName = file.name;
+  } catch (error) {
+    if (state.projects?.wizard !== wizard) return;
+    wizard.error = `This backup could not be opened. ${error?.message || "Choose a valid PM OS JSON backup."}`;
+  } finally {
+    if (state.projects?.wizard === wizard) {
+      ui.busy = false;
+      render();
+      document.querySelector("#onboardingImportFile")?.focus();
+    }
+  }
+}
+
+function showOnboardingReady(wizard) {
+  const preferenceSaved = saveWorkspaceModePreference("operation");
+  state.modeChoiceOpen = false;
+  state.storageChoiceOpen = false;
+  wizard.step = 3;
+  wizard.readyCanCreate = !state.team.active || ["owner", "editor"].includes(state.team.role);
+  const name = currentProjectDescriptor(state.projects, state.team).name;
+  const storage = state.team.active ? "saved on the Team server" : state.source.type === "google-drive"
+    ? "saved in its Google Drive file" : state.source.type === "local-file" ? "saved in its linked workspace file" : "saved in this browser on this device";
+  wizard.readySummary = `${name} is ${storage}. ${state.items.length} initiative${state.items.length === 1 ? "" : "s"} ready.`;
+  wizard.readySharing = state.team.active
+    ? "Team members share this workspace. Owners manage invitations and access in Settings → Data & backup."
+    : "This workspace is not shared with a Team. You can download backups in Settings → Data & backup. For shared work, open a Team workspace from the project switcher.";
+  wizard.error = preferenceSaved ? "" : "Your workspace is open, but this browser could not remember that setup is complete. Keep a backup before closing it.";
+  state.projects.wizard = wizard;
+  state.projects.surface = "wizard";
+  render();
+}
+
+function finishOnboarding(createFirstInitiative) {
+  state.projects.wizard.importDocument = null;
+  state.projects.wizard.firstRun = false;
+  state.projects.surface = "closed";
+  render();
+  if (createFirstInitiative) openInitiativeEditor("new", document.querySelector("#newInitiativeButton"));
+  else focusAfterRender("viewTitle");
 }
 
 async function createProductionProject() {
@@ -4028,6 +5140,15 @@ async function createProductionProject() {
   render();
   try {
     if (!wizard.name.trim() || wizard.name.length > 160) throw new Error("Enter a project name between 1 and 160 characters.");
+    if (wizard.firstRun && wizard.entryMode === "template") {
+      workspaceDocument = decodeWorkspaceDocument({ ...workspaceDocument, experience: onboardingExperience(wizard) });
+      workspaceRaw = encodeWorkspaceDocument(workspaceDocument);
+    }
+    if (wizard.firstRun && wizard.provider === "browser" && wizard.entryMode === "import") {
+      if (!wizard.importDocument) throw new Error("Choose a valid PM OS JSON backup before opening this workspace.");
+      workspaceDocument = decodeWorkspaceDocument(wizard.importDocument);
+      workspaceRaw = encodeWorkspaceDocument(workspaceDocument);
+    }
     if (wizard.provider === "local-file") {
       handle = wizard.sourceAction === "existing"
         ? await openLinkedWorkspaceFile(globalThis, { storeHandle: false })
@@ -4096,6 +5217,7 @@ async function createProductionProject() {
       state.syncStatus = "Connected to Google Drive for this session. The workspace file is ready.";
       render();
     }
+    if (opened && wizard.firstRun) showOnboardingReady(wizard);
   } catch (error) {
     if (handle && !registered) await clearLinkedFileHandle(projectId).catch(() => undefined);
     ui.busy = false;
@@ -4119,17 +5241,25 @@ async function createServerProjectFromWizard() {
   ui.wizard.error = "";
   render();
   try {
-    let connector = wizard.connectorId ? serverConnectorPool.connector(wizard.connectorId) : null;
+    const managed = wizard.connectorId === "__managed__" ? wizard.managedConfig : null;
+    if (wizard.connectorId === "__managed__" && !managed) throw new Error("The configured server is unavailable. Choose another connection.");
+    let connector = managed ? serverConnectorPool.registry.connectors.find(entry =>
+      entry.url === managed.url && entry.publishableKey === managed.publishableKey && entry.mode === managed.mode
+      && entry.authMode === managed.authMode && entry.persistSession === managed.persistSession
+      && entry.allowWorkspaceCreation === managed.allowWorkspaceCreation)
+      : wizard.connectorId ? serverConnectorPool.connector(wizard.connectorId) : null;
+    if (!connector && wizard.connectorId && !managed) throw new Error("This saved connection is unavailable. Choose another connection.");
     if (!connector) {
       connector = serverConnectorPool.register({
         id: `server-${globalThis.crypto?.randomUUID?.().toLowerCase() || Date.now().toString(36)}`.slice(0, 80),
         label: wizard.connectorLabel, mode: wizard.connectorMode, url: wizard.connectorUrl,
         publishableKey: wizard.connectorKey, persistSession: wizard.persistSession,
-        authMode: wizard.connectorMode === "remote" ? "otp" : "password", allowWorkspaceCreation: true
+        authMode: wizard.connectorMode === "remote" ? wizard.connectorAuthMode : "password", allowWorkspaceCreation: true,
+        ...(managed || {})
       });
-      wizard.connectorId = connector.id;
-      ui.connectors = serverConnectorPool.registry.connectors;
     }
+    wizard.connectorId = connector.id;
+    ui.connectors = serverConnectorPool.registry.connectors;
     const client = serverConnectorPool.clientFor(connector.id);
     const capabilities = await client.checkCapabilities(serverConnectorClientConfig(connector));
     const auth = await client.getAuthState();
@@ -4137,7 +5267,7 @@ async function createServerProjectFromWizard() {
       ui.busy = false;
       ui.serverGate = {
         intent: "create", projectName: wizard.name, connectorId: connector.id, connectorLabel: connector.label,
-        authMode: connector.authMode, allowLocalAccount: connector.mode === "personal-local", codeSent: false, email: ""
+        authMode: connector.authMode, allowEmailCode: capabilities.emailInvitations === true, allowLocalAccount: connector.mode === "personal-local", codeSent: false, email: ""
       };
       ui.surface = "server-auth";
       render();
@@ -4145,7 +5275,10 @@ async function createServerProjectFromWizard() {
     }
     const listed = collectionFrom(await client.teamService.listWorkspaces(), "workspaces").map(normalizeTeamWorkspace);
     let workspace;
-    if (wizard.serverAction === "existing") {
+    if (wizard.createdServerWorkspaceId) {
+      workspace = listed.find(entry => entry.id === wizard.createdServerWorkspaceId);
+      if (!workspace) throw new Error("The new Team workspace could not be reopened. Check your connection before retrying.");
+    } else if (wizard.serverAction === "existing") {
       wizard.serverWorkspaces = listed;
       workspace = listed.find((entry) => entry.id === wizard.serverWorkspaceId);
       if (!workspace) {
@@ -4183,6 +5316,17 @@ async function createServerProjectFromWizard() {
       }
     }
     if (!workspace?.id) throw new Error("The server workspace was not returned.");
+    if (wizard.firstRun && wizard.serverAction === "create") {
+      wizard.createdServerWorkspaceId = workspace.id;
+      if (wizard.entryMode === "template") {
+        const repository = client.repositoryFor(workspace.id);
+        const opened = await repository.open();
+        const next = onboardingExperience(wizard, opened.snapshot.experience);
+        if (JSON.stringify(next.enabledCapabilities) !== JSON.stringify(opened.snapshot.experience.enabledCapabilities)) {
+          await repository.updateExperience(next, opened.snapshot.experience.version);
+        }
+      }
+    }
     const projectId = `project-${globalThis.crypto?.randomUUID?.().toLowerCase() || Date.now().toString(36)}`.slice(0, 80);
     const created = createRegistryProject(localStorage, ui.registry, {
       id: projectId, name: workspace.name || wizard.name, provider: "server",
@@ -4194,7 +5338,8 @@ async function createServerProjectFromWizard() {
     ui.registry = created.registry;
     ui.busy = false;
     ui.surface = "switcher";
-    await stageServerProjectSwitch(created.project.id);
+    const opened = await stageServerProjectSwitch(created.project.id);
+    if (opened && wizard.firstRun) showOnboardingReady(wizard);
   } catch (error) {
     ui.busy = false;
     ui.surface = "wizard";
@@ -4217,16 +5362,19 @@ async function submitServerProjectAuth(event) {
   ui.busy = true;
   ui.error = "";
   render();
+  let passwordSignInPending = false;
   try {
     const client = serverConnectorPool.clientFor(connector.id);
     if (gate.authMode === "password") {
       if (createAccount && connector.mode !== "personal-local") throw new Error("Account creation is available only on your local server.");
       const password = String(form.get("password") || "");
       if (!email.includes("@") || password.length < 8) throw new Error("Enter an email address and a password of at least eight characters.");
+      passwordSignInPending = !createAccount;
       const auth = createAccount
         ? await client.signUpWithPassword(email, password)
         : await client.signInWithPassword(email, password);
       if (auth?.status !== "authenticated" && !auth?.user) throw { code: "AUTH_REQUIRED" };
+      passwordSignInPending = false;
     } else if (!gate.codeSent) {
       await client.sendOtp(email);
       gate.codeSent = true;
@@ -4252,7 +5400,7 @@ async function submitServerProjectAuth(event) {
     }
   } catch (error) {
     ui.busy = false;
-    ui.error = safeTeamError(error, error?.message || "Sign-in could not be completed.");
+    ui.error = safeTeamError(error, passwordSignInPending ? "Sign-in could not be completed. Please try again." : error?.message || "Sign-in could not be completed.", { passwordSignIn: passwordSignInPending });
     ui.surface = "server-auth";
     render();
   }
@@ -4279,6 +5427,7 @@ async function removeServerConnectorFromUi(event) {
 async function changeServerConnectorSession(connectorId, remove) {
   const ui = state.projects;
   if (!ui || ui.connectorBusyId) return;
+  ui.catalogGeneration = (ui.catalogGeneration || 0) + 1;
   ui.connectorBusyId = connectorId;
   ui.error = "";
   render();
@@ -4332,11 +5481,22 @@ async function submitRenameProject(event) {
   event.preventDefault();
   const ui = state.projects;
   if (!ui || ui.busy) return;
-  const project = registryProjectById(ui.registry, ui.renameProjectId);
   try {
-    const name = String(new FormData(event.currentTarget).get("name") || "").trim();
+    const { registry: currentRegistry, project, name, unchanged } = prepareProjectRename(localStorage, ui.registry, ui.renameProjectId, new FormData(event.currentTarget).get("name"));
+    if (project.provider === "server" && project.serverRole !== "owner") throw new Error("Only an owner can rename this server project.");
+    if (unchanged) {
+      projectRegistry = currentRegistry;
+      ui.registry = currentRegistry;
+      ui.status = "Project name unchanged.";
+      ui.error = "";
+      ui.surface = "manage";
+      ui.renameProjectId = "";
+      ui.renameMutationId = "";
+      render();
+      document.querySelector("#backToProjectSwitcherButton")?.focus();
+      return;
+    }
     if (project?.provider === "server") {
-      if (project.serverRole !== "owner") throw new Error("Only an owner can rename this server project.");
       const connector = serverConnectorPool.connector(project.connectorId);
       if (!connector) throw new Error("Reconnect this server project before renaming it.");
       const client = serverConnectorPool.clientFor(connector.id);
@@ -4377,6 +5537,7 @@ async function submitRenameProject(event) {
     }
     ui.registry = projectRegistry;
     ui.status = `Renamed the project to ${registryProjectById(projectRegistry, ui.renameProjectId).name}.`;
+    ui.error = "";
     ui.surface = "manage";
     ui.renameProjectId = "";
     render();
@@ -4452,7 +5613,7 @@ async function confirmProjectArchive() {
     if (createdFallbackId && ui.registry.activeProjectId !== createdFallbackId) {
       try {
         const keys = projectKeys(createdFallbackId);
-        projectRegistry = runStorageTransaction(localStorage, ["pm-os-staging.projects.v1", ...Object.values(keys)], () => {
+        projectRegistry = await forgetStorageWriteScope(localStorage, keys.workspace, ["pm-os-staging.projects.v1", ...Object.values(keys)], () => {
           const archived = setProjectArchived(localStorage, ui.registry, createdFallbackId, true);
           return forgetRegistryProject(localStorage, archived, createdFallbackId);
         });
@@ -4636,7 +5797,8 @@ async function confirmForgetProject(event) {
         ui.busy = false;
       }
     }
-    projectRegistry = forgetRegistryProject(localStorage, ui.registry, project.id);
+    const forgottenKeys = projectKeys(project.id);
+    projectRegistry = await forgetStorageWriteScope(localStorage, forgottenKeys.workspace, ["pm-os-staging.projects.v1", ...Object.values(forgottenKeys)], () => forgetRegistryProject(localStorage, ui.registry, project.id));
     ui.registry = projectRegistry;
     await clearLinkedFileHandle(project.id).catch(() => undefined);
     ui.status = project.provider === "server" ? `Deleted ${project.name} from the server and removed it from this device.`
@@ -4670,55 +5832,55 @@ function toggleSprintCalendarFields() {
   }
 }
 
+function restorePlanningCalendarDraft(data) {
+  const form = document.querySelector("#planningCalendarForm");
+  if (!form) return;
+  const enabled = data.getAll("periodTypes").map(String);
+  form.querySelectorAll('[name="periodTypes"]').forEach(input => { input.checked = enabled.includes(input.value); });
+  for (const name of ["fiscalYearStartMonth", "sprintLengthWeeks", "sprintAnchorDate"]) {
+    const input = form.elements.namedItem(name);
+    if (input && data.has(name)) input.value = String(data.get(name));
+  }
+  toggleSprintCalendarFields();
+}
+
 async function savePlanningCalendar(event) {
   event.preventDefault();
   if (!planningCalendarCanManage()) return;
   const data = new FormData(event.currentTarget);
-  const enabledPeriodTypes = data.getAll("periodTypes").map(String);
-  if (!enabledPeriodTypes.length) {
-    state.planningCalendarStatus = "Enable at least one planning layer.";
-    renderAndFocus("planningCalendarStatus");
-    return;
-  }
-  let next;
+  const scope = captureDocumentArtifactScope();
+  const expectedVersion = state.planningCalendar.version;
+  let saved = false;
   try {
-    next = patchPlanningCalendar(state.planningCalendar, {
+    const enabledPeriodTypes = data.getAll("periodTypes").map(String);
+    if (!enabledPeriodTypes.length) throw new PlanningCalendarError("PERIOD_REQUIRED", "Enable at least one planning layer.");
+    const next = patchPlanningCalendar(state.planningCalendar, {
       enabledPeriodTypes,
       fiscalYearStartMonth: Number(data.get("fiscalYearStartMonth")),
       sprintLengthWeeks: Number(data.get("sprintLengthWeeks") || state.planningCalendar.sprintLengthWeeks),
       sprintAnchorDate: String(data.get("sprintAnchorDate") || "")
     });
-  } catch (error) {
-    state.planningCalendarStatus = error instanceof PlanningCalendarError ? error.message : "The planning calendar could not be saved.";
-    renderAndFocus("planningCalendarStatus");
-    return;
-  }
-  if (state.team.active) {
-    state.team.mutationBusy = true;
+    const pending = writePlanningCalendar(next, expectedVersion, scope, "Planning calendar");
     render();
-    try {
-      const result = await state.team.repository.updatePlanningCalendar(next, state.planningCalendar.version);
-      applyTeamSnapshot(result?.snapshot);
-      state.planningCalendarStatus = "Planning calendar saved. Timeline scope reset to All time.";
-    } catch (error) {
-      state.planningCalendarStatus = safeTeamError(error, "The planning calendar could not be updated.");
-    } finally {
-      state.team.mutationBusy = false;
+    await pending;
+    if (!documentArtifactScopeIsCurrent(scope)) return;
+    saved = true;
+    state.planningCalendarStatus = "Planning calendar saved. Timeline scope reset to All time. Review any saved capacity against the updated calendar.";
+    state.periodSelection = { kind: "all" };
+    state.periodAnnouncement = "Planning calendar changed. Timeline scope reset to All time.";
+    pushViewUrl(true);
+  } catch (error) {
+    if (documentArtifactScopeIsCurrent(scope)) state.planningCalendarStatus = planningSaveError(error);
+  } finally {
+    if (documentArtifactScopeIsCurrent(scope)) {
+      renderAndFocus("planningCalendarStatus");
+      if (!saved) restorePlanningCalendarDraft(data);
     }
-  } else {
-    const previousVersion = state.planningCalendar.version;
-    state.planningCalendar = next;
-    logActivity("planning-calendar-updated", { id: "", title: "Planning calendar" }, { planningCalendar: { from: `v${previousVersion}`, to: `v${next.version}` } });
-    persist();
-    state.planningCalendarStatus = "Planning calendar saved. Timeline scope reset to All time.";
   }
-  state.periodSelection = { kind: "all" };
-  state.periodAnnouncement = "Planning calendar changed. Timeline scope reset to All time.";
-  pushViewUrl(true);
-  renderAndFocus("planningCalendarStatus");
 }
 
 function selectSpaceMode(mode) {
+  state.routeAnnouncement = "";
   state.selectedMode = String(mode || "");
   if (state.selectedView === "insights") { state.query = ""; state.insightStatusFilter = ""; }
   state.spaceModes[state.selectedView] = state.selectedMode;
@@ -4748,15 +5910,17 @@ function customerCanManageFields() {
   return !state.team.active || (state.team.role === "owner" && state.team.connection === "live" && !state.team.mutationBusy);
 }
 
-async function commitCustomerDirectory(nextDirectory, message) {
-  if (!customerCanManage()) return;
+async function commitCustomerDirectory(nextDirectory, message, onCommitted = () => {}) {
+  if (!customerCanManage()) return false;
+  let committed = false;
   const next = normalizeCustomerDirectory({ ...nextDirectory, version: state.customerDirectory.version + 1 });
   if (state.team.active) {
     state.team.mutationBusy = true;
     render();
     try {
       const result = await state.team.repository.updateCustomerDirectory(next, state.customerDirectory.version);
-      applyTeamSnapshot(result?.snapshot);
+      if (!applyTeamSnapshot(result?.snapshot)) throw new Error("The customer save was not confirmed. Your draft is still available.");
+      committed = true;
       state.customerStatus = message;
     } catch (error) {
       state.customerStatus = safeTeamError(error, "The customer directory could not be updated.");
@@ -4764,13 +5928,14 @@ async function commitCustomerDirectory(nextDirectory, message) {
       state.team.mutationBusy = false;
     }
   } else {
-    state.customerDirectory = next;
-    persist();
-    logActivity("customer-directory-updated", { title: "Customer directory" }, { customerDirectory: message });
+    await commitLocalWorkspacePatch({ customerDirectory: next }, [createActivityEntry("customer-directory-updated", { title: "Customer directory" }, { customerDirectory: message })]);
+    committed = true;
     state.customerStatus = message;
   }
+  if (committed) onCommitted();
   render();
   document.querySelector("#customerStatus")?.focus();
+  return committed;
 }
 
 function openNewCustomer() {
@@ -4804,23 +5969,47 @@ function changeCustomerPage(page) {
   document.querySelector("#accountDirectoryTitle")?.focus?.();
 }
 
-function customerAccountFormValues(form) {
+function captureCustomerAccountDraft(event) {
+  if (!customerCanManage()) return;
+  const form = event.currentTarget;
+  const id = String(new FormData(form).get("accountId") || "");
+  const key = id || "new";
+  const previous = state.customerAccountDrafts.get(key);
+  state.customerAccountDrafts.set(key, {
+    baseline: previous?.baseline ?? JSON.stringify(state.customerDirectory.accounts.find(account => account.id === id) || null),
+    fields: previous?.fields ?? JSON.stringify(state.customerDirectory.fields),
+    values: { id, ...customerAccountFormValues(form, false) }
+  });
+  document.querySelector("#customerAccountDraftStatus")?.removeAttribute("hidden");
+  document.querySelector("#discardCustomerAccountDraft")?.removeAttribute("hidden");
+}
+
+function discardCustomerAccountDraft() {
+  const id = document.querySelector('#customerAccountForm [name="accountId"]')?.value || "new";
+  state.customerAccountDrafts.delete(id);
+  state.customerStatus = "Account draft discarded.";
+  render();
+  document.querySelector('#customerAccountForm [name="name"]')?.focus();
+}
+
+function customerAccountFormValues(form, trim = true) {
   const data = new FormData(form);
+  const text = name => trim ? String(data.get(name) || "").trim() : String(data.get(name) || "");
   const attributes = {};
   for (const field of state.customerDirectory.fields) {
     const name = `attribute.${field.id}`;
     if (field.type === "multi-select") attributes[field.id] = data.getAll(name).map(String);
-    else if (data.get(name) !== null && String(data.get(name)).trim() !== "") {
-      const raw = String(data.get(name)).trim();
-      attributes[field.id] = field.type === "number" ? Number(raw) : field.type === "boolean" ? raw === "true" : raw;
+    else if (data.get(name) !== null && (trim ? String(data.get(name)).trim() : String(data.get(name))) !== "") {
+      const raw = text(name);
+      attributes[field.id] = field.type === "number" && trim ? Number(raw) : field.type === "boolean" ? raw === "true" : raw;
     }
   }
   return {
-    name: String(data.get("name") || "").trim(), domain: String(data.get("domain") || "").trim(),
-    status: String(data.get("status") || "prospect"), industry: String(data.get("industry") || "").trim(),
-    region: String(data.get("region") || "").trim(), employeeCount: data.get("employeeCount") === "" ? null : Number(data.get("employeeCount")),
-    planTier: String(data.get("planTier") || "").trim(), ownerPersonId: String(data.get("ownerPersonId") || "").trim(),
-    notes: String(data.get("notes") || "").trim(), tagIds: data.getAll("tagIds").map(String), attributes
+    name: text("name"), domain: text("domain"),
+    status: String(data.get("status") || "prospect"), industry: text("industry"),
+    region: text("region"), employeeCount: trim ? (data.get("employeeCount") === "" ? null : Number(data.get("employeeCount"))) : text("employeeCount"),
+    planTier: text("planTier"), ownerPersonId: text("ownerPersonId"),
+    notes: text("notes"), tagIds: data.getAll("tagIds").map(String), attributes
   };
 }
 
@@ -4829,11 +6018,17 @@ async function saveCustomerAccount(event) {
   if (!customerCanManage()) return;
   try {
     const id = String(new FormData(event.currentTarget).get("accountId") || "");
+    const draft = state.customerAccountDrafts.get(id || "new");
+    if (draft && (draft.baseline !== JSON.stringify(state.customerDirectory.accounts.find(account => account.id === id) || null) || draft.fields !== JSON.stringify(state.customerDirectory.fields))) {
+      throw new Error("This account or its custom fields changed while you were editing. Copy your draft, then discard it to load the latest version.");
+    }
     const values = customerAccountFormValues(event.currentTarget);
     const next = id ? updateCustomerAccount(state.customerDirectory, id, values) : createCustomerAccount(state.customerDirectory, values);
     const saved = id ? id : next.accounts.at(-1).id;
-    state.selectedCustomerId = saved;
-    await commitCustomerDirectory(next, `${values.name} ${id ? "updated" : "added"}.`);
+    await commitCustomerDirectory(next, `${values.name} ${id ? "updated" : "added"}.`, () => {
+      state.selectedCustomerId = saved;
+      state.customerAccountDrafts.delete(id || "new");
+    });
   } catch (error) { showCustomerError(error); }
 }
 
@@ -4841,12 +6036,14 @@ async function deleteCustomerAccount(event) {
   const id = event.currentTarget.dataset.customerId;
   const account = state.customerDirectory.accounts.find((entry) => entry.id === id);
   if (!account) return;
-  const confirmed = await requestDataConfirmation({ title: "Delete customer account?", description: `${account.name} can only be deleted when no initiative targets it directly.`, confirmLabel: "Delete account", trigger: event.currentTarget });
+  const confirmed = await requestDataConfirmation({ title: "Delete customer account?", description: `${account.name} can only be deleted when no initiative or Insights record links to it.`, confirmLabel: "Delete account", trigger: event.currentTarget });
   if (!confirmed) return;
   try {
-    const next = removeCustomerAccount(state.customerDirectory, id, state.items);
-    state.selectedCustomerId = next.accounts[0]?.id || "";
-    await commitCustomerDirectory(next, `${account.name} deleted.`);
+    const next = removeCustomerAccount(state.customerDirectory, id, state.items, state.insightRecords);
+    await commitCustomerDirectory(next, `${account.name} deleted.`, () => {
+      state.selectedCustomerId = next.accounts[0]?.id || "";
+      state.customerAccountDrafts.delete(id);
+    });
   } catch (error) { showCustomerError(error); }
 }
 
@@ -4883,8 +6080,10 @@ async function applyCustomerImport() {
     const result = applyCustomerCsvImport(state.customerImport.text, state.customerDirectory);
     if (!demoMode && !state.team.active) state.backups = storeWorkspaceSnapshot(localStorage, backupKey, state.backups, exportPortableWorkspace(), backupReasons.import);
     const total = result.preview.creates + result.preview.updates;
-    state.customerImport = null;
-    await commitCustomerDirectory(result.directory, `Imported ${total} customer accounts with a recovery snapshot.`);
+    const pendingImport = state.customerImport;
+    await commitCustomerDirectory(result.directory, `Imported ${total} customer accounts with a recovery snapshot.`, () => {
+      if (state.customerImport === pendingImport) state.customerImport = null;
+    });
   } catch (error) { showCustomerError(error); }
 }
 
@@ -4967,12 +6166,14 @@ async function saveCustomerSegment(event) {
 async function deleteCustomerSegment(event) {
   const id = event.currentTarget.dataset.segmentId;
   const segment = state.customerDirectory.segments.find((entry) => entry.id === id);
-  const confirmed = await requestDataConfirmation({ title: "Delete segment?", description: `${segment?.name || "This segment"} can only be deleted when no initiative targets it.`, confirmLabel: "Delete segment", trigger: event.currentTarget });
+  const confirmed = await requestDataConfirmation({ title: "Delete segment?", description: `${segment?.name || "This segment"} can only be deleted when no initiative or Insights record links to it.`, confirmLabel: "Delete segment", trigger: event.currentTarget });
   if (!confirmed) return;
   try {
-    const next = removeCustomerSegment(state.customerDirectory, id, state.items);
-    state.selectedSegmentId = next.segments[0]?.id || "";
-    await commitCustomerDirectory(next, `${segment.name} deleted.`);
+    const next = removeCustomerSegment(state.customerDirectory, id, state.items, state.insightRecords);
+    await commitCustomerDirectory(next, `${segment.name} deleted.`, () => {
+      state.selectedSegmentId = next.segments[0]?.id || "";
+      state.customerSegmentDraft = null;
+    });
   } catch (error) { showCustomerError(error); }
 }
 
@@ -5080,9 +6281,7 @@ async function commitOrganization(nextOrganization, message) {
       state.team.mutationBusy = false;
     }
   } else {
-    state.organization = next;
-    persist();
-    logActivity("organization-updated", { title: "Product organization" }, { organization: message });
+    await commitLocalWorkspacePatch({ organization: next }, [createActivityEntry("organization-updated", { title: "Product organization" }, { organization: message })]);
     state.organizationStatus = message;
   }
   render();
@@ -5114,21 +6313,27 @@ async function editOrganizationPerson(event) {
 }
 
 async function removeOrganizationPerson(event) {
+  const trigger = event.currentTarget;
+  const personId = trigger.dataset.removePerson;
+  const scope = captureDocumentArtifactScope();
   try {
-    const person = state.organization.people.find((entry) => entry.id === event.currentTarget.dataset.removePerson);
+    const person = state.organization.people.find((entry) => entry.id === personId);
     const confirmed = await requestDataConfirmation({
       title: "Remove person?",
       description: `${person?.displayName || "This person"} can only be removed when they lead no units and own no initiatives, risks, dependencies, or customer accounts.`,
       confirmLabel: "Remove Person",
-      trigger: event.currentTarget
+      trigger
     });
-    if (!confirmed) return;
+    if (!confirmed || !documentArtifactScopeIsCurrent(scope)) return;
     const customerAssignments = state.customerDirectory.accounts.map((account) => ({ id: `customer:${account.id}`, title: account.name, pocPersonId: account.ownerPersonId, orgUnitId: "" }));
-    const next = removePerson(state.organization, event.currentTarget.dataset.removePerson, [...state.items, ...customerAssignments]);
-    state.selectedPersonId = next.people[0]?.id || "";
+    const next = removePerson(state.organization, personId, [...state.items, ...customerAssignments]);
     await commitOrganization(next, `${person?.displayName || "Person"} removed.`);
+    if (!documentArtifactScopeIsCurrent(scope)) return;
+    if (state.organization.people.some(entry => entry.id === personId)) throw new Error("Removal was not confirmed. The saved person is still available; review the status and try again.");
+    state.selectedPersonId = next.people[0]?.id || "";
+    renderAndFocus("organizationStatus");
   } catch (error) {
-    showOrganizationError(error);
+    if (documentArtifactScopeIsCurrent(scope)) showOrganizationError(error);
   }
 }
 
@@ -5158,20 +6363,26 @@ async function editOrganizationUnit(event) {
 }
 
 async function removeOrganizationUnit(event) {
+  const trigger = event.currentTarget;
+  const unitId = trigger.dataset.removeUnit;
+  const scope = captureDocumentArtifactScope();
   try {
-    const unit = state.organization.units.find((entry) => entry.id === event.currentTarget.dataset.removeUnit);
+    const unit = state.organization.units.find((entry) => entry.id === unitId);
     const confirmed = await requestDataConfirmation({
       title: "Remove organization unit?",
       description: `${unit?.name || "This unit"} can only be removed when it has no child units or assigned initiatives.`,
       confirmLabel: "Remove Unit",
-      trigger: event.currentTarget
+      trigger
     });
-    if (!confirmed) return;
-    const next = removeUnit(state.organization, event.currentTarget.dataset.removeUnit, state.items);
-    state.selectedOrgUnitId = rootUnits(next)[0]?.id || "";
+    if (!confirmed || !documentArtifactScopeIsCurrent(scope)) return;
+    const next = removeUnit(state.organization, unitId, state.items);
     await commitOrganization(next, `${unit?.name || "Unit"} removed.`);
+    if (!documentArtifactScopeIsCurrent(scope)) return;
+    if (state.organization.units.some(entry => entry.id === unitId)) throw new Error("Removal was not confirmed. The saved unit is still available; review the status and try again.");
+    state.selectedOrgUnitId = rootUnits(next)[0]?.id || "";
+    renderAndFocus("organizationStatus");
   } catch (error) {
-    showOrganizationError(error);
+    if (documentArtifactScopeIsCurrent(scope)) showOrganizationError(error);
   }
 }
 
@@ -5206,17 +6417,31 @@ function labelReadonlyDrafts() {
   });
 }
 
+function weeklyChecklistStorageKey() {
+  if (demoMode) return "";
+  if (!state.team.active) return activeProjectStorageKeys.checklist;
+  if (state.team.projectId) return projectKeys(state.team.projectId).checklist;
+  const server = state.team.connectorId || state.team.config?.url || state.team.managedConfig?.url || state.team.mode;
+  return `pm-os-staging.checklist.v1.team.${encodeURIComponent(JSON.stringify([server, state.team.workspace?.id]))}`;
+}
+
 async function copyDraft(button, draftId) {
   const draft = document.querySelector(`#${draftId}`);
   const liveRegion = document.querySelector(draftId === "executiveBriefMemoDraft" ? "#executiveBriefCopyStatus" : "#copyStatus");
   if (!button || !draft || !liveRegion) return;
   const originalLabel = button.textContent;
   const copiedWorkspace = state.items;
+  const checklistKey = weeklyChecklistStorageKey();
+  let progressWarning = "";
   try {
     if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
     await navigator.clipboard.writeText(draft.value);
     if (draftId === "weeklyUpdateDraft" && state.items === copiedWorkspace) {
       state.weeklyUpdateCopied = true;
+      if (checklistKey) {
+        try { localStorage.setItem(checklistKey, "1"); }
+        catch { progressWarning = " Checklist progress could not be saved on this device."; }
+      }
       const step = document.querySelector("#checklistCopyUpdate")?.closest("li");
       step?.classList.add("complete");
       if (step?.querySelector("span")) step.querySelector("span").textContent = "✓";
@@ -5226,10 +6451,12 @@ async function copyDraft(button, draftId) {
     button.textContent = "Copied";
     liveRegion.textContent = draftId === "executiveBriefMemoDraft"
       ? "Executive brief copied to clipboard"
-      : `${draft.getAttribute("aria-label") || "Draft"} copied to clipboard.`;
+      : `${draft.getAttribute("aria-label") || "Draft"} copied to clipboard.${progressWarning}`;
     button.focus();
     window.setTimeout(() => { if (button.isConnected) button.textContent = originalLabel; }, 2000);
   } catch {
+    const details = draft.closest("details");
+    if (details) details.open = true;
     draft.focus();
     draft.select();
     liveRegion.textContent = draftId === "executiveBriefMemoDraft"
@@ -5266,6 +6493,9 @@ function createTeamState(overrides = {}) {
     unsubscribeConnection: null,
     members: [],
     invite: null,
+    invitations: [],
+    inviteEmail: "",
+    inviteAttempt: null,
     showWorkspaceList: false,
     mutationBusy: false,
     conflict: null,
@@ -5297,9 +6527,25 @@ function initiativeDetailItem() {
 }
 
 function revealFocusedInitiativeRecord(detail, item) {
-  if (!detail.focusRecordId || !item) return detail;
-  const risk = item.risks.find((record) => record.id === detail.focusRecordId);
-  const dependency = item.dependencies.find((record) => record.id === detail.focusRecordId);
+  if (!detail.selectedId) return detail;
+  const risk = item?.risks.find(record => record.id === detail.focusRecordId);
+  const dependency = item?.dependencies.find(record => record.id === detail.focusRecordId);
+  if (!item || (detail.focusRecordId && !risk && !dependency)) {
+    const kind = detail.focusSection === "dependencies" ? "dependency" : "risk";
+    detail.missingLinkMessage = !item
+      ? "This initiative is no longer available in this workspace. Return to the workspace to choose an available initiative."
+      : "The linked " + kind + " record is no longer available. Showing " + item.title + "; review its current records below or close details to return to the workspace.";
+    detail.focusRecordId = "";
+    detail.focusSection = "";
+    state.editorAnnouncement = detail.missingLinkMessage;
+    const url = new URL(location.href);
+    if (url.searchParams.get("initiative") === detail.selectedId) {
+      url.searchParams.delete("record");
+      url.searchParams.delete("section");
+      history.replaceState(history.state, "", url);
+    }
+    return detail;
+  }
   if (risk) {
     detail.focusSection = "risks";
     if (["accepted", "resolved"].includes(risk.status)) detail.showClosedRisks = true;
@@ -5311,14 +6557,71 @@ function revealFocusedInitiativeRecord(detail, item) {
   return detail;
 }
 
+function initiativeRecordDraftScope() {
+  return JSON.stringify([demoMode, storageKey, documentComposerContext().projectKey,
+    state.team.active ? [state.team.connectorId, state.team.workspace?.id, state.team.authUser?.id || ""]
+      : [state.source.type, state.source.fileId || "", state.source.folderName || "", state.source.fileName || ""]]);
+}
+
+function prepareInitiativeRecordEditor(editor, item = initiativeDetailItem()) {
+  const scope = initiativeRecordDraftScope();
+  const key = recordDraftKey(scope, item?.id || "", editor);
+  const retained = initiativeRecordDrafts.get(key);
+  if (retained) {
+    retained.returnFocusId = editor.returnFocusId;
+    retained.actionContext = editor.actionContext;
+    retained.focusField = editor.focusField;
+    return retained;
+  }
+  return { ...editor, key, scope, initiativeId: item?.id || "", initiativeTitle: item?.title || "Initiative", baseline: recordDraftBaseline(item, editor), saving: false };
+}
+
+function initiativeRecordDraftRecoveryMarkup() {
+  if (!initiativeRecordDrafts.size) return "";
+  const drafts = [...initiativeRecordDrafts.values()].filter(draft => draft.scope === initiativeRecordDraftScope());
+  return `<aside class="storage-warning" aria-label="Unsaved risk and dependency drafts"><div><strong>Unsaved risk and dependency drafts</strong><p>Kept in this tab while you navigate. Reloading or closing the tab discards them. Save or download before leaving.</p>${drafts.map(draft => `<div><span>${escapeHtml(draft.initiativeTitle)} · ${draft.kind}</span> <button class="secondary small" type="button" data-resume-record-draft="${escapeHtml(draft.key)}">Resume ${draft.kind} draft</button> <button class="secondary small" type="button" data-download-record-draft="${escapeHtml(draft.key)}">Download ${draft.kind} draft</button> <button class="text-button" type="button" data-discard-record-draft="${escapeHtml(draft.key)}" ${draft.saving ? "disabled" : ""}>Discard ${draft.kind} draft</button></div>`).join("")}${drafts.length < initiativeRecordDrafts.size ? "<p>Other drafts are retained in their original projects or data sources. Return there to review them.</p>" : ""}</div></aside>`;
+}
+
+function bindInitiativeRecordDraftRecovery() {
+  document.querySelectorAll("[data-resume-record-draft]").forEach(button => button.addEventListener("click", () => {
+    const draft = initiativeRecordDrafts.get(button.dataset.resumeRecordDraft);
+    if (!draft || draft.scope !== initiativeRecordDraftScope()) return;
+    if (!state.items.some(item => item.id === draft.initiativeId)) {
+      state.editorAnnouncement = "The initiative is unavailable. Download the retained draft before discarding it.";
+      button.parentElement.querySelector("span").textContent = state.editorAnnouncement;
+      button.parentElement.querySelector("[data-download-record-draft]")?.focus();
+      return;
+    }
+    openInitiativeDetail(draft.initiativeId, button, { replaceDetail: Boolean(state.initiativeDetail.selectedId) });
+    state.initiativeDetail.recordEditor = draft;
+    state.initiativeDetail.focusSection = draft.kind === "risk" ? "risks" : "dependencies";
+    render();
+  }));
+  document.querySelectorAll("[data-download-record-draft]").forEach(button => button.addEventListener("click", () => {
+    const draft = initiativeRecordDrafts.get(button.dataset.downloadRecordDraft);
+    if (draft?.scope === initiativeRecordDraftScope()) downloadFile(JSON.stringify({ initiative: draft.initiativeTitle, kind: draft.kind, recordId: draft.recordId, convertFromRiskId: draft.convertFromRiskId, fields: draft.draft }, null, 2), "application/json", "pm-os-unsaved-record.json");
+  }));
+  document.querySelectorAll("[data-discard-record-draft]").forEach(button => button.addEventListener("click", () => {
+    const draft = initiativeRecordDrafts.get(button.dataset.discardRecordDraft);
+    if (!draft || draft.saving || draft.scope !== initiativeRecordDraftScope()) return;
+    initiativeRecordDrafts.delete(draft.key);
+    if (state.initiativeDetail.recordEditor === draft) state.initiativeDetail.recordEditor = createInitiativeDetailState().recordEditor;
+    state.editorAnnouncement = `${draft.kind === "risk" ? "Risk" : "Dependency"} draft discarded.`;
+    render();
+  }));
+}
+
 function openInitiativeRecordEditor(kind, recordId = "", trigger = null) {
   if (!["risk", "dependency"].includes(kind) || teamEditorReadOnlyReason()) return;
-  state.initiativeDetail.recordEditor = { kind, recordId, convertFromRiskId: "", returnFocusId: trigger?.id || "", focusField: "", actionContext: null, draft: null, error: "" };
+  state.initiativeDetail.recordEditor = prepareInitiativeRecordEditor({ kind, recordId, convertFromRiskId: "", returnFocusId: trigger?.id || "", focusField: "", actionContext: null, draft: null, error: "" });
   state.initiativeDetail.focusSection = kind === "dependency" ? "dependencies" : "risks";
   render();
 }
 
-function cancelInitiativeRecordEditor() {
+function cancelInitiativeRecordEditor(discard = true) {
+  const editor = state.initiativeDetail.recordEditor;
+  if (discard && editor.saving) return;
+  if (discard) initiativeRecordDrafts.delete(editor.key);
   const { kind, returnFocusId } = state.initiativeDetail.recordEditor;
   state.initiativeDetail.recordEditor = { kind: "", recordId: "", convertFromRiskId: "", returnFocusId: "", focusField: "", actionContext: null, draft: null, error: "" };
   render();
@@ -5327,8 +6630,13 @@ function cancelInitiativeRecordEditor() {
 
 function captureInitiativeRecordDraft(event) {
   const form = event.currentTarget;
+  const editor = state.initiativeDetail.recordEditor;
+  if (!form.isConnected || editor.saving || editor.scope !== initiativeRecordDraftScope()) return;
   const data = new FormData(form);
-  state.initiativeDetail.recordEditor.draft = Object.fromEntries(data);
+  editor.draft = Object.fromEntries(data);
+  initiativeRecordDrafts.set(editor.key, editor);
+  const status = document.querySelector("#initiativeRecordDraftStatus");
+  if (status) status.textContent = "Unsaved draft. Kept in this tab while you navigate. Save or download before reloading or closing the tab. Cancel discards this draft; Escape keeps it.";
 }
 
 function syncDependencyTargetFields(event) {
@@ -5355,7 +6663,7 @@ function convertInitiativeRisk(recordId, trigger = null) {
   const item = initiativeDetailItem();
   const record = item?.risks.find((entry) => entry.id === recordId);
   if (!record || teamEditorReadOnlyReason()) return;
-  state.initiativeDetail.recordEditor = {
+  state.initiativeDetail.recordEditor = prepareInitiativeRecordEditor({
     kind: "dependency",
     recordId: "",
     convertFromRiskId: recordId,
@@ -5374,7 +6682,8 @@ function convertInitiativeRisk(recordId, trigger = null) {
       ownerName: record.ownerName,
       neededBy: record.reviewDate
     }
-  };
+  });
+  initiativeRecordDrafts.set(state.initiativeDetail.recordEditor.key, state.initiativeDetail.recordEditor);
   state.initiativeDetail.focusSection = "dependencies";
   render();
 }
@@ -5385,9 +6694,13 @@ async function saveInitiativeRecord(event) {
   const item = initiativeDetailItem();
   if (!item) return;
   const editor = state.initiativeDetail.recordEditor;
+  if (editor.saving) return;
   const data = new FormData(event.currentTarget);
   const raw = Object.fromEntries(data);
   editor.draft = raw;
+  initiativeRecordDrafts.set(editor.key, editor);
+  const staleError = recordDraftSaveError(item, editor, initiativeRecordDraftScope());
+  if (staleError) return failInitiativeRecord(staleError);
   const description = String(raw.description || "").trim();
   if (!description) return failInitiativeRecord("Description is required.");
   const timestamp = new Date().toISOString();
@@ -5399,7 +6712,7 @@ async function saveInitiativeRecord(event) {
   if (editor.kind === "risk") {
     record = normalizeRiskRecord({
       ...existing,
-      id: existing?.id || initiativeRecordId("risk"),
+      id: existing?.id || (editor.pendingRecordId ||= initiativeRecordId("risk")),
       description,
       likelihood: Number(raw.likelihood),
       impact: Number(raw.impact),
@@ -5420,7 +6733,7 @@ async function saveInitiativeRecord(event) {
     if (!targetName) return failInitiativeRecord("Target name is required for an external dependency.", "[name=targetName]");
     record = normalizeDependencyRecord({
       ...existing,
-      id: existing?.id || initiativeRecordId("dependency"),
+      id: existing?.id || (editor.pendingRecordId ||= initiativeRecordId("dependency")),
       description,
       targetType,
       targetInitiativeId: targetType === "initiative" ? targetInitiative.id : "",
@@ -5438,11 +6751,18 @@ async function saveInitiativeRecord(event) {
   if (editor.convertFromRiskId) patch.risks = item.risks.filter((entry) => entry.id !== editor.convertFromRiskId);
   const verb = editor.convertFromRiskId ? "Converted" : existing ? "Updated" : "Added";
   const actionContext = editor.actionContext;
-  if (state.team.active) {
-    state.initiativeDetail.recordEditor = { kind: "", recordId: "", convertFromRiskId: "", returnFocusId: "", focusField: "", actionContext: null, draft: null, error: "" };
-    state.initiativeDetail.focusRecordId = record.id;
+  editor.saving = true;
+  const scope = captureDocumentArtifactScope();
+  render();
+  try {
+    await commitInitiativeRecordPatch(item, patch, initiativeRecordAnnouncement(verb, editor.kind, record.description), editor.kind, actionContext, { editor, recordId: record.id, scope });
+  } finally {
+    editor.saving = false;
+    if (documentArtifactScopeIsCurrent(scope) && state.initiativeDetail.recordEditor === editor) {
+      render();
+      if (editor.error) focusAfterRender("initiativeRecordError");
+    }
   }
-  await commitInitiativeRecordPatch(item, patch, initiativeRecordAnnouncement(verb, editor.kind, record.description), editor.kind, actionContext, { editor, recordId: record.id });
 }
 
 function failInitiativeRecord(message, selector = "[name=description]") {
@@ -5483,6 +6803,19 @@ async function deleteInitiativeRecord(kind, recordId, trigger) {
 }
 
 async function commitInitiativeRecordPatch(item, patch, announcement, kind, actionContext = null, savedRecord = null) {
+  const scope = savedRecord?.scope || captureDocumentArtifactScope();
+  const scopeCurrent = () => documentArtifactScopeIsCurrent(scope);
+  const finishSavedDraft = () => {
+    if (!savedRecord) return;
+    if (initiativeRecordDrafts.get(savedRecord.editor.key) === savedRecord.editor) initiativeRecordDrafts.delete(savedRecord.editor.key);
+    if (scopeCurrent() && state.initiativeDetail.recordEditor === savedRecord.editor) {
+      state.initiativeDetail.recordEditor = createInitiativeDetailState().recordEditor;
+      state.initiativeDetail.focusRecordId = savedRecord.recordId;
+    }
+  };
+  if (kind === "dependency" && findDependencyCycles(state.items.map((entry) => entry.id === item.id ? { ...entry, ...patch } : entry)).some((cycle) => cycle.itemIds.includes(item.id))) {
+    announcement += " Circular dependency detected. Review the dependency loop before committing to this plan.";
+  }
   const change = {};
   for (const field of ["risks", "dependencies"]) {
     if (!Array.isArray(patch[field]) || JSON.stringify(item[field]) === JSON.stringify(patch[field])) continue;
@@ -5497,12 +6830,13 @@ async function commitInitiativeRecordPatch(item, patch, announcement, kind, acti
   }
   if (!state.team.active) {
     try {
-      commitLocalInitiativeUpdate(updateItem(state.items, item.id, patch), createActivityEntry(`${kind}-updated`, item, change));
+      await commitLocalInitiativeUpdate(updateItem(state.items, item.id, patch), createActivityEntry(`${kind}-updated`, item, change), scope);
     } catch (error) {
-      const message = localInitiativeSaveError(error, Boolean(savedRecord));
+      const message = scopeCurrent() ? localInitiativeSaveError(error, Boolean(savedRecord)) : "The project changed while saving. Your draft is retained; check the original project for the saved result before retrying.";
+      if (savedRecord && !scopeCurrent()) savedRecord.editor.requiresReview = true;
       if (savedRecord) {
         savedRecord.editor.error = message;
-        const errorNode = document.querySelector("#initiativeRecordError");
+        const errorNode = scopeCurrent() && state.initiativeDetail.recordEditor === savedRecord.editor ? document.querySelector("#initiativeRecordError") : null;
         if (errorNode) {
           errorNode.textContent = message;
           errorNode.tabIndex = -1;
@@ -5524,10 +6858,8 @@ async function commitInitiativeRecordPatch(item, patch, announcement, kind, acti
       }
       return;
     }
-    if (savedRecord) {
-      state.initiativeDetail.recordEditor = { kind: "", recordId: "", convertFromRiskId: "", returnFocusId: "", focusField: "", actionContext: null, draft: null, error: "" };
-      state.initiativeDetail.focusRecordId = savedRecord.recordId;
-    }
+    finishSavedDraft();
+    if (!scopeCurrent()) return;
     if (actionContext) finishActionMutation(actionContext, announcement);
     else {
       state.editorAnnouncement = announcement;
@@ -5540,14 +6872,41 @@ async function commitInitiativeRecordPatch(item, patch, announcement, kind, acti
   render();
   let saved = false;
   try {
-    const result = await state.team.repository.updateItem(item.id, patch, item.version);
-    applyTeamSnapshot(result?.snapshot);
+    const result = await scope.repository.updateItem(item.id, patch, item.version);
+    if (!scopeCurrent()) {
+      if (savedRecord) {
+        savedRecord.editor.requiresReview = true;
+        savedRecord.editor.error = "The save completed in the original project. Your draft is retained; reopen that project and check its saved record before discarding.";
+      }
+      return;
+    }
+    if (!result?.snapshot || !applyTeamSnapshot(result.snapshot)) {
+      if (savedRecord) savedRecord.editor.requiresReview = true;
+      throw new Error("The server did not confirm the save. Your draft is retained; check the saved record before retrying.");
+    }
+    finishSavedDraft();
     state.team.conflict = null;
     state.team.status = "Team workspace updated.";
     state.editorAnnouncement = announcement;
     saved = true;
   } catch (error) {
-    if (isTeamConflict(error) || isAmbiguousTeamError(error)) {
+    if (savedRecord) {
+      if (isAmbiguousTeamError(error)) savedRecord.editor.requiresReview = true;
+      savedRecord.editor.error = isTeamConflict(error) || isAmbiguousTeamError(error)
+        ? "The saved record changed or the save could not be confirmed. Your draft is retained. Reopen the project to review its latest saved values before retrying."
+        : safeTeamError(error, `The ${kind} could not be saved. Your draft is retained.`);
+      if (scopeCurrent()) {
+        state.team.status = savedRecord.editor.error;
+        if (isTeamConflict(error) || isAmbiguousTeamError(error)) {
+          try {
+            const latest = await scope.repository.open();
+            if (scopeCurrent()) applyTeamSnapshot(latest?.snapshot || latest);
+          } catch { /* Preserve the raw draft when the latest workspace is unavailable. */ }
+        }
+        if (isTeamAccessLoss(error)) await exitTeamForBoundary(teamAccessLossMessage(error));
+      }
+    } else if (!scopeCurrent()) return;
+    else if (isTeamConflict(error) || isAmbiguousTeamError(error)) {
       const draft = prepareTeamUpdateDraft({ operation: "update", itemId: item.id, itemTitle: item.title, patch, ambiguous: isAmbiguousTeamError(error) }, item);
       const outcome = draft.ambiguous ? (await preserveTeamConflict(draft), "conflict") : await resolveTeamConflictDraft(draft);
       clearInitiativeDetailUrl();
@@ -5558,7 +6917,8 @@ async function commitInitiativeRecordPatch(item, patch, announcement, kind, acti
     }
     else if (isTeamAccessLoss(error)) await exitTeamForBoundary(teamAccessLossMessage(error));
     else state.team.status = safeTeamError(error, `The ${kind} could not be saved.`);
-  } finally { state.team.mutationBusy = false; }
+  } finally { scope.team.mutationBusy = false; }
+  if (!scopeCurrent()) return;
   if (saved && actionContext) finishActionMutation(actionContext, announcement);
   else {
     render();
@@ -5583,30 +6943,47 @@ function activeSourceLabel() {
 }
 
 function globalSyncLabel() {
+  if (state.localWriteConflict) return "Not saved · review newer work";
   if (demoMode) return "Demo only";
-  if (state.dataBusy) return "Syncing";
-  if (!state.team.active && (state.sourceSelection === "local-server" || state.sourceSelection === "team")) return "Browser active · server setup";
   if (state.team.active) {
-    if (["offline", "reconnecting"].includes(state.team.connection)) return "Read-only · reconnecting";
-    return state.team.role === "viewer" ? "Read-only · live" : "Saved · live";
+    if (state.team.connection !== "live") return "Read-only · reconnecting";
+    if (state.team.mutationBusy) return "Saving to Team…";
+    if (state.dataBusy) return "Preparing Team data…";
+    return state.team.role === "viewer" ? "Viewer · read-only" : "Synced with Team";
   }
+  if (state.storageWarning) return "Recovery needed · check saved work";
+  if (state.dataBusy) return "Preparing your data…";
   if (state.source.type === "google-drive") {
-    if (state.driveReview || state.sync.conflict) return "Conflict";
+    if (state.driveReview || state.sync.conflict) return "Conflict · review Drive changes";
+    if (!navigator.onLine) return state.sync.localPending ? "Offline · Drive sync pending" : "Offline · device copy available";
+    if (state.sync.localPending) return state.driveToken ? "Saved on device · Drive sync pending" : "Saved on device · connect Drive to sync";
     if (!state.driveToken) return "Offline · Drive disconnected";
-    return "Saved · Drive connected";
+    return state.sync.baseRemote ? "Synced with Drive" : "Drive connected · sync not checked";
   }
   if (state.source.type === "local-file") {
     if (state.linkedFile.permission === "denied") return "Read-only · permission needed";
-    return state.linkedFile.handle ? "Saved · linked file" : "Offline · file unavailable";
+    if (state.sync.fileConflicts.length) return "Conflict · review linked file";
+    if (!state.linkedFile.handle) return "Offline · file unavailable";
+    if (state.sync.localPending) return "Saved on device · file save pending";
+    return "Saved to linked file";
   }
-  return "Saved locally";
+  return "Saved on this device";
 }
 
 function syncIndicatorTone() {
   const label = globalSyncLabel();
-  if (/Conflict|Offline|Read-only/.test(label)) return "is-warning";
-  if (/Syncing|reconnecting/.test(label)) return "is-busy";
+  if (/conflict|offline|read-only|pending|recovery|connect Drive|not checked/i.test(label)) return "is-warning";
+  if (/Saving|Preparing/.test(label)) return "is-busy";
   return "is-saved";
+}
+
+function refreshSaveStatus() {
+  if (demoMode) return;
+  for (const pill of document.querySelectorAll(".global-sync-pill")) {
+    pill.textContent = globalSyncLabel();
+    pill.className = `global-sync-pill ${syncIndicatorTone()}`;
+  }
+  for (const status of document.querySelectorAll("[data-save-status]")) status.textContent = globalSyncLabel();
 }
 
 function initiativeDetailDialogMarkup() {
@@ -5614,7 +6991,7 @@ function initiativeDetailDialogMarkup() {
   if (!detail.selectedId) return "";
   const item = initiativeDetailItem();
   if (!item) {
-    return `<dialog class="initiative-detail-dialog" id="initiativeDetailDialog" aria-labelledby="initiativeDetailTitle" aria-describedby="initiativeDetailDescription"><div class="initiative-detail-shell"><header class="initiative-detail-heading"><div><p class="eyebrow">Initiative</p><h3 id="initiativeDetailTitle" tabindex="-1">Initiative unavailable</h3><p id="initiativeDetailDescription">This initiative is not available in the active data source.</p></div><button class="editor-close" id="closeInitiativeDetailButton" type="button" aria-label="Close initiative details" title="Close">X</button></header><div class="initiative-detail-body">${emptyState("It may have been deleted, or this link may belong to a different Browser, Drive, or Team workspace.")}</div><footer class="initiative-detail-footer"><button class="secondary" id="dismissUnavailableInitiativeButton" type="button">Return to ${escapeHtml(selectedViewDefinition().title)}</button></footer></div></dialog>`;
+    return `<dialog class="initiative-detail-dialog" id="initiativeDetailDialog" aria-labelledby="initiativeDetailTitle" aria-describedby="initiativeDetailDescription"><div class="initiative-detail-shell"><header class="initiative-detail-heading"><div><p class="eyebrow">Initiative</p><h3 id="initiativeDetailTitle" tabindex="-1">Initiative unavailable</h3><p id="initiativeDetailDescription">This initiative is not available in the active data source.</p></div><button class="editor-close" id="closeInitiativeDetailButton" type="button" aria-label="Close initiative details" title="Close">X</button></header><div class="initiative-detail-body">${emptyState("It may have been deleted, or this link may belong to a different Browser, Drive, or Team workspace.")}${initiativeRecordDraftRecoveryMarkup()}</div><footer class="initiative-detail-footer"><button class="secondary" id="dismissUnavailableInitiativeButton" type="button">Return to ${escapeHtml(selectedViewDefinition().title)}</button></footer></div></dialog>`;
   }
   const score = workspacePriorityValue(item);
   const readiness = calculateLaunchReadiness(item);
@@ -5627,12 +7004,17 @@ function initiativeDetailDialogMarkup() {
     <div class="initiative-detail-shell">
       <header class="initiative-detail-heading"><div><p class="eyebrow">Initiative</p><h3 id="initiativeDetailTitle" tabindex="-1">${escapeHtml(item.title)}</h3><p id="initiativeDetailDescription">Canonical initiative details from the active ${escapeHtml(activeSourceLabel())} workspace.</p></div><button class="editor-close" id="closeInitiativeDetailButton" type="button" aria-label="Close ${escapeHtml(item.title)} details" title="Close">X</button></header>
       <div class="initiative-detail-body">
+        ${detail.missingLinkMessage ? `<p class="route-notice" id="initiativeMissingLinkStatus" role="status">${escapeHtml(detail.missingLinkMessage)}</p>` : ""}
+        ${initiativeRecordDraftRecoveryMarkup()}
         <section class="initiative-detail-summary" aria-label="Initiative summary"><span class="pill status-pill status-${escapeHtml(statusForInitiative(state.workflow, item).color)}">${escapeHtml(initiativeStatusLabel(item))}</span><div class="initiative-detail-scores"><p><span>${escapeHtml(workspacePriorityLabel())}</span><strong>${escapeHtml(score)}</strong></p><p><span>Launch readiness</span><strong>${readiness}%</strong></p></div><dl class="initiative-detail-facts"><div class="initiative-detail-targets"><dt>Customer targets</dt><dd>${initiativeTargetChips(item, 12)}</dd></div><div><dt>Point of contact</dt><dd>${escapeHtml(organizationPersonName(item.pocPersonId) || item.owner || "Unassigned")}</dd></div><div><dt>Organization unit</dt><dd>${escapeHtml(organizationUnitPath(item.orgUnitId) || "Unassigned")}</dd></div><div><dt>Planned timeline</dt><dd>${escapeHtml(describeInitiativeTimeline(item, state.planningCalendar))}</dd></div><div><dt>Last updated</dt><dd>${escapeHtml(formatSyncTime(item.updatedAt))}</dd></div></dl></section>
         <section class="initiative-detail-section" aria-labelledby="initiativeProblemTitle"><h4 id="initiativeProblemTitle">Problem and priority</h4><p>${escapeHtml(item.problem || "No problem statement captured.")}</p>${initiativePriorityFactsMarkup(item)}</section>
+        <section class="initiative-detail-section" aria-labelledby="initiativeMeasureTitle"><h4 id="initiativeMeasureTitle">Authored measure</h4><p>Saved intent; achievement requires observed results.</p><dl class="initiative-detail-facts stacked">${[["Objective", item.objective], ["Primary metric", item.primaryMetric], ["Metric target", item.metricTarget], ["Metric review date", item.metricReviewDate]].map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHtml(value || "Not recorded")}</dd></div>`).join("")}</dl>${initiativeContextualEditButton(item, "detail-measure", "primaryMetric", "Edit measure")}</section>
         <section class="initiative-detail-section" aria-labelledby="initiativeExecutionTitle"><h4 id="initiativeExecutionTitle">Current execution</h4><dl class="initiative-detail-facts stacked"><div><dt>Next step</dt><dd>${escapeHtml(item.nextStep || "No next step captured.")}</dd></div></dl></section>
+        ${initiativeSavedActionsMarkup(item)}
+        ${initiativeSavedDecisionsMarkup(item)}
         ${initiativeRecordCollectionMarkup("risk", item, reason)}
         ${initiativeRecordCollectionMarkup("dependency", item, reason)}
-        <section class="initiative-detail-section" aria-labelledby="initiativeEvidenceTitle"><h4 id="initiativeEvidenceTitle">Evidence and decision</h4><dl class="initiative-detail-facts stacked"><div><dt>Experiment</dt><dd>${escapeHtml(item.experiment || "No experiment captured.")}</dd></div><div><dt>Decision</dt><dd>${escapeHtml(item.decision || "No decision captured.")}</dd></div></dl>${initiativeLinkedLearningMarkup(item)}</section>
+        <section class="initiative-detail-section" aria-labelledby="initiativeEvidenceTitle"><h4 id="initiativeEvidenceTitle">Experiment and research</h4>${initiativeSavedValidationsMarkup(item)}${initiativeLinkedLearningMarkup(item)}</section>
         <section class="initiative-detail-section" aria-labelledby="initiativeActionsTitle"><div class="initiative-detail-section-heading"><h4 id="initiativeActionsTitle">Recommended actions</h4><span class="muted">Derived from current gaps</span></div><div class="initiative-detail-action-list">${recommendations.map(detailRecommendationCard).join("") || emptyState("No immediate follow-ups detected for this initiative.")}</div></section>
         <section class="initiative-detail-section" aria-labelledby="initiativeActivityTitle"><div class="initiative-detail-section-heading"><h4 id="initiativeActivityTitle">Activity</h4><span class="muted">${activity.length} matching events</span></div><div class="initiative-detail-activity">${activity.map((entry) => `<article><time datetime="${escapeHtml(entry.createdAt)}">${escapeHtml(new Date(entry.createdAt).toLocaleString())}</time><h5>${escapeHtml(entry.action)} by ${escapeHtml(entry.actor)}</h5><p>${escapeHtml(formatActivityChanges(entry.changes))}</p></article>`).join("") || emptyState("No activity has been recorded for this initiative yet.")}</div></section>
         <nav class="initiative-related-views" aria-label="Related initiative views"><span>Related views</span>${initiativeRelatedViews(item).map((view) => `<button class="secondary small" data-detail-view="${escapeHtml(view.deepLink)}" type="button">${escapeHtml(view.label)}</button>`).join("")}</nav>
@@ -5657,6 +7039,7 @@ function initiativeRecordCollectionMarkup(kind, item, reason) {
   const collection = kind === "dependency" ? "dependencies" : "risks";
   return `<section class="initiative-detail-section initiative-record-section" id="initiative-${collection}" aria-labelledby="${sectionId}">
     <div class="initiative-detail-section-heading"><div><h4 id="${sectionId}" tabindex="-1">${plural}</h4><span class="muted">${active.length} active${closed.length ? ` · ${closed.length} closed` : ""}</span></div><div class="initiative-record-section-actions">${closed.length ? `<button class="secondary small" data-toggle-closed="${kind}" type="button" aria-expanded="${showClosed}">${showClosed ? "Hide closed" : "Show closed"}</button>` : ""}<button class="secondary small" id="addInitiative${risk ? "Risk" : "Dependency"}" data-add-record="${kind}" type="button" ${disabled} ${describedBy}>Add ${kind}</button></div></div>
+    ${risk ? "" : dependencyCycleWarnings([item], "detail", false)}
     ${editorOpen ? initiativeRecordFormMarkup(kind, item) : ""}
     <div class="initiative-record-list">${visible.map((record) => initiativeRecordCardMarkup(kind, record, item, reason)).join("") || emptyState(`No ${risk ? "active risks" : "dependencies"} captured.`)}</div>
   </section>`;
@@ -5693,16 +7076,20 @@ function initiativeRecordFormMarkup(kind, item) {
     ? { description: "", likelihood: 3, impact: 3, status: "open", ownerPersonId: "", ownerName: "", mitigation: "", reviewDate: "", needsClassification: false }
     : { description: "", targetType: "external", targetInitiativeId: "", targetName: "", status: "pending", ownerPersonId: "", ownerName: "", neededBy: "" };
   const value = { ...defaults, ...(existing || {}), ...(editor.draft || {}) };
-  const otherInitiatives = state.items.filter((entry) => entry.id !== item.id).map((entry) => `<option value="${escapeHtml(entry.id)}" ${value.targetInitiativeId === entry.id ? "selected" : ""}>${escapeHtml(entry.title)}</option>`).join("");
+  const missingTarget = value.targetInitiativeId && !state.items.some(entry => entry.id === value.targetInitiativeId);
+  const missingOwner = value.ownerPersonId && !state.organization.people.some(person => person.id === value.ownerPersonId);
+  const otherInitiatives = (missingTarget ? `<option value="${escapeHtml(value.targetInitiativeId)}" selected>Unavailable initiative (${escapeHtml(value.targetInitiativeId)})</option>` : "") + state.items.filter((entry) => entry.id !== item.id).map((entry) => `<option value="${escapeHtml(entry.id)}" ${value.targetInitiativeId === entry.id ? "selected" : ""}>${escapeHtml(entry.title)}</option>`).join("");
   const editorHeading = editor.actionContext?.heading || `${existing ? "Edit" : editor.convertFromRiskId ? "Convert to" : "Add"} ${kind}`;
   const editorDescription = editor.actionContext?.requestedOutcome || "";
-  return `<form class="initiative-record-form" id="initiativeRecordForm" data-record-kind="${kind}" novalidate>
+  return `<form class="initiative-record-form" id="initiativeRecordForm" data-record-kind="${kind}" aria-busy="${Boolean(editor.saving)}" novalidate><fieldset style="display:contents" ${editor.saving ? "disabled" : ""}>
     <div class="initiative-record-form-heading"><div><h5 id="initiativeRecordEditorTitle">${escapeHtml(editorHeading)}</h5>${editorDescription ? `<p>${escapeHtml(editorDescription)}</p>` : ""}</div><button class="text-button" id="cancelInitiativeRecord" type="button">Cancel</button></div>
+    <p id="initiativeRecordDraftStatus" role="status">${editor.draft ? "Unsaved draft. " : ""}Edits stay in this tab while you navigate. Save or download before reloading or closing the tab. Cancel discards this draft; Escape keeps it.</p>
+    ${editor.draft ? `<button class="secondary small" type="button" data-download-record-draft="${escapeHtml(editor.key)}">Download ${kind} draft</button>` : ""}
     <label class="record-wide"><span>Description</span><textarea name="description" maxlength="1000" required>${escapeHtml(value.description)}</textarea></label>
     ${risk ? `<div class="initiative-record-form-grid"><label><span>Likelihood</span><select name="likelihood">${[1,2,3,4,5].map((score) => `<option value="${score}" ${Number(value.likelihood) === score ? "selected" : ""}>${score}</option>`).join("")}</select></label><label><span>Impact</span><select name="impact">${[1,2,3,4,5].map((score) => `<option value="${score}" ${Number(value.impact) === score ? "selected" : ""}>${score}</option>`).join("")}</select></label><label><span>Status</span><select name="status">${Object.entries(riskStatusLabels).map(([status,label]) => `<option value="${status}" ${value.status === status ? "selected" : ""}>${label}</option>`).join("")}</select></label><label><span>Review date</span><input name="reviewDate" type="date" value="${escapeHtml(value.reviewDate)}"></label></div><label class="record-wide"><span>Mitigation</span><textarea name="mitigation" maxlength="2000">${escapeHtml(value.mitigation)}</textarea></label>` : `<div class="initiative-record-form-grid"><label><span>Target type</span><select name="targetType"><option value="external" ${value.targetType === "external" ? "selected" : ""}>External</option><option value="initiative" ${value.targetType === "initiative" ? "selected" : ""}>Initiative</option></select></label><label data-target-field="initiative" ${value.targetType === "initiative" ? "" : "hidden"}><span>Initiative target</span><select name="targetInitiativeId"><option value="">Select initiative</option>${otherInitiatives}</select></label><label data-target-field="external" ${value.targetType === "initiative" ? "hidden" : ""}><span>External target name</span><input name="targetName" maxlength="500" value="${escapeHtml(value.targetName)}" placeholder="Team, vendor, or approval"></label><label><span>Status</span><select name="status">${Object.entries(dependencyStatusLabels).map(([status,label]) => `<option value="${status}" ${value.status === status ? "selected" : ""}>${label}</option>`).join("")}</select></label><label><span>Needed by</span><input name="neededBy" type="date" value="${escapeHtml(value.neededBy)}"></label></div>`}
-    <div class="initiative-record-form-grid"><label><span>Organization owner</span><select name="ownerPersonId"><option value="">Unlinked</option>${personOptions(state.organization, value.ownerPersonId)}</select></label><label><span>External or fallback owner</span><input name="ownerName" maxlength="300" value="${escapeHtml(value.ownerName)}"></label></div>
-    <p class="initiative-editor-error" id="initiativeRecordError" role="alert">${escapeHtml(editor.error)}</p><button class="primary" type="submit">Save ${kind}</button>
-  </form>`;
+    <div class="initiative-record-form-grid"><label><span>Organization owner</span><select name="ownerPersonId"><option value="">Unlinked</option>${missingOwner ? `<option value="${escapeHtml(value.ownerPersonId)}" selected>Unavailable owner (${escapeHtml(value.ownerPersonId)})</option>` : ""}${personOptions(state.organization, value.ownerPersonId)}</select></label><label><span>External or fallback owner</span><input name="ownerName" maxlength="300" value="${escapeHtml(value.ownerName)}"></label></div>
+    <p class="initiative-editor-error" id="initiativeRecordError" tabindex="-1" role="alert">${escapeHtml(editor.error || recordDraftSaveError(item, editor, initiativeRecordDraftScope()))}</p><button class="primary" type="submit">${editor.saving ? "Saving..." : `Save ${kind}`}</button>
+  </fieldset></form>`;
 }
 
 function initiativePriorityFactsMarkup(item) {
@@ -5742,15 +7129,15 @@ function openInitiativeDetail(itemId, trigger, { replaceDetail = false } = {}) {
     createInitiativeDetailState({ selectedId: itemId, triggerId, historyOwned, focusSection, focusRecordId }),
     state.items.find((item) => item.id === itemId)
   );
-  if (focusRecordId) {
+  if (state.initiativeDetail.focusRecordId) {
     const kind = state.initiativeDetail.focusSection === "dependencies" ? "dependency" : "risk";
     state.editorAnnouncement = `Opened linked ${kind} record.`;
   }
   const url = new URL(location.href);
   url.searchParams.set("view", state.selectedView);
   url.searchParams.set("initiative", itemId);
-  if (focusSection) url.searchParams.set("section", focusSection); else url.searchParams.delete("section");
-  if (focusRecordId) url.searchParams.set("record", focusRecordId); else url.searchParams.delete("record");
+  if (state.initiativeDetail.focusSection) url.searchParams.set("section", state.initiativeDetail.focusSection); else url.searchParams.delete("section");
+  if (state.initiativeDetail.focusRecordId) url.searchParams.set("record", state.initiativeDetail.focusRecordId); else url.searchParams.delete("record");
   if (demoMode) url.searchParams.set("demo", "1");
   history[replaceDetail ? "replaceState" : "pushState"]({ view: state.selectedView, initiative: itemId, detailOpenedFromUi: historyOwned, detailTriggerId: triggerId }, "", url);
   persistCurrentProjectLocation();
@@ -5839,7 +7226,7 @@ function createInsightEditorState(overrides = {}) {
 }
 
 function insightCommandLabel(type) {
-  return ({ discovery: "New discovery", research: "New study", validation: "New experiment", feedback: "Add feedback", support: "New support case" })[type] || "New record";
+  return ({ discovery: "New discovery", research: "New study", validation: "New experiment", feedback: "Add feedback", support: "New support case", action: "New action", decision: "New decision" })[type] || "New record";
 }
 
 function insightCommandsMarkup() {
@@ -5857,8 +7244,69 @@ function blankInsightValues(type) {
   if (type === "discovery") return { ...common, problem: "", hypothesis: "", confidence: 0.5, nextStep: "" };
   if (type === "research") return { ...common, objective: "", questions: [], method: "", recruitmentTarget: 5, participantCount: 0, findings: "", dueDate: "" };
   if (type === "validation") return { ...common, hypothesis: "", method: "", successMetric: "", result: "", decision: "", decisionNotes: "", dueDate: "" };
+  if (type === "decision") return { ...common, question: "", outcome: "", rationale: "", decidedAt: "" };
+  if (type === "action") return { ...common, description: "", dueDate: "", sourceRecordId: "", enablementArea: "", completionEvidence: "" };
   if (type === "feedback") return { ...common, source: "", sourceRef: "", signal: "", receivedAt: todayStamp(), urgency: 3 };
   return { ...common, source: "", sourceRef: "", issue: "", customerImpact: "", severity: "medium", responseDueDate: "", resolution: "" };
+}
+
+function insightRelationshipEntries(field, values) {
+  const entries = field === "customerIds" ? state.customerDirectory.accounts.map(entry => ({ id: entry.id, label: entry.name, detail: [entry.domain, entry.industry, entry.region].filter(Boolean).join(" · ") }))
+    : field === "segmentIds" ? state.customerDirectory.segments.map(entry => ({ id: entry.id, label: entry.name, detail: segmentRuleSummary(entry) }))
+      : state.insightRecords.filter(entry => entry.id !== state.insightEditor.selectedId).map(entry => ({ id: entry.id, label: `${INSIGHT_TYPE_LABELS[entry.type]}: ${entry.title}`, detail: INSIGHT_STATUS_LABELS[entry.status] || entry.status }));
+  for (const id of values[field] || []) {
+    if (!entries.some(entry => entry.id === id)) entries.push({ id, label: `Unavailable record (${id})`, detail: "Existing link retained. Remove it only if intended." });
+  }
+  return entries;
+}
+
+function insightRelationshipMarkup(field, title, values) {
+  const selected = new Set(values[field] || []);
+  const entries = insightRelationshipEntries(field, values);
+  const query = state.insightEditor.relationshipQueries?.[field] || "";
+  return `<fieldset class="initiative-wide-field insight-relationships" data-insight-relationship="${field}"><legend>${title}</legend>
+    <div class="initiative-target-chip-list" data-relationship-chips role="group" aria-label="Selected ${title.toLowerCase()}"></div>
+    <label class="initiative-target-search"><span>Search ${title.toLowerCase()}</span><input type="search" data-relationship-search value="${escapeHtml(query)}" autocomplete="off" aria-controls="insight-relationship-${field}"></label>
+    <p data-relationship-summary role="status" aria-live="polite" aria-atomic="true"></p>
+    <div class="initiative-target-results" id="insight-relationship-${field}">${entries.map(entry => `<label class="initiative-target-option" data-relationship-option data-search-text="${escapeHtml(`${entry.label} ${entry.detail}`.toLowerCase())}"><input type="checkbox" name="${field}" value="${escapeHtml(entry.id)}" aria-label="${escapeHtml(entry.label)}" ${selected.has(entry.id) ? "checked" : ""}><span><strong>${escapeHtml(entry.label)}</strong><small>${escapeHtml(entry.detail)}</small></span></label>`).join("")}</div>
+    <p class="initiative-target-no-results" data-relationship-empty hidden>${entries.length ? "No matches. Try another search; your selected links are kept." : "No records available to link yet."}</p>
+  </fieldset>`;
+}
+
+function refreshInsightRelationship(section) {
+  const query = section.querySelector("[data-relationship-search]").value.trim().toLowerCase();
+  const options = [...section.querySelectorAll("[data-relationship-option]")];
+  const selected = options.map(option => option.querySelector("input")).filter(input => input.checked);
+  let shown = 0;
+  options.forEach(option => { option.hidden = !option.dataset.searchText.includes(query); if (!option.hidden) shown += 1; });
+  section.querySelector("[data-relationship-summary]").textContent = `${selected.length} selected · ${shown} of ${options.length} shown`;
+  section.querySelector("[data-relationship-empty]").hidden = shown > 0;
+  section.querySelector("[data-relationship-chips]").innerHTML = selected.map(input => `<button class="initiative-target-chip" type="button" data-remove-insight-relationship="${escapeHtml(input.value)}" aria-label="Remove ${escapeHtml(input.getAttribute("aria-label"))}"><strong>${escapeHtml(input.getAttribute("aria-label"))}</strong><b aria-hidden="true">×</b></button>`).join("");
+}
+
+function bindInsightRelationships() {
+  const form = document.querySelector("#insightEditorForm");
+  if (!form) return;
+  form.querySelectorAll("[data-insight-relationship]").forEach(refreshInsightRelationship);
+  form.addEventListener("input", event => {
+    const section = event.target.closest("[data-insight-relationship]");
+    if (!section) return;
+    if (event.target.matches("[data-relationship-search]")) {
+      state.insightEditor.relationshipQueries ||= {};
+      state.insightEditor.relationshipQueries[section.dataset.insightRelationship] = event.target.value;
+    }
+    refreshInsightRelationship(section);
+  });
+  form.addEventListener("click", event => {
+    const button = event.target.closest("[data-remove-insight-relationship]");
+    if (!button) return;
+    const section = button.closest("[data-insight-relationship]");
+    const input = [...section.querySelectorAll('input[type="checkbox"]')].find(input => input.value === button.dataset.removeInsightRelationship);
+    if (!input || input.disabled || input.closest("fieldset[disabled]")) return;
+    input.checked = false;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    section.querySelector("[data-relationship-search]").focus();
+  });
 }
 
 function insightEditorDialogMarkup() {
@@ -5869,22 +7317,32 @@ function insightEditorDialogMarkup() {
   const viewing = editor.mode === "view";
   const editing = editor.mode === "edit";
   const typeLabel = INSIGHT_TYPE_LABELS[editor.type] || "Insight record";
-  const title = viewing ? typeLabel : editing ? `Edit ${typeLabel.toLowerCase()}` : insightCommandLabel(editor.type);
-  const relatedOptions = state.insightRecords.filter((entry) => entry.id !== values.id).map((entry) => `<option value="${escapeHtml(entry.id)}" ${values.relatedRecordIds.includes(entry.id) ? "selected" : ""}>${escapeHtml(INSIGHT_TYPE_LABELS[entry.type])}: ${escapeHtml(entry.title)}</option>`).join("");
+  const title = editor.actionContext?.heading || (viewing ? typeLabel : editing ? `Edit ${typeLabel.toLowerCase()}` : insightCommandLabel(editor.type));
   const initiativeOptions = state.items.map((item) => `<option value="${escapeHtml(item.id)}" ${values.initiativeId === item.id ? "selected" : ""}>${escapeHtml(item.title)}</option>`).join("");
-  const accountOptions = state.customerDirectory.accounts.map((account) => `<option value="${escapeHtml(account.id)}" ${values.customerIds.includes(account.id) ? "selected" : ""}>${escapeHtml(account.name)}</option>`).join("");
-  const segmentOptions = state.customerDirectory.segments.map((segment) => `<option value="${escapeHtml(segment.id)}" ${values.segmentIds.includes(segment.id) ? "selected" : ""}>${escapeHtml(segment.name)}</option>`).join("");
   const canPromote = editor.type === "discovery" && values.status === "validated" && !values.initiativeId && !viewing;
-  return `<dialog class="initiative-editor-dialog insight-editor-dialog" id="insightEditorDialog" aria-modal="true" aria-busy="${editor.saving}" aria-labelledby="insightEditorTitle" aria-describedby="insightEditorDescription"><form id="insightEditorForm" novalidate><div class="initiative-editor-heading"><div><p class="eyebrow">Insights · ${escapeHtml(typeLabel)}</p><h3 id="insightEditorTitle">${escapeHtml(title)}</h3><p id="insightEditorDescription">${viewing ? "Review this saved record and its links." : "Capture source-accurate learning and keep it connected to customers and product work."}</p></div><button class="editor-close" id="closeInsightEditorButton" type="button" aria-label="Close insight editor" title="Close">X</button></div>${viewing ? insightReadViewMarkup(values) : `<fieldset class="insight-editor-fields" ${editor.saving ? "disabled" : ""}><div class="initiative-form-grid"><label class="initiative-title-field"><span>Title</span><input id="insightTitle" name="title" required value="${escapeHtml(values.title)}"></label><label><span>Status</span><select name="status">${INSIGHT_STATUSES[editor.type].map((status) => `<option value="${status}" ${values.status === status ? "selected" : ""}>${escapeHtml(INSIGHT_STATUS_LABELS[status])}</option>`).join("")}</select></label><label><span>Owner</span><input name="owner" value="${escapeHtml(values.owner)}"></label><label><span>Team owner</span><select name="ownerPersonId"><option value="">Unassigned</option>${personOptions(state.organization, values.ownerPersonId)}</select></label>${insightTypeFieldsMarkup(editor.type, values)}<label class="initiative-wide-field"><span>Tags / themes</span><input name="tags" value="${escapeHtml(values.tags.join(", "))}" placeholder="activation, billing, reliability"><small>Comma-separated and intentionally assigned.</small></label><label><span>Customer accounts</span><select name="customerIds" multiple size="4">${accountOptions}</select></label><label><span>Segments</span><select name="segmentIds" multiple size="4">${segmentOptions}</select></label><label class="initiative-wide-field"><span>Linked initiative</span><select name="initiativeId"><option value="">Not linked</option>${initiativeOptions}</select></label><label class="initiative-wide-field"><span>Related Insights records</span><select name="relatedRecordIds" multiple size="${Math.max(3, Math.min(6, state.insightRecords.length || 3))}">${relatedOptions}</select><small>Use Ctrl or Command to select multiple records.</small></label></div></fieldset>`}<p class="initiative-editor-error" id="insightEditorError" tabindex="-1" role="alert" aria-live="assertive">${escapeHtml(editor.error)}</p><div class="initiative-editor-actions">${viewing && editor.backStack.length ? `<button class="secondary" id="backToInsightButton" type="button">Back to previous record</button>` : ""}${editing ? `<button class="danger" id="deleteInsightButton" type="button" ${editor.saving ? "disabled" : ""}>Delete record</button>` : ""}${canPromote ? `<button class="secondary" id="promoteInsightButton" type="button">Create initiative</button>` : ""}<button class="secondary" id="cancelInsightEditorButton" type="button">${viewing ? "Close" : "Cancel"}</button>${viewing && !teamEditorReadOnlyReason() ? `<button class="primary" id="editInsightFromViewButton" type="button">Edit</button>` : !viewing ? `<button class="primary" id="saveInsightButton" type="submit" ${editor.saving ? "disabled" : ""}>${editor.saving ? "Saving..." : "Save"}</button>` : ""}</div></form></dialog>`;
+  return `<dialog class="initiative-editor-dialog insight-editor-dialog" id="insightEditorDialog" aria-modal="true" aria-busy="${editor.saving}" aria-labelledby="insightEditorTitle" aria-describedby="insightEditorDescription"><form id="insightEditorForm" novalidate><div class="initiative-editor-heading"><div><p class="eyebrow">${["action", "decision"].includes(editor.type) ? "Work" : "Insights"} · ${escapeHtml(typeLabel)}</p><h3 id="insightEditorTitle">${escapeHtml(title)}</h3><p id="insightEditorDescription">${editor.actionContext?.requestedOutcome ? escapeHtml(editor.actionContext.requestedOutcome) : viewing ? "Review this saved record and its links." : editor.type === "decision" ? "Record the question, outcome and rationale. Pending and Revisit keep the decision open for review." : editor.type === "action" ? "Keep the work, owner and evidence together. Done records completion; Deferred keeps the work for later." : "Capture source-accurate learning and keep it connected to customers and product work."}</p></div><button class="editor-close" id="closeInsightEditorButton" type="button" aria-label="${["action", "decision"].includes(editor.type) ? `Close ${editor.type} editor` : "Close insight editor"}" title="Close">X</button></div>${viewing ? insightReadViewMarkup(values) : `<fieldset class="insight-editor-fields" ${editor.saving ? "disabled" : ""}><div class="initiative-form-grid"><label class="initiative-title-field"><span>Title</span><input id="insightTitle" name="title" required value="${escapeHtml(values.title)}"></label><label><span>Status</span><select name="status">${INSIGHT_STATUSES[editor.type].map((status) => `<option value="${status}" ${values.status === status ? "selected" : ""}>${escapeHtml(INSIGHT_STATUS_LABELS[status])}</option>`).join("")}</select></label><label><span>Owner</span><input name="owner" value="${escapeHtml(values.owner)}"></label><label><span>Team owner</span><select name="ownerPersonId"><option value="">Unassigned</option>${personOptions(state.organization, values.ownerPersonId)}</select></label>${insightTypeFieldsMarkup(editor.type, values)}<label class="initiative-wide-field"><span>Tags / themes</span><input name="tags" value="${escapeHtml(values.tags.join(", "))}" placeholder="activation, billing, reliability"><small>Comma-separated and intentionally assigned.</small></label>${insightRelationshipMarkup("customerIds", "Customer accounts", values)}${insightRelationshipMarkup("segmentIds", "Segments", values)}<label class="initiative-wide-field"><span>Linked initiative</span><select name="initiativeId"><option value="">Not linked</option>${initiativeOptions}</select></label>${insightRelationshipMarkup("relatedRecordIds", "Related Insights records", values)}</div></fieldset>`}<p class="initiative-editor-error" id="insightEditorError" tabindex="-1" role="alert" aria-live="assertive">${escapeHtml(editor.error)}</p><div class="initiative-editor-actions">${viewing && editor.backStack.length ? `<button class="secondary" id="backToInsightButton" type="button">Back to previous record</button>` : ""}${editing ? `<button class="danger" id="deleteInsightButton" type="button" ${editor.saving ? "disabled" : ""}>Delete record</button>` : ""}${canPromote ? `<button class="secondary" id="promoteInsightButton" type="button">Create initiative</button>` : ""}<button class="secondary" id="cancelInsightEditorButton" type="button">${viewing ? "Close" : "Cancel"}</button>${viewing && !teamEditorReadOnlyReason() ? `<button class="primary" id="editInsightFromViewButton" type="button">Edit</button>` : !viewing ? `<button class="primary" id="saveInsightButton" type="submit" ${editor.saving ? "disabled" : ""}>${editor.saving ? "Saving..." : "Save"}</button>` : ""}</div></form></dialog>`;
 }
 
 function insightRecordLink(record, context) {
   return `<button class="secondary small" id="insight-link-${elementIdToken(context)}-${elementIdToken(record.id)}" data-view-insight="${escapeHtml(record.id)}" type="button">${escapeHtml(INSIGHT_TYPE_LABELS[record.type])}: ${escapeHtml(record.title)}</button>`;
 }
 
+function initiativeSavedValidationsMarkup(item) {
+  const records = state.insightRecords.filter(record => record.type === "validation" && record.initiativeId === item.id);
+  const current = records.filter(record => !["complete", "cancelled"].includes(record.status));
+  const history = records.filter(record => ["complete", "cancelled"].includes(record.status));
+  const rows = entries => entries.map(record => `<article class="review-card" data-validation-record="${escapeHtml(record.id)}"><h5>${escapeHtml(record.title)}</h5><p>${escapeHtml(INSIGHT_STATUS_LABELS[record.status])} · Captured experiment</p><p>${escapeHtml(record.method || "Method not recorded.")}</p>${record.successMetric ? `<p>Success metric: ${escapeHtml(record.successMetric)}</p>` : ""}${record.result ? `<p>Result: ${escapeHtml(record.result)}</p>` : ""}${record.decision || record.decisionNotes ? `<p>Decision: ${escapeHtml(validationDecisionSummary(record))}</p>` : ""}${insightRecordLink(record, `initiative-validation-${item.id}`)}</article>`).join("");
+  return `<div class="saved-validations"><div class="contextual-card-actions">${!teamEditorReadOnlyReason() ? `<button class="secondary" id="addInitiativeValidation-${escapeHtml(item.id)}" data-add-initiative-validation="${escapeHtml(item.id)}" type="button">New experiment</button>` : ""}</div><h5>Current experiments</h5><div class="review-list">${rows(current) || "No current experiments linked."}</div>${history.length ? `<h5>Experiment history</h5><div class="review-list">${rows(history)}</div>` : ""}</div>`;
+}
+
+function validationStatusHistoryMarkup(board) {
+  return [["Status not recorded", board.unknown], ["Cancelled experiments", board.cancelled]].map(([title, records]) => `<section class="panel"><div class="panel-header"><h3>${title}</h3><span class="muted">${records.length} records</span></div><div class="validation-list">${records.map(record => insightRecordCard(record, record.method || "Method not recorded.", record.result || (record.status === "unknown" ? "Set the status after reviewing this captured experiment." : "Retained experiment history."))).join("") || emptyState("No records in this status.")}</div></section>`).join("");
+}
+
+
 function initiativeLinkedLearningMarkup(item) {
-  const linked = state.insightRecords.filter((record) => record.initiativeId === item.id);
-  return `<section class="linked-learning" aria-label="Linked learning"><h5>Linked learning</h5><p>Research records keep their own evidence, confidence and next steps. Opening a record does not change this initiative.</p><div class="contextual-card-actions">${linked.map((record) => insightRecordLink(record, `initiative-${item.id}`)).join("") || "No learning records linked to this initiative."}</div></section>`;
+  const linked = state.insightRecords.filter((record) => !["action", "decision", "validation"].includes(record.type) && record.initiativeId === item.id);
+  return `<section class="linked-learning" aria-label="Linked learning"><h5>Linked learning</h5><p>Research records keep their own evidence, ownership and status. Opening a record does not change this initiative.</p><div class="contextual-card-actions">${linked.map((record) => insightRecordLink(record, `initiative-${item.id}`)).join("") || "No learning records linked to this initiative."}</div></section>`;
 }
 
 function insightReadViewMarkup(values) {
@@ -5893,6 +7351,8 @@ function insightReadViewMarkup(values) {
     research: [["Objective", values.objective], ["Research questions", values.questions], ["Method", values.method], ["Recruitment target", values.recruitmentTarget], ["Participants completed", values.participantCount], ["Due date", values.dueDate], ["Findings", values.findings]],
     validation: [["Hypothesis", values.hypothesis], ["Method", values.method], ["Success metric", values.successMetric], ["Due date", values.dueDate], ["Result", values.result], ["Decision", VALIDATION_DECISION_LABELS[values.decision] || values.decision], ["Decision notes", values.decisionNotes]],
     feedback: [["Source", values.source], ["Source reference", values.sourceRef], ["Received", values.receivedAt], ["Urgency", `${values.urgency} / 5`], ["Feedback signal", values.signal]],
+    decision: [["Question", values.question], ["Outcome", values.outcome], ["Rationale", values.rationale], ["Decision date", values.decidedAt], ["Imported from", values.legacyField]],
+    action: [["Work to complete", values.description], ["Due date", values.dueDate], ["Enablement area", values.enablementArea], ["Source record reference", values.sourceRecordId], ["Completion evidence", values.completionEvidence]],
     support: [["Source", values.source], ["Source reference", values.sourceRef], ["Severity", SUPPORT_SEVERITY_LABELS[values.severity] || values.severity], ["Response due", values.responseDueDate], ["Issue", values.issue], ["Customer impact", values.customerImpact], ["Resolution", values.resolution]]
   }[values.type] || [];
   const selectedNames = (ids, records) => ids.map((id) => records.find((record) => record.id === id)?.name || "Unavailable linked record");
@@ -5904,13 +7364,15 @@ function insightReadViewMarkup(values) {
   ];
   const initiative = state.items.find((item) => item.id === values.initiativeId);
   const related = values.relatedRecordIds.map((id) => state.insightRecords.find((record) => record.id === id));
-  return `<section class="insight-read-view" aria-label="Saved learning record"><dl class="initiative-detail-facts stacked">${facts.map(([label, value]) => {
+  return `<section class="insight-read-view" tabindex="0" aria-label="${["action", "decision"].includes(values.type) ? `Saved ${values.type}` : "Saved learning record"}"><dl class="initiative-detail-facts stacked">${facts.map(([label, value]) => {
     const text = Array.isArray(value) ? value.join("\n") : String(value ?? "");
     return `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(text || "Not captured")}</dd></div>`;
   }).join("")}</dl>${values.type === "discovery" && initiative ? `<p>Confidence and next step belong to this discovery record. Linked initiative fields are maintained separately.</p>` : ""}<section class="linked-learning" aria-label="Linked initiative"><h4>Linked initiative</h4>${initiative ? `<button class="secondary small" data-insight-initiative="${escapeHtml(initiative.id)}" type="button">${escapeHtml(initiative.title)}</button>` : `<p>${values.initiativeId ? "Linked initiative is unavailable." : "No initiative linked."}</p>`}</section><section class="linked-learning" aria-label="Related learning records"><h4>Related learning records</h4><div class="contextual-card-actions">${related.map((record) => record ? insightRecordLink(record, values.id) : "<p>A linked learning record is unavailable.</p>").join("") || "No related learning records."}</div></section></section>`;
 }
 
 function insightTypeFieldsMarkup(type, values) {
+  if (type === "decision") return `<label class="initiative-wide-field"><span>Question</span><textarea name="question">${escapeHtml(values.question)}</textarea></label><label class="initiative-wide-field"><span>Outcome</span><textarea name="outcome">${escapeHtml(values.outcome)}</textarea><small>Required before marking a decision Decided.</small></label><label class="initiative-wide-field"><span>Rationale</span><textarea name="rationale">${escapeHtml(values.rationale)}</textarea></label><label><span>Decision date</span><input name="decidedAt" type="date" value="${escapeHtml(values.decidedAt)}"><small>Leave blank if the date is unknown.</small></label>`;
+  if (type === "action") return `<label class="initiative-wide-field"><span>Work to complete</span><textarea name="description">${escapeHtml(values.description)}</textarea></label><label><span>Due date</span><input name="dueDate" type="date" value="${escapeHtml(values.dueDate)}"></label><label><span>Enablement area</span><select name="enablementArea"><option value="">Not an enablement action</option>${ENABLEMENT_AREAS.map((area) => `<option value="${area}" ${values.enablementArea === area ? "selected" : ""}>${area}</option>`).join("")}</select></label><label class="initiative-wide-field"><span>Completion evidence</span><textarea name="completionEvidence" placeholder="What was completed, when, and where the result can be reviewed">${escapeHtml(values.completionEvidence)}</textarea><small>Required with an owner before an enablement action can be marked Done.</small></label><label class="initiative-wide-field"><span>Source record reference</span><input name="sourceRecordId" value="${escapeHtml(values.sourceRecordId)}"><small>Optional reference captured for this action.</small></label>`;
   if (type === "discovery") return `<label class="initiative-wide-field"><span>Problem</span><textarea name="problem">${escapeHtml(values.problem)}</textarea></label><label class="initiative-wide-field"><span>Hypothesis</span><textarea name="hypothesis">${escapeHtml(values.hypothesis)}</textarea></label><label><span>Confidence (%)</span><input name="confidence" type="number" min="0" max="100" value="${Math.round(values.confidence * 100)}"></label><label class="initiative-wide-field"><span>Next step</span><textarea name="nextStep">${escapeHtml(values.nextStep)}</textarea></label>`;
   if (type === "research") return `<label class="initiative-wide-field"><span>Objective</span><textarea name="objective">${escapeHtml(values.objective)}</textarea></label><label class="initiative-wide-field"><span>Research questions</span><textarea name="questions" placeholder="One question per line">${escapeHtml(values.questions.join("\n"))}</textarea></label><label class="initiative-wide-field"><span>Method</span><textarea name="method">${escapeHtml(values.method)}</textarea></label><label><span>Recruitment target</span><input name="recruitmentTarget" type="number" min="0" max="10000" value="${values.recruitmentTarget}"></label><label><span>Participants completed</span><input name="participantCount" type="number" min="0" max="10000" value="${values.participantCount}"></label><label><span>Due date</span><input name="dueDate" type="date" value="${escapeHtml(values.dueDate)}"></label><label class="initiative-wide-field"><span>Findings</span><textarea name="findings">${escapeHtml(values.findings)}</textarea></label>`;
   if (type === "validation") return `<label class="initiative-wide-field"><span>Hypothesis</span><textarea name="hypothesis">${escapeHtml(values.hypothesis)}</textarea></label><label class="initiative-wide-field"><span>Method</span><textarea name="method">${escapeHtml(values.method)}</textarea></label><label class="initiative-wide-field"><span>Success metric</span><textarea name="successMetric">${escapeHtml(values.successMetric)}</textarea></label><label><span>Due date</span><input name="dueDate" type="date" value="${escapeHtml(values.dueDate)}"></label><label class="initiative-wide-field"><span>Result</span><textarea name="result">${escapeHtml(values.result)}</textarea></label><label><span>Decision</span><select name="decision">${VALIDATION_DECISIONS.map((decision) => `<option value="${decision}" ${values.decision === decision ? "selected" : ""}>${escapeHtml(VALIDATION_DECISION_LABELS[decision])}</option>`).join("")}</select></label><label class="initiative-wide-field"><span>Decision notes</span><textarea name="decisionNotes">${escapeHtml(values.decisionNotes)}</textarea></label>`;
@@ -5922,7 +7384,7 @@ function openInsightEditor(mode, trigger, selectedId = "", type = state.selected
   if (mode !== "view" && teamEditorReadOnlyReason()) return;
   const record = state.insightRecords.find((entry) => entry.id === selectedId);
   if (mode === "view" && !record) return;
-  const resolvedType = record?.type || (["discovery", "research", "validation", "feedback", "support"].includes(type) ? type : "discovery");
+  const resolvedType = record?.type || (["discovery", "research", "validation", "feedback", "support", "action", "decision"].includes(type) ? type : "discovery");
   const previous = state.insightEditor;
   const navigating = mode === "view" && previous.mode === "view";
   const backStack = navigating ? [...previous.backStack, { id: previous.selectedId, focusId: trigger?.id || "closeInsightEditorButton" }] : [];
@@ -5942,6 +7404,7 @@ function insightValuesFromForm(form) {
 }
 
 function captureInsightEditorDraft(event) {
+  if (event.target.matches("[data-relationship-search]")) return;
   if (!state.insightEditor.mode || state.insightEditor.mode === "view") return;
   state.insightEditor.draft = insightValuesFromForm(event.currentTarget);
 }
@@ -5960,25 +7423,37 @@ async function saveInsightEditor(event) {
   try { normalizeInsightRecord({ ...values, id: state.insightEditor.selectedId || "validation", version: 1, createdAt: new Date(), updatedAt: new Date(), updatedBy: "pm-os" }, { legacy: true }); }
   catch (error) { state.insightEditor.error = error.message; render(); document.querySelector("#insightEditorError")?.focus(); return; }
   if (state.team.active) await saveTeamInsightEditor(values);
-  else saveBrowserInsightEditor(values);
+  else await saveBrowserInsightEditor(values);
 }
 
-function saveBrowserInsightEditor(values) {
+async function saveBrowserInsightEditor(values) {
   const editor = state.insightEditor;
   let record;
+  let records;
+  let activity;
   if (editor.mode === "new") {
     record = createInsightRecord(values);
-    state.insightRecords = [record, ...state.insightRecords];
-    logActivity("insight-created", record, { type: record.type, title: record.title });
+    records = [record, ...state.insightRecords];
+    activity = createActivityEntry("insight-created", record, { type: record.type, title: record.title });
   } else {
     const current = insightEditorRecord();
     if (!current) { state.insightEditor.error = "That record is no longer available."; render(); return; }
-    state.insightRecords = updateInsightRecord(state.insightRecords, current.id, values);
-    record = state.insightRecords.find((entry) => entry.id === current.id);
-    logActivity("insight-updated", record, insightRecordChanges(current, record));
+    records = updateInsightRecord(state.insightRecords, current.id, values);
+    record = records.find((entry) => entry.id === current.id);
+    activity = createActivityEntry("insight-updated", record, insightRecordChanges(current, record));
   }
-  persist();
+  try { await commitLocalInsightUpdate(records, activity); }
+  catch (error) {
+    editor.error = localInitiativeSaveError(error);
+    render();
+    queueMicrotask(() => document.querySelector("#insightEditorError")?.focus());
+    return;
+  }
   completeInsightEditorSave(`${editor.mode === "new" ? "Added" : "Updated"} ${record.title}.`, editor.triggerId);
+}
+
+async function commitLocalInsightUpdate(records, activityEntry) {
+  await commitLocalWorkspacePatch({ insightRecords: records }, [activityEntry]);
 }
 
 async function saveTeamInsightEditor(values) {
@@ -6003,11 +7478,16 @@ async function saveTeamInsightEditor(values) {
 }
 
 function completeInsightEditorSave(message, triggerId) {
+  const actionContext = state.insightEditor.actionContext;
   state.insightEditor = createInsightEditorState();
   pushViewUrl(true);
+  if (actionContext) {
+    finishActionMutation(actionContext, message);
+    return;
+  }
   state.editorAnnouncement = message;
   render();
-  (document.getElementById(triggerId) || document.querySelector("#viewTitle"))?.focus();
+  queueMicrotask(() => (document.getElementById(triggerId) || document.querySelector("#viewTitle"))?.focus());
 }
 
 function closeInsightEditor() {
@@ -6046,8 +7526,12 @@ async function deleteInsightFromEditor(event) {
     try { const result = await state.team.repository.deleteInsightRecord(record.id, record.version); applyTeamSnapshot(result.snapshot); }
     catch (error) { state.insightEditor.error = safeTeamError(error, "The Insights record could not be deleted."); render(); return; }
   } else {
-    state.insightRecords = deleteInsightRecord(state.insightRecords, record.id);
-    logActivity("insight-deleted", record, {}); persist();
+    try { await commitLocalInsightUpdate(deleteInsightRecord(state.insightRecords, record.id), createActivityEntry("insight-deleted", record, {})); }
+    catch (error) {
+      state.insightEditor.error = localInitiativeSaveError(error);
+      render(); queueMicrotask(() => document.querySelector("#insightEditorError")?.focus());
+      return;
+    }
   }
   completeInsightEditorSave(`Deleted ${record.title}.`, "viewTitle");
 }
@@ -6169,34 +7653,43 @@ function initiativeEditorDialogMarkup() {
   const item = initiativeEditorItem();
   const values = { ...blankInitiativeValues(), ...(item || {}), ...(editor.draft || {}) };
   const editing = editor.mode === "edit";
-  const description = editor.actionContext?.requestedOutcome || (editing
+  const description = (editor.measureContext ? "Review the suggested wording, write your own target, and save this initiative's measure. Saving records intent; it does not establish achievement." : "") || editor.actionContext?.requestedOutcome || (editing
     ? editor.selectedFromCard ? "Update this initiative's product and delivery details." : "Choose an initiative, then update its product and delivery details."
-    : "Capture the product problem, priority, and next action.");
-  const editorTitle = editor.actionContext?.heading || (editing ? "Edit initiative" : "New initiative");
+    : "Capture the product problem and delivery details.");
+  const editorTitle = editor.measureContext ? editor.measureContext === "captured" ? "Edit measure" : "Define measure" : editor.actionContext?.heading || (editing ? "Edit initiative" : "New initiative");
   const editorEyebrow = editor.actionContext ? "Action Queue" : "Initiative";
   const revealOwner = true;
   const openMoreDetails = editor.moreDetailsOpen;
-  const options = state.items.map((entry) => `<option value="${escapeHtml(entry.id)}" data-search-text="${escapeHtml(`${entry.title} ${entry.customer} ${entry.owner}`.toLowerCase())}" ${entry.id === editor.selectedId ? "selected" : ""}>${escapeHtml(entry.title)} | ${escapeHtml(entry.owner || "Unowned")}</option>`).join("");
+  const searchQuery = editor.search.trim().toLowerCase();
+  const searchText = (entry) => `${entry.title} ${entry.customer} ${entry.owner}`.toLowerCase();
+  const matchCount = state.items.filter(entry => searchText(entry).includes(searchQuery)).length;
+  const options = state.items.map((entry) => `<option value="${escapeHtml(entry.id)}" data-search-text="${escapeHtml(searchText(entry))}" ${searchText(entry).includes(searchQuery) ? "" : "hidden"} ${entry.id === editor.selectedId ? "selected" : ""}>${escapeHtml(entry.title)} | ${escapeHtml(entry.owner || "Unowned")}</option>`).join("");
   return `<dialog class="initiative-editor-dialog" id="initiativeEditorDialog" aria-modal="true" aria-busy="${editor.saving}" aria-labelledby="initiativeEditorTitle" aria-describedby="initiativeEditorDescription">
     <form id="initiativeEditorForm" novalidate>
       <div class="initiative-editor-heading"><div><p class="eyebrow">${escapeHtml(editorEyebrow)}</p><h3 id="initiativeEditorTitle">${escapeHtml(editorTitle)}</h3><p id="initiativeEditorDescription">${escapeHtml(description)}</p></div><button class="editor-close" id="closeInitiativeEditorButton" type="button" aria-label="Close initiative editor" title="Close">X</button></div>
       <fieldset class="initiative-editor-fields" ${editor.saving ? "disabled" : ""}>
-        ${editing && !editor.selectedFromCard ? `<section class="initiative-picker" aria-labelledby="initiativePickerTitle"><h4 id="initiativePickerTitle">Choose initiative</h4><label><span>Search initiatives</span><input id="initiativeEditorSearch" type="search" value="${escapeHtml(editor.search)}" placeholder="Search title, customer, or owner"></label><label><span>Initiatives</span><select id="initiativeEditorPicker" size="${Math.max(2, Math.min(5, state.items.length))}">${options}</select></label></section>` : ""}
+        ${editing && !editor.selectedFromCard ? `<section class="initiative-picker" aria-labelledby="initiativePickerTitle"><h4 id="initiativePickerTitle">Choose initiative</h4><p id="initiativeEditingTarget">Editing: <strong>${escapeHtml(item?.title || "Unavailable initiative")}</strong></p><p id="initiativePickerHelp">Search filters this chooser. The initiative being edited stays the same until you select another one.</p><label><span>Search initiatives</span><input id="initiativeEditorSearch" type="search" value="${escapeHtml(editor.search)}" placeholder="Search title, customer, or owner" aria-describedby="initiativePickerHelp initiativePickerResults"></label><p id="initiativePickerResults" role="status" aria-live="polite">${escapeHtml(initiativePickerResultText(matchCount))}</p><button class="secondary small" id="clearInitiativeEditorSearch" type="button" ${editor.search ? "" : "disabled"}>Clear search</button><label><span>Initiatives</span><select id="initiativeEditorPicker" aria-describedby="initiativeEditingTarget initiativePickerHelp" size="${Math.max(2, Math.min(5, state.items.length))}">${options}</select></label></section>` : ""}
         <div class="initiative-form-grid simple-initiative-form">
           <label class="initiative-title-field"><span>Title</span><input id="initiativeTitle" name="title" value="${escapeHtml(values.title)}" required></label>
           <label class="initiative-wide-field"><span>Problem</span><textarea name="problem">${escapeHtml(values.problem)}</textarea></label>
           <label><span>Status</span><select name="statusId">${statusOptions(values.statusId || values.status)}</select></label>
-          <label class="initiative-wide-field"><span>Next step</span><textarea name="nextStep">${escapeHtml(values.nextStep)}</textarea></label>
+          <p class="initiative-wide-field">Track next steps and decisions in this initiative’s saved action and decision records.</p>
           <label><span>Target date</span><input name="dueDate" type="date" aria-describedby="initiativeEditorError" value="${escapeHtml(values.dueDate)}"></label>
           <p class="initiative-editor-error" id="initiativeEditorError" tabindex="-1" role="alert" aria-live="assertive">${escapeHtml(editor.error)}</p>
           <details class="initiative-more-details initiative-wide-field" ${openMoreDetails ? "open" : ""}><summary>More details</summary><div class="initiative-form-grid">
             <input type="hidden" name="customer" value="${escapeHtml(customerDisplayProjection(values, state.customerDirectory))}">
-            ${experienceHas("research-validation") || experienceHas("customer-support") ? initiativeTargetAudienceMarkup(values, editor) : ""}
+            <section class="initiative-wide-field authored-measure-fields" aria-label="Authored measure"><h4>Objective and measurement</h4><p>Record the outcome you intend to achieve. Leave unknown targets and dates blank.</p><div class="initiative-form-grid">
+              <label class="initiative-wide-field"><span>Objective</span><input name="objective" value="${escapeHtml(values.objective || "")}"></label>
+              <label class="initiative-wide-field"><span>Primary metric</span><textarea name="primaryMetric">${escapeHtml(values.primaryMetric || "")}</textarea></label>
+              <label class="initiative-wide-field"><span>Metric target</span><textarea name="metricTarget">${escapeHtml(values.metricTarget || "")}</textarea></label>
+              <label><span>Metric review date</span><input name="metricReviewDate" type="date" value="${escapeHtml(values.metricReviewDate || "")}"></label>
+            </div></section>
+            ${editor.focusField === "customer" || experienceHas("research-validation") || experienceHas("customer-support") ? initiativeTargetAudienceMarkup(values, editor) : ""}
             ${revealOwner ? `<label><span>Owner</span><input name="owner" value="${escapeHtml(values.owner)}"></label>` : ""}${experienceHas("team-ownership") ? `<label><span>Point of contact</span><select name="pocPersonId"><option value="">Unassigned</option>${personOptions(state.organization, values.pocPersonId)}</select></label><label><span>Organization unit</span><select name="orgUnitId"><option value="">Unassigned</option>${unitOptions(state.organization, values.orgUnitId)}</select></label>` : ""}
-            ${experienceHas("advanced-prioritization") ? `<label><span>Priority level</span><select name="priorityLevelId"><option value="">Unassigned</option>${state.prioritization.levels.map((level) => `<option value="${escapeHtml(level.id)}" ${level.id === (values.priorityLevelId || values.priority?.tierByMethod?.levels) ? "selected" : ""}>${escapeHtml(level.label)}</option>`).join("")}</select></label>${initiativePriorityInputsMarkup(values)}` : ""}
+            ${experienceHas("advanced-prioritization") ? initiativePriorityInputsMarkup(values) : ""}
             ${experienceHas("timeline-planning") ? `<label><span>Planned start</span><input name="startDate" type="date" value="${escapeHtml(values.startDate)}"></label><p class="initiative-wide-field initiative-timeline-preview" id="initiativeTimelinePreview" aria-live="polite">${escapeHtml(describeInitiativeTimeline(values, state.planningCalendar))}</p>` : ""}
-            <label class="initiative-wide-field"><span>Experiment</span><textarea name="experiment">${escapeHtml(values.experiment)}</textarea></label>
-            <label class="initiative-wide-field"><span>Decision</span><textarea name="decision">${escapeHtml(values.decision)}</textarea></label>
+            <p class="initiative-wide-field">Manage experiments and their evidence in Validation or this initiative’s details.</p>
+
           </div></details>
         </div>
       </fieldset>
@@ -6207,7 +7700,7 @@ function initiativeEditorDialogMarkup() {
 
 function blankInitiativeValues() {
   const selected = statusForId(state.workflow, state.workflow.defaultStatusId);
-  return { title: "", customer: "", customerIds: [], segmentIds: [], problem: "", owner: "", pocPersonId: "", orgUnitId: "", status: selected.category, statusId: selected.id, reach: 100, impact: 3, confidence: 0.7, effort: 3, priority: { valuesByMethod: {}, tierByMethod: {} }, priorityLevelId: "", priorityInputs: {}, startDate: "", dueDate: "", nextStep: "", risks: [], dependencies: [], experiment: "", decision: "" };
+  return { title: "", customer: "", customerIds: [], segmentIds: [], problem: "", owner: "", pocPersonId: "", orgUnitId: "", status: selected.category, statusId: selected.id, reach: 100, impact: 3, confidence: 0.7, effort: 3, priority: { valuesByMethod: {}, tierByMethod: {} }, priorityLevelId: "", priorityInputs: {}, startDate: "", dueDate: "", nextStep: "", risks: [], dependencies: [], experiment: "", decision: "", objective: "", primaryMetric: "", metricTarget: "", metricReviewDate: "" };
 }
 
 function initiativePriorityInputsMarkup(values) {
@@ -6222,10 +7715,16 @@ function initiativePriorityInputsMarkup(values) {
       ? `${effectiveFramework.name} controls ${teamPath}'s board. Cross-team views continue to use ${workspaceFramework.name}.`
       : `${effectiveFramework.name} controls ${teamPath}'s board and matches the workspace default.`
     : `${effectiveFramework.name} is the workspace default for this initiative.`;
+  const separateLevelControl = effectiveFramework.id !== "levels" && workspaceFramework.id !== "levels" ? priorityLevelControlMarkup(values) : "";
   const workspaceDisclosure = hasDistinctTeamOverride
     ? `<details class="initiative-priority-workspace"><summary><span>Cross-team workspace scoring</span><small>${escapeHtml(workspaceFramework.name)} workspace default</small></summary><div class="initiative-priority-workspace-body"><p>These inputs affect portfolio, All teams, and briefing views. They do not change the ${escapeHtml(teamPath)} board.</p>${priorityFrameworkEditorSection(workspaceFramework, values, "Workspace default")}</div></details>`
     : "";
-  return `<section class="initiative-wide-field initiative-priority-inputs" aria-labelledby="initiativePriorityTitle"><div class="initiative-priority-heading"><div><h4 id="initiativePriorityTitle">Prioritization</h4><p>${escapeHtml(contextMessage)}</p></div></div><div class="initiative-priority-primary">${priorityFrameworkEditorSection(effectiveFramework, values, primarySourceLabel)}</div>${workspaceDisclosure}</section>`;
+  return `<section class="initiative-wide-field initiative-priority-inputs" aria-labelledby="initiativePriorityTitle"><div class="initiative-priority-heading"><div><h4 id="initiativePriorityTitle">Prioritization</h4><p>${escapeHtml(contextMessage)}</p></div></div><div class="initiative-priority-primary">${priorityFrameworkEditorSection(effectiveFramework, values, primarySourceLabel)}</div>${workspaceDisclosure}${separateLevelControl}</section>`;
+}
+
+function priorityLevelControlMarkup(values) {
+  const selectedLevelId = values.priorityLevelId || values.priority?.tierByMethod?.levels || "";
+  return `<label><span>Priority level</span><select name="priorityLevelId"><option value="">Unassigned</option>${state.prioritization.levels.map((level) => `<option value="${escapeHtml(level.id)}" ${level.id === selectedLevelId ? "selected" : ""}>${escapeHtml(level.label)}</option>`).join("")}</select></label>`;
 }
 
 function priorityFrameworkEditorSection(framework, values, sourceLabel) {
@@ -6233,19 +7732,42 @@ function priorityFrameworkEditorSection(framework, values, sourceLabel) {
     return `<fieldset class="initiative-priority-framework initiative-priority-ordering"><legend><span>${escapeHtml(framework.name)}</span><small>${escapeHtml(sourceLabel)}</small></legend><p>The board uses the saved shared pecking order. No score inputs are required here.</p></fieldset>`;
   }
   if (framework.id === "levels") {
-    const selectedLevelId = values.priorityLevelId || values.priority?.tierByMethod?.levels || "";
-    return `<fieldset class="initiative-priority-framework initiative-priority-levels"><legend><span>${escapeHtml(framework.name)}</span><small>${escapeHtml(sourceLabel)}</small></legend><p>Choose the level used for this context. Missing assignments stay last.</p><div class="priority-input-grid"><label><span>Priority level</span><select name="priorityLevelId"><option value="">Unassigned</option>${state.prioritization.levels.map((level) => `<option value="${escapeHtml(level.id)}" ${level.id === selectedLevelId ? "selected" : ""}>${escapeHtml(level.label)}</option>`).join("")}</select></label></div></fieldset>`;
+    return `<fieldset class="initiative-priority-framework initiative-priority-levels"><legend><span>${escapeHtml(framework.name)}</span><small>${escapeHtml(sourceLabel)}</small></legend><p>Choose the level used for this context. Missing assignments stay last.</p><div class="priority-input-grid">${priorityLevelControlMarkup(values)}</div></fieldset>`;
   }
   return priorityInputSection(framework, values.priorityInputs?.[framework.id] || {}, sourceLabel);
 }
 
 function priorityInputSection(framework, inputs, sourceLabel) {
-  const score = priorityScore({ priorityInputs: { [framework.id]: inputs } }, framework, state.prioritization);
-  return `<fieldset class="initiative-priority-framework"><legend><span>${escapeHtml(framework.name)}</span><small>${escapeHtml(sourceLabel)}</small></legend><p>${escapeHtml(framework.description)} <strong>${score.complete ? `Score ${score.value}` : "Unscored"}</strong></p><div class="priority-input-grid">${framework.id === "rice" ? ricePriorityInputsMarkup(inputs) : framework.fields.map((field) => `<label><span>${escapeHtml(field.name)}${framework.builtIn ? "" : ` · weight ${field.weight}`}</span><input name="${escapeHtml(priorityFieldInputName(framework.id, field.id))}" data-priority-framework="${escapeHtml(framework.id)}" data-priority-field="${escapeHtml(field.id)}" type="number" min="${field.min}" max="${field.max}" step="${field.step}" value="${inputs[field.id] === undefined ? "" : escapeHtml(inputs[field.id])}" inputmode="decimal"><small>${field.direction === "lower" ? "Lower is better" : "Higher is better"}</small></label>`).join("")}</div></fieldset>`;
+  return `<fieldset class="initiative-priority-framework"><legend><span>${escapeHtml(framework.name)}</span><small>${escapeHtml(sourceLabel)}</small></legend><p>${escapeHtml(framework.description)}</p><p class="priority-score-preview" data-priority-preview="${escapeHtml(framework.id)}" role="status" aria-live="polite">${escapeHtml(priorityScorePreviewText(framework, inputs))}</p>${framework.id === "rice" ? riceScoringHelpMarkup() : ""}<div class="priority-input-grid">${framework.id === "rice" ? ricePriorityInputsMarkup(inputs) : framework.fields.map((field) => `<label><span>${escapeHtml(field.name)}${framework.builtIn ? "" : ` · weight ${field.weight}`}</span><input name="${escapeHtml(priorityFieldInputName(framework.id, field.id))}" data-priority-framework="${escapeHtml(framework.id)}" data-priority-field="${escapeHtml(field.id)}" aria-label="${escapeHtml(field.name)}" aria-describedby="priority-help-${escapeHtml(framework.id)}-${escapeHtml(field.id)}" type="number" min="${field.min}" max="${field.max}" step="${field.step}" value="${inputs[field.id] === undefined ? "" : escapeHtml(inputs[field.id])}" inputmode="decimal"><small id="priority-help-${escapeHtml(framework.id)}-${escapeHtml(field.id)}">${field.min} to ${field.max}. ${field.direction === "lower" ? "Lower is better" : "Higher is better"}.</small></label>`).join("")}</div></fieldset>`;
 }
 
 function ricePriorityInputsMarkup(inputs) {
-  return `<label><span>Reach</span><input name="reach" data-priority-framework="rice" data-priority-field="reach" type="number" min="0" max="100000" value="${inputs.reach === undefined ? "" : escapeHtml(inputs.reach)}"></label><label><span>Impact</span><input name="impact" data-priority-framework="rice" data-priority-field="impact" type="number" min="1" max="5" value="${inputs.impact === undefined ? "" : escapeHtml(inputs.impact)}"></label><label><span>Confidence (%)</span><input name="confidence" data-priority-framework="rice" data-priority-field="confidence" data-priority-scale="100" type="number" min="10" max="100" value="${inputs.confidence === undefined ? "" : confidencePercent(inputs.confidence)}"></label><label><span>Effort</span><select name="effort" data-priority-framework="rice" data-priority-field="effort"><option value="">Unscored</option>${effortOptions(inputs.effort)}</select></label>`;
+  return `<label><span>Reach</span><input name="reach" aria-label="Reach" aria-describedby="priority-help-rice-reach" data-priority-framework="rice" data-priority-field="reach" type="number" min="0" max="100000" value="${inputs.reach === undefined ? "" : escapeHtml(inputs.reach)}"><small id="priority-help-rice-reach">0 to 100000 people.</small></label><label><span>Impact</span><input name="impact" aria-label="Impact" aria-describedby="priority-help-rice-impact" data-priority-framework="rice" data-priority-field="impact" type="number" min="1" max="5" value="${inputs.impact === undefined ? "" : escapeHtml(inputs.impact)}"><small id="priority-help-rice-impact">1 to 5. Higher is better.</small></label><label><span>Confidence (%)</span><input name="confidence" aria-label="Confidence (%)" aria-describedby="priority-help-rice-confidence" data-priority-framework="rice" data-priority-field="confidence" data-priority-scale="100" type="number" min="10" max="100" value="${inputs.confidence === undefined ? "" : confidencePercent(inputs.confidence)}"><small id="priority-help-rice-confidence">10% to 100%.</small></label><label><span>Effort</span><select name="effort" aria-label="Effort" aria-describedby="priority-help-rice-effort" data-priority-framework="rice" data-priority-field="effort"><option value="">Unscored</option>${effortOptions(inputs.effort)}</select><small id="priority-help-rice-effort">1 to 8. Lower is better.</small></label>`;
+}
+
+function riceScoringHelpMarkup() {
+  return `<details class="priority-help"><summary>How RICE scoring works</summary><p>Compare initiatives using the same audience and time period.</p><ul><li><strong>Reach:</strong> how many people the work will affect.</li><li><strong>Impact:</strong> expected benefit per person, from 1 (low) to 5 (high).</li><li><strong>Confidence:</strong> how certain you are about the estimates, from 10% to 100%.</li><li><strong>Effort:</strong> relative work required: XS = 1, S = 2, M = 3, L = 5, XL = 8.</li></ul><p>Multiply Reach × Impact × Confidence, then divide by Effort. Use confidence as a fraction: 80% = 0.8. For example, 100 × 3 × 0.8 ÷ 2 gives a score of 120.</p></details>`;
+}
+
+function priorityEditorFocus(item, framework) {
+  if (framework.id === "manual") return "";
+  if (framework.id === "levels") return "priorityLevelId";
+  const result = priorityScore(item, framework, state.prioritization);
+  return priorityFieldInputName(framework.id, result.missingFields[0] || framework.fields[0]?.id || "");
+}
+
+function priorityScorePreviewText(framework, inputs) {
+  const saved = state.initiativeEditor.mode === "edit" ? initiativeEditorItem() : null;
+  const savedScore = saved ? priorityScore(saved, framework, state.prioritization) : null;
+  const draftScore = priorityScore({ priorityInputs: { [framework.id]: inputs } }, framework, state.prioritization);
+  return `Saved score: ${savedScore ? savedScore.complete ? savedScore.value : "Unscored" : "Not saved"}. Draft score: ${draftScore.complete ? draftScore.value : "Unscored"}. Changes apply after Save.`;
+}
+
+function refreshPriorityScorePreviews(form, values) {
+  form.querySelectorAll("[data-priority-preview]").forEach(preview => {
+    const framework = priorityFrameworkForId(state.prioritization, preview.dataset.priorityPreview);
+    preview.textContent = priorityScorePreviewText(framework, values.priorityInputs?.[framework.id] || {});
+  });
 }
 
 function priorityFieldInputName(frameworkId, fieldId) {
@@ -6259,6 +7781,11 @@ function initiativeEditorItem() {
 function openInitiativeEditor(mode, trigger, selectedId = "", defaults = null, actionContext = null) {
   if (teamEditorReadOnlyReason() || (mode === "edit" && !state.items.length)) return;
   const initialId = mode === "edit" ? selectedId || state.items[0]?.id || "" : "";
+  const recordField = actionContext?.editor?.field || trigger?.dataset?.editorFocus;
+  if (mode === "edit" && ["nextStep", "decision", "experiment"].includes(recordField)) {
+    openInitiativeWorkRecord(initialId, recordField === "nextStep" ? "action" : recordField === "experiment" ? "validation" : "decision", trigger, actionContext);
+    return;
+  }
   state.initiativeEditor = createInitiativeEditorState({
     mode,
     selectedId: initialId,
@@ -6286,7 +7813,7 @@ function finishInitiativeEditorClose() {
 
 function captureInitiativeEditorDraft(event) {
   if (!state.initiativeEditor.mode
-    || ["initiativeEditorSearch", "initiativeTargetSearch"].includes(event.target.id)
+    || ["initiativeEditorSearch", "initiativeEditorPicker", "initiativeTargetSearch"].includes(event.target.id)
     || event.target.name === "initiativeTargetKind"
     || event.target.dataset.initiativeTargetKind) return;
   if (event.target.name === "pocPersonId") {
@@ -6294,6 +7821,7 @@ function captureInitiativeEditorDraft(event) {
     if (ownerInput) ownerInput.value = organizationPersonName(event.target.value);
   }
   state.initiativeEditor.draft = initiativeValuesFromForm(event.currentTarget);
+  if (event.target.dataset.priorityFramework) refreshPriorityScorePreviews(event.currentTarget, state.initiativeEditor.draft);
   if (["startDate", "dueDate"].includes(event.target.name)) refreshInitiativeTimelinePreview(event.currentTarget);
 }
 
@@ -6309,18 +7837,44 @@ function refreshInitiativePriorityFields(event) {
   queueMicrotask(() => document.querySelector('#initiativeEditorForm [name="orgUnitId"]')?.focus());
 }
 
+function initiativePickerResultText(count) {
+  return count ? `${count} of ${state.items.length} initiatives match.` : "No initiatives match. Clear search to see all initiatives.";
+}
+
 function filterInitiativeEditorOptions(event) {
   const query = event.currentTarget.value.trim().toLowerCase();
   state.initiativeEditor.search = event.currentTarget.value;
   const picker = document.querySelector("#initiativeEditorPicker");
   if (!picker) return;
   for (const option of picker.options) option.hidden = Boolean(query) && !option.dataset.searchText.includes(query);
+  document.querySelector("#initiativePickerResults").textContent = initiativePickerResultText([...picker.options].filter(option => !option.hidden).length);
+  document.querySelector("#clearInitiativeEditorSearch").disabled = !event.currentTarget.value;
 }
 
-function selectInitiativeForEditor(event) {
-  state.initiativeEditor.selectedId = event.currentTarget.value;
-  state.initiativeEditor.draft = null;
-  state.initiativeEditor.error = "";
+async function selectInitiativeForEditor(event) {
+  const picker = event.currentTarget;
+  const nextId = picker.value;
+  const editor = state.initiativeEditor;
+  if (nextId === editor.selectedId || editor.saving) return;
+  // Keep the displayed selection tied to the draft until departure is approved.
+  picker.value = editor.selectedId;
+  if (editor.draft) {
+    const confirmed = await requestDataConfirmation({
+      title: "Discard edits and switch initiative?",
+      description: "Your edits have not been saved. Cancel to keep editing and save them, or discard these edits to open the other initiative.",
+      confirmLabel: "Discard edits and switch",
+      trigger: picker
+    });
+    if (!confirmed || state.initiativeEditor !== editor) return;
+  }
+  if (!state.items.some(item => item.id === nextId)) {
+    editor.error = "That initiative is no longer available. Your current draft is unchanged.";
+    document.querySelector("#initiativeEditorError").textContent = editor.error;
+    return;
+  }
+  editor.selectedId = nextId;
+  editor.draft = null;
+  editor.error = "";
   render();
   queueMicrotask(() => document.querySelector("#initiativeTitle")?.focus());
 }
@@ -6482,6 +8036,10 @@ function initiativeValuesFromForm(form) {
     customerIds: hasField("customerIds") ? data.getAll("customerIds").map(String) : [...(current.customerIds || [])],
     segmentIds: hasField("segmentIds") ? data.getAll("segmentIds").map(String) : [...(current.segmentIds || [])],
     problem: String(input.problem || "").trim(),
+    objective: hasField("objective") ? String(input.objective || "").trim() : current.objective || "",
+    primaryMetric: hasField("primaryMetric") ? String(input.primaryMetric || "").trim() : current.primaryMetric || "",
+    metricTarget: hasField("metricTarget") ? String(input.metricTarget || "").trim() : current.metricTarget || "",
+    metricReviewDate: hasField("metricReviewDate") ? String(input.metricReviewDate || "").trim() : current.metricReviewDate || "",
     owner: organizationPersonName(pocPersonId) || typedOwner,
     pocPersonId,
     orgUnitId: hasField("orgUnitId") ? String(input.orgUnitId || "").trim() : current.orgUnitId || "",
@@ -6494,9 +8052,7 @@ function initiativeValuesFromForm(form) {
     priorityInputs,
     startDate: hasField("startDate") ? String(input.startDate || "").trim() : current.startDate || "",
     dueDate: String(input.dueDate || "").trim(),
-    nextStep: String(input.nextStep || "").trim(),
-    experiment: String(input.experiment || "").trim(),
-    decision: String(input.decision || "").trim()
+    experiment: ""
   };
   values.priority = {
     ...(current.priority || { valuesByMethod: {}, tierByMethod: {} }),
@@ -6523,7 +8079,7 @@ async function saveInitiativeEditor(event) {
     return;
   }
   try {
-    assertPriorityAssignments(state.prioritization, state.organization, [{ id: state.initiativeEditor.selectedId || "new-initiative", priorityInputs: values.priorityInputs, priority: values.priority, priorityLevelId: values.priorityLevelId }]);
+    assertPriorityAssignments(state.prioritization, state.organization, [{ id: state.initiativeEditor.selectedId || "new-initiative", title: values.title, priorityInputs: values.priorityInputs, priority: values.priority, priorityLevelId: values.priorityLevelId }]);
   } catch (error) {
     state.initiativeEditor.error = error?.message || "The prioritization inputs are invalid.";
     const errorNode = document.querySelector("#initiativeEditorError");
@@ -6550,18 +8106,21 @@ async function saveInitiativeEditor(event) {
     await saveTeamInitiativeEditor(values);
     return;
   }
-  saveBrowserInitiativeEditor(values);
+  await saveBrowserInitiativeEditor(values);
 }
 
-function saveBrowserInitiativeEditor(values) {
+async function saveBrowserInitiativeEditor(values) {
   const editor = state.initiativeEditor;
   let announcement;
   if (editor.mode === "new") {
     const item = createItem(values);
-    state.items = [item, ...state.items];
-    logActivity("created", item, { title: item.title });
-    linkPromotedDiscoveryBrowser(item);
-    persist();
+    const discovery = state.insightRecords.find(record => record.id === state.pendingInsightPromotionId);
+    const insightRecords = discovery ? updateInsightRecord(state.insightRecords, discovery.id, { initiativeId: item.id, status: "promoted" }) : state.insightRecords;
+    const entries = [createActivityEntry("created", item, { title: item.title })];
+    if (discovery) entries.unshift(createActivityEntry("insight-promoted", discovery, { initiativeId: { from: "", to: item.id }, status: { from: discovery.status, to: "promoted" } }));
+    try { await commitLocalWorkspacePatch({ items: [item, ...state.items], insightRecords }, entries); }
+    catch (error) { editor.error = localInitiativeSaveError(error); render(); return; }
+    state.pendingInsightPromotionId = "";
     announcement = `Added ${item.title}.`;
   } else {
     const item = initiativeEditorItem();
@@ -6572,7 +8131,7 @@ function saveBrowserInitiativeEditor(values) {
     }
     const changes = initiativeChanges(item, values);
     try {
-      commitLocalInitiativeUpdate(updateItem(state.items, item.id, values), createActivityEntry("updated", item, changes));
+      await commitLocalInitiativeUpdate(updateItem(state.items, item.id, values), createActivityEntry("updated", item, changes));
     } catch (error) {
       editor.error = localInitiativeSaveError(error);
       const errorNode = document.querySelector("#initiativeEditorError");
@@ -6585,28 +8144,12 @@ function saveBrowserInitiativeEditor(values) {
   completeInitiativeEditorSave(announcement, editor.triggerId, editor.actionContext);
 }
 
-function commitLocalInitiativeUpdate(items, activityEntry) {
-  const activity = [activityEntry, ...state.activity].slice(0, 250);
-  const sync = ["local-file", "google-drive"].includes(state.source.type) ? { ...state.sync, localPending: true } : state.sync;
-  if (!demoMode) {
-    // Commit every local representation before publishing the change in memory
-    // or allowing an external writer to observe it.
-    const payload = exportPortableWorkspace(items, activity);
-    runStorageTransaction(localStorage, [storageKey, activityKey, syncKey], () => {
-      localStorage.setItem(storageKey, payload);
-      localStorage.setItem(activityKey, JSON.stringify({ activity }));
-      if (sync !== state.sync) localStorage.setItem(syncKey, serializeSync(sync));
-    });
-  }
-  state.items = items;
-  state.activity = activity;
-  if (!demoMode) {
-    state.sync = sync;
-    markExternalSourcePending();
-  }
+async function commitLocalInitiativeUpdate(items, activityEntry, scope = null) {
+  await commitLocalWorkspacePatch({ items }, [activityEntry], scope);
 }
 
 function localInitiativeSaveError(error, hasDraft = true) {
+  if (error?.code === "LOCAL_WORKSPACE_CHANGED") return error.message;
   return error instanceof AggregateError
     ? `The change could not be saved and browser recovery was incomplete. ${hasDraft ? "Your draft is still open. Preserve it before reloading." : "Preserve your workspace before reloading."}`
     : `The change could not be saved in this browser. ${hasDraft ? "Your draft is still open. Try saving again." : "Try the change again."}`;
@@ -6708,6 +8251,7 @@ function completeInitiativeEditorSave(announcement, triggerId, actionContext = n
 }
 
 function finishActionMutation(actionContext, fallbackAnnouncement) {
+  state.items = projectCanonicalInitiativeRecords(state.items, state.insightRecords);
   const completed = isActionQueueEntryComplete(actionContext, state.items, new Date());
   state.editorAnnouncement = completed
     ? `Completed: ${actionContext.heading}.`
@@ -6784,11 +8328,11 @@ async function deleteInitiativeFromEditor(event) {
     return;
   }
   if (!state.team.active) {
-    state.items = deleteItem(state.items, item.id);
-    logActivity("deleted", item, { status: item.status });
-    persist();
+    try { await commitLocalWorkspacePatch({ items: deleteItem(state.items, item.id) }, [createActivityEntry("deleted", item, { status: item.status })]); }
+    catch (error) { state.initiativeEditor.error = localInitiativeSaveError(error); render(); return; }
     state.initiativeEditor = createInitiativeEditorState();
     state.editorAnnouncement = `Deleted ${item.title}.`;
+    clearDeletedInitiativeDetail(item.id);
     render();
     document.querySelector("#viewTitle")?.focus();
     return;
@@ -6801,6 +8345,12 @@ async function deleteInitiativeFromEditor(event) {
   );
 }
 
+function clearDeletedInitiativeDetail(itemId) {
+  if (state.initiativeDetail.selectedId === itemId || new URLSearchParams(location.search).get("initiative") === itemId) {
+    clearInitiativeDetailUrl();
+  }
+}
+
 async function runTeamMutation(draft, action, { successAnnouncement = "", createAttempt = null } = {}) {
   if (!state.team.active || state.team.mutationBusy || teamMutationDisabled()) return;
   state.team.mutationBusy = true;
@@ -6808,7 +8358,8 @@ async function runTeamMutation(draft, action, { successAnnouncement = "", create
   const preparedDraft = prepareTeamUpdateDraft(draft);
   try {
     const result = await action();
-    applyTeamSnapshot(result?.snapshot);
+    const applied = applyTeamSnapshot(result?.snapshot);
+    if (applied && draft.operation === "delete" && !state.items.some(item => item.id === draft.itemId)) clearDeletedInitiativeDetail(draft.itemId);
     if (createAttempt) clearTeamItemCreateAttempt(createAttempt.scope, createAttempt.attempt);
     state.team.conflict = null;
     state.team.status = "Team workspace updated.";
@@ -6969,6 +8520,7 @@ function discardTeamDraft() {
 
 function applyTeamSnapshot(snapshot) {
   if (!snapshot || !Array.isArray(snapshot.items) || !Array.isArray(snapshot.activity)) return false;
+  const artifacts = (Object.hasOwn(snapshot, "artifacts") ? snapshot.artifacts : []).map(normalizeArtifactRecord);
   state.items = snapshot.items.map((item) => ({
     ...createItem(item),
     version: Number.isInteger(item.version) ? item.version : 1,
@@ -6978,6 +8530,7 @@ function applyTeamSnapshot(snapshot) {
   state.insightRecords = (snapshot.insightRecords || []).map((record) => normalizeInsightRecord(record, { legacy: true, now: record.updatedAt, updatedBy: record.updatedBy }));
   state.codeRepositories = snapshot.codeRepositories || [];
   state.implementationRuns = snapshot.implementationRuns || [];
+  state.artifacts = artifacts;
   state.activity = snapshot.activity.map((entry) => ({
     ...entry,
     actorId: typeof entry.actor === "object" ? entry.actor?.id || "" : entry.actorId || "",
@@ -7043,9 +8596,7 @@ async function changeSourceSelection(event) {
 async function initializeTeamSetup(selection = state.sourceSelection === "local-server" ? "local-server" : "team") {
   if (demoMode) return;
   const previousClient = state.team.client;
-  if (previousClient) {
-    try { await previousClient.dispose?.(); } catch { /* A failed cleanup does not expose or retain workspace data. */ }
-  }
+  if (previousClient) await disposeTeamClient();
   state.team = createTeamState({ mode: "loading", status: "Loading Team workspace setup." });
   state.sourceSelection = selection;
   render();
@@ -7098,7 +8649,7 @@ async function checkByoTeamSetup(event) {
     url: form.get("url"),
     publishableKey: form.get("publishableKey"),
     mode: local ? "personal-local" : "remote",
-    authMode: local ? "password" : "otp",
+    authMode: local ? "password" : form.get("authMode") === "password" ? "password" : "otp",
     persistSession: local
   });
 }
@@ -7116,13 +8667,35 @@ async function prepareTeamProject(input) {
     return;
   }
   await runTeamAction(async () => {
+    if (state.projects?.persistent && serverConnectorPool?.persistent) {
+      let connector = serverConnectorPool.registry.connectors.find((entry) =>
+        entry.url === config.url && entry.publishableKey === config.publishableKey
+        && entry.mode === config.mode && entry.authMode === config.authMode
+        && entry.persistSession === config.persistSession
+        && entry.allowWorkspaceCreation === state.team.allowWorkspaceCreation);
+      if (!connector) connector = serverConnectorPool.register({
+        ...config,
+        id: `server-${globalThis.crypto?.randomUUID?.().toLowerCase() || Date.now().toString(36)}`.slice(0, 80),
+        label: new URL(config.url).host,
+        allowWorkspaceCreation: state.team.allowWorkspaceCreation
+      });
+      const client = serverConnectorPool.clientFor(connector.id);
+      if (client !== state.team.client) {
+        await disposeTeamClient();
+        state.team.client = client;
+        state.team.unsubscribeConnection = client.subscribeConnection?.((status) => handleTeamConnection(status, client)) || null;
+      }
+      state.team.connectorId = connector.id;
+      state.projects.connectors = serverConnectorPool.registry.connectors;
+      config = serverConnectorClientConfig(connector);
+    }
     state.team.config = config;
     state.team.authMode = config.authMode;
     state.team.backendMode = config.mode;
     state.team.persistSession = config.persistSession;
     const capabilities = await state.team.client.checkCapabilities(config);
     state.team.capabilities = capabilities;
-    if (typeof capabilities?.allowWorkspaceCreation === "boolean") state.team.allowWorkspaceCreation = capabilities.allowWorkspaceCreation;
+    state.team.allowWorkspaceCreation = state.team.allowWorkspaceCreation !== false && capabilities?.allowWorkspaceCreation !== false;
     const auth = await state.team.client.getAuthState();
     state.team.authUser = auth?.user || null;
     if (auth?.status === "authenticated" && auth.user) {
@@ -7153,10 +8726,10 @@ function validateTeamConfigInput(input = {}) {
 function safeConfigError(error, input = {}) {
   const key = String(input.publishableKey || input.key || "");
   if (error?.message === "SECRET_KEY" || /^sb_secret_/i.test(key) || /service[_-]?role/i.test(key)) {
-    return "Use a publishable key. Secret and service-role keys are not accepted.";
+    return "Ask your administrator for the public connection key (Supabase publishable or legacy anon key). Secret and service-role keys are not accepted.";
   }
   if (error?.message === "INVALID_URL") return state.sourceSelection === "local-server" ? "Enter an HTTPS Supabase API URL, or a loopback HTTP URL for a personal local server." : "Enter the HTTPS Supabase API URL.";
-  if (error?.message === "INVALID_KEY") return "Enter the publishable key from Supabase.";
+  if (error?.message === "INVALID_KEY") return "Enter your server's public connection key (Supabase publishable or legacy anon key).";
   return "This project is not ready for PM OS team workspaces. Run the PM OS setup, then check again.";
 }
 
@@ -7259,7 +8832,7 @@ function collectionFrom(value, key) {
   return [];
 }
 
-async function runTeamAction(action, { pendingStatus, focusId = "teamStatus", invalidCode = false } = {}) {
+async function runTeamAction(action, { pendingStatus, focusId = "teamStatus", invalidCode = false, errorContext } = {}) {
   if (state.dataBusy) return { skipped: true };
   state.dataBusy = true;
   state.team.error = false;
@@ -7271,15 +8844,13 @@ async function runTeamAction(action, { pendingStatus, focusId = "teamStatus", in
     value = await action();
   } catch (error) {
     failure = error;
-    if (isTeamAccessLoss(error)) {
-      if (state.team.active || state.team.boundaryPromise) {
-        await exitTeamForBoundary(teamAccessLossMessage(error));
-      }
+    if (isTeamAccessLoss(error) && (state.team.active || state.team.boundaryPromise)) {
+      await exitTeamForBoundary(teamAccessLossMessage(error));
     } else {
       state.team.error = true;
       state.team.status = invalidCode
         ? "That code could not be verified. Check it or request a new one."
-        : safeTeamError(error, "The Team workspace action could not be completed.");
+        : safeTeamError(error, "The Team workspace action could not be completed.", errorContext);
     }
   } finally {
     state.dataBusy = false;
@@ -7289,7 +8860,8 @@ async function runTeamAction(action, { pendingStatus, focusId = "teamStatus", in
   return { value, error: failure };
 }
 
-function safeTeamError(error, fallback) {
+function safeTeamError(error, fallback, context = {}) {
+  if (["LOCAL_WORKSPACE_CHANGED", "LOCAL_WORKSPACE_LOCK_UNAVAILABLE", "PROJECT_CHANGED"].includes(error?.code)) return error.message;
   if (error?.code === "PERMISSION_DENIED") {
     const signal = JSON.stringify(error?.details || {}).toLowerCase();
     return signal.includes("last") && signal.includes("owner")
@@ -7297,7 +8869,9 @@ function safeTeamError(error, fallback) {
       : "Your role does not allow that Team workspace action.";
   }
   if (isTeamConflict(error)) return "The Team workspace changed before this action was saved.";
-  if (error?.code === "AUTH_REQUIRED") return "Your team session ended. Sign in again to reopen this workspace.";
+  if (error?.code === "AUTH_REQUIRED") return context.passwordSignIn
+    ? "Those sign-in details were not accepted. Check your email and password, then try again."
+    : "Your team session ended. Sign in again to reopen this workspace.";
   if (error?.code === "INVALID_DOCUMENT" || error?.code === "UNKNOWN_SCHEMA") {
     return "This project is not ready for PM OS team workspaces. Run the PM OS setup, then check again.";
   }
@@ -7399,7 +8973,43 @@ async function openTeamWorkspaceById(workspaceId, trigger, options = {}) {
           void refreshActiveTeamMetadata(repository);
         }
       });
+      const auth = await client.getAuthState();
       const members = await membersForWorkspace(workspace.id, client).catch(() => []);
+      const capabilities = options.capabilities || state.team.capabilities;
+      const invitations = capabilities?.emailInvitations && (opened.role || workspace.role) === "owner"
+        ? collectionFrom(await client.teamService.listInvites(workspace.id).catch(() => []), "invitations") : [];
+      const connector = options.connector || serverConnectorPool?.connector(state.team.connectorId || "missing");
+      if (!options.serverProject && connector && state.projects?.persistent) {
+        const registry = state.projects.registry;
+        let project = registry.projects.find((entry) => entry.provider === "server"
+          && entry.connectorId === connector.id && entry.workspaceId === workspace.id);
+        if (!project) {
+          const created = createRegistryProject(localStorage, registry, {
+            id: `project-${globalThis.crypto?.randomUUID?.().toLowerCase() || Date.now().toString(36)}`.slice(0, 80),
+            name: workspace.name, provider: "server", onboarding: "guided",
+            connectorId: connector.id, workspaceId: workspace.id,
+            serverRole: opened.role || workspace.role || "viewer", serverRevision: workspace.revision || 0,
+            serverStatus: "available", location: captureProjectLocation()
+          }, {});
+          state.projects.registry = created.registry;
+          project = created.project;
+        } else if (project.archivedAt) {
+          state.projects.registry = setProjectArchived(localStorage, registry, project.id, false);
+        }
+        options = { ...options, connector, serverProject: project };
+      }
+      if (options.serverProject) {
+        const nextRegistry = runStorageTransaction(localStorage, ["pm-os-staging.projects.v1"], () => {
+          const activated = activateProjectRegistryEntry(localStorage, state.projects.registry, options.serverProject.id, previousLocation);
+          return updateProjectMetadata(localStorage, activated, options.serverProject.id, {
+            name: workspace.name, serverRole: opened.role || workspace.role || "viewer",
+            serverRevision: Number(opened?.revision ?? opened?.snapshot?.revision ?? workspace.revision ?? options.serverProject.serverRevision),
+            serverStatus: "available"
+          });
+        });
+        projectRegistry = nextRegistry;
+        state.projects.registry = nextRegistry;
+      }
       const oldRepository = switching ? state.team.repository : null;
       const oldUnsubscribe = switching ? state.team.unsubscribeRepository : null;
       const oldConnectionUnsubscribe = switching ? state.team.unsubscribeConnection : null;
@@ -7410,15 +9020,21 @@ async function openTeamWorkspaceById(workspaceId, trigger, options = {}) {
       state.team.workspace = { ...workspace, role: opened.role || workspace.role };
       state.team.role = String(opened.role || workspace.role || "viewer").toLowerCase();
       state.team.client = client;
+      state.team.authUser = auth?.user || null;
       state.team.connectorId = options.connector?.id || state.team.connectorId;
       state.team.projectId = options.serverProject?.id || "";
       state.team.capabilities = options.capabilities || state.team.capabilities;
       state.team.backendMode = options.connector?.mode || state.team.backendMode;
+      state.team.authMode = options.connector?.authMode || state.team.authMode;
+      state.team.persistSession = options.connector?.persistSession ?? state.team.persistSession;
       state.team.repository = repository;
       state.team.openResult = opened;
       state.team.unsubscribeRepository = unsubscribe;
       state.team.unsubscribeConnection = client.subscribeConnection?.((status) => handleTeamConnection(status, client)) || null;
       state.team.members = members;
+      state.team.invitations = invitations;
+      state.team.invite = null;
+      state.team.inviteAttempt = null;
       state.team.returnState = returnState;
       state.team.showWorkspaceList = false;
       state.team.connection = "live";
@@ -7426,8 +9042,10 @@ async function openTeamWorkspaceById(workspaceId, trigger, options = {}) {
       state.team.error = false;
       state.team.conflict = null;
       state.sourceSelection = state.team.backendMode === "remote" ? "team" : "local-server";
+      state.syncStatus = `Team workspace is active. Changes are shared with members of ${workspace.name}.`;
       state.driveToken = "";
       applyTeamSnapshot(stagedSnapshot);
+      state.weeklyUpdateCopied = readWeeklyUpdateCopied(localStorage, weeklyChecklistStorageKey());
       if (switching) {
         try { oldUnsubscribe?.(); } catch { /* The staged workspace is already active. */ }
         try { oldConnectionUnsubscribe?.(); } catch { /* The staged workspace owns the connection listener. */ }
@@ -7437,14 +9055,6 @@ async function openTeamWorkspaceById(workspaceId, trigger, options = {}) {
         }
       }
       if (options.serverProject) {
-        projectRegistry = activateProjectRegistryEntry(localStorage, state.projects.registry, options.serverProject.id, previousLocation);
-        projectRegistry = updateProjectMetadata(localStorage, projectRegistry, options.serverProject.id, {
-          name: workspace.name,
-          serverRole: state.team.role,
-          serverRevision: Number(opened?.revision ?? opened?.snapshot?.revision ?? workspace.revision ?? options.serverProject.serverRevision),
-          serverStatus: "available"
-        });
-        state.projects.registry = projectRegistry;
         resetWorkspaceUiState();
         restoreProjectLocation(activeRegistryProject(projectRegistry)?.location);
         state.projects.surface = "closed";
@@ -7493,6 +9103,7 @@ function captureBrowserReturnState() {
     insightRecords: state.insightRecords,
     codeRepositories: state.codeRepositories,
     implementationRuns: state.implementationRuns,
+    artifacts: state.artifacts,
     activity: state.activity,
     planningCalendar: state.planningCalendar,
     organization: state.organization,
@@ -7642,6 +9253,7 @@ async function closeTeamWorkspace(message, { forProjectSwitch = false } = {}) {
     state.insightRecords = returning.insightRecords;
     state.codeRepositories = returning.codeRepositories;
     state.implementationRuns = returning.implementationRuns;
+    state.artifacts = returning.artifacts || [];
     state.activity = returning.activity;
     state.planningCalendar = returning.planningCalendar;
     state.organization = returning.organization;
@@ -7658,10 +9270,12 @@ async function closeTeamWorkspace(message, { forProjectSwitch = false } = {}) {
       state.projects.registry = projectRegistry;
     }
   } else {
+    localWriteScope = createLocalWriteScope();
     state.items = loadItems();
     state.insightRecords = loadInsightRecords();
     state.codeRepositories = loadCodeRepositories();
     state.implementationRuns = loadImplementationRuns();
+    state.artifacts = loadArtifacts();
     state.activity = loadActivity();
     state.planningCalendar = loadPlanningCalendar();
     state.organization = loadOrganization();
@@ -7672,6 +9286,7 @@ async function closeTeamWorkspace(message, { forProjectSwitch = false } = {}) {
     state.source = loadSource();
     state.sync = loadSync();
     state.driveReview = null;
+    localCommittedWorkspace = localCanonicalFields();
   }
   state.driveToken = "";
   state.team = createTeamState();
@@ -7690,12 +9305,15 @@ async function closeTeamWorkspace(message, { forProjectSwitch = false } = {}) {
 async function exportWorkspaceData(format) {
   if (!state.team.active) {
     downloadWorkspaceFormat(format);
+    announceDataStatus(state.dataStatus);
     return;
   }
   await runTeamAction(async () => {
     await refreshActiveTeamSnapshot();
     downloadWorkspaceFormat(format);
-    state.team.status = "Exported a fresh authorized Team workspace snapshot.";
+    state.team.status = format === "json"
+      ? "Backup download requested from the latest Team data. Check your browser's downloads and keep the file somewhere safe."
+      : "Export download requested from the latest Team data.";
   }, { pendingStatus: "Refreshing Team workspace for export...", focusId: "teamStatus" });
 }
 
@@ -7714,35 +9332,59 @@ function downloadWorkspaceFormat(format) {
     return;
   }
   downloadFile(exportPortableWorkspace(), "application/json", `pm-os-workspace-${todayStamp()}.json`);
+  state.dataStatus = "Backup download requested. Check your browser's downloads and keep the file somewhere safe.";
 }
 
 async function createTeamInvite(event) {
   event.preventDefault();
   if (!state.team.active || state.team.role !== "owner") return;
-  const role = String(new FormData(event.currentTarget).get("role") || "editor");
+  const form = new FormData(event.currentTarget);
+  const role = String(form.get("role") || "viewer");
+  const email = String(form.get("email") || "").trim().toLowerCase();
+  state.team.inviteEmail = email;
+  if (!state.team.inviteAttempt || state.team.inviteAttempt.email !== email || state.team.inviteAttempt.role !== role) {
+    state.team.inviteAttempt = { email, role, requestId: globalThis.crypto.randomUUID() };
+  }
   await runTeamAction(async () => {
-    const result = await state.team.client.teamService.createInvite({ workspaceId: state.team.workspace.id, role });
-    const code = String(result?.code || result?.inviteCode || result?.invite_code || "").trim();
-    if (!code) throw { code: "INVALID_DOCUMENT" };
-    state.team.invite = {
-      code,
-      role: String(result?.role || role),
-      expiresAt: result?.expiresAt || result?.expires_at || ""
-    };
-    state.team.status = "Invite code created. It is shown once.";
-  }, { pendingStatus: "Creating a one-use invite code...", focusId: "teamInviteCode" });
+    const result = await state.team.client.teamService.createInvite({ workspaceId: state.team.workspace.id, ...state.team.inviteAttempt });
+    showSentTeamInvitation(result);
+    state.team.inviteAttempt = null;
+  }, { pendingStatus: "Submitting invitation email…", focusId: "teamInviteTitle" });
 }
 
-async function copyTeamInviteCode() {
-  const code = state.team.invite?.code;
-  if (!code) return;
-  try {
-    await navigator.clipboard.writeText(code);
-    const button = document.querySelector("#copyTeamInviteButton");
-    if (button) button.textContent = "Copied";
-  } catch {
-    document.querySelector("#teamInviteCode")?.focus();
-  }
+function showSentTeamInvitation(result) {
+  const invitation = result?.invitation;
+  if (!invitation?.id) throw { code: "INVALID_DOCUMENT" };
+  state.team.invite = invitation;
+  state.team.invitations = [invitation, ...state.team.invitations.filter(entry => entry.id !== invitation.id)];
+  state.team.status = invitationDeliveryLabel(invitation);
+}
+
+async function refreshTeamInvitations() {
+  await runTeamAction(async () => {
+    state.team.invitations = collectionFrom(await state.team.client.teamService.listInvites(state.team.workspace.id), "invitations");
+    state.team.status = "Invitations refreshed.";
+  }, { pendingStatus: "Checking invitations…", focusId: "teamStatus" });
+}
+
+async function resendTeamInvitation(id) {
+  const invitation = state.team.invitations.find(entry => entry.id === id);
+  if (!invitation || state.team.role !== "owner") return;
+  await runTeamAction(async () => {
+    const result = await state.team.client.teamService.createInvite({ workspaceId: state.team.workspace.id,
+      email: invitation.email, role: invitation.role, previousInviteId: id, requestId: globalThis.crypto.randomUUID() });
+    showSentTeamInvitation(result);
+    state.team.invitations = state.team.invitations.map(entry => entry.id === id ? { ...entry, revokedAt: new Date().toISOString() } : entry);
+  }, { pendingStatus: "Replacing the invitation and sending email…", focusId: "teamInviteTitle" });
+}
+
+async function revokeTeamInvitation(id) {
+  if (state.team.role !== "owner") return;
+  await runTeamAction(async () => {
+    await state.team.client.teamService.revokeInvite({ workspaceId: state.team.workspace.id, inviteId: id });
+    state.team.invitations = state.team.invitations.map(entry => entry.id === id ? { ...entry, revokedAt: new Date().toISOString() } : entry);
+    state.team.status = "Invitation revoked. Its link can no longer join this workspace.";
+  }, { pendingStatus: "Revoking invitation…", focusId: "teamStatus" });
 }
 
 function clearTeamInvite() {
@@ -7816,7 +9458,7 @@ function createDemoWorkspace(items) {
   return { experience: fullWorkspaceExperience(), organization, customerDirectory: customers.directory, planningCalendar: emptyPlanningCalendar(), workflow: defaultInitiativeWorkflow(), prioritization: defaultPrioritization(), items: customers.items, insightRecords: createDemoInsightRecords(customers.items) };
 }
 
-function linkPromotedDiscoveryBrowser(item) {
+async function linkPromotedDiscoveryBrowser(item) {
   if (!state.pendingInsightPromotionId) return;
   const discovery = state.insightRecords.find((record) => record.id === state.pendingInsightPromotionId);
   state.pendingInsightPromotionId = "";
@@ -7828,17 +9470,17 @@ function linkPromotedDiscoveryBrowser(item) {
 
 function createDemoInsightRecords(items) {
   const item = (fragment) => items.find((entry) => entry.title.toLowerCase().includes(fragment)) || items[0];
-  const timestamp = new Date("2026-07-20T10:00:00.000Z");
+  const timestamp = demoReferenceDate;
   const records = [
     { id: "insight-discovery-feedback", type: "discovery", title: "Unify the feedback triage workflow", status: "researching", owner: "Platform PM", problem: "Support and success teams cannot see whether repeated feedback has been triaged.", hypothesis: "A shared, tagged inbox will reduce duplicate analysis and missed follow-up.", confidence: 0.62, nextStep: "Interview five success managers.", initiativeId: item("feedback").id, relatedRecordIds: ["insight-research-triage", "insight-validation-triage"] },
-    { id: "insight-research-triage", type: "research", title: "Success manager triage study", status: "recruiting", owner: "Platform PM", objective: "Understand how customer feedback is captured, tagged, and escalated today.", questions: ["Where does feedback get lost?", "Which tags drive a product decision?"], method: "Five 30-minute customer-success interviews", recruitmentTarget: 5, participantCount: 2, findings: "", dueDate: "2026-08-05", relatedRecordIds: ["insight-discovery-feedback"] },
-    { id: "insight-validation-triage", type: "validation", title: "Tagged inbox concierge test", status: "running", owner: "Platform PM", hypothesis: "A single tagged queue will shorten weekly synthesis time.", method: "Manually consolidate one week of incoming feedback for two success pods.", successMetric: "At least 30% less synthesis time with no missed urgent signals.", result: "", decision: "", decisionNotes: "", dueDate: "2026-08-09", initiativeId: item("feedback").id, relatedRecordIds: ["insight-discovery-feedback"] },
-    { id: "insight-feedback-onboarding", type: "feedback", title: "Setup progress is hard to recover", status: "new", source: "Customer interview", sourceRef: "INT-104", signal: "We stop halfway through setup and cannot tell what remains when we return.", receivedAt: "2026-07-18", urgency: 4, tags: ["onboarding", "progress"], owner: "Growth PM", initiativeId: item("onboarding").id },
-    { id: "insight-feedback-export", type: "feedback", title: "Export permissions are unclear", status: "triaged", source: "Success call", sourceRef: "CALL-228", signal: "Security admins need an explicit record of who can export workspace data.", receivedAt: "2026-07-17", urgency: 3, tags: ["security", "exports"], owner: "Trust PM", initiativeId: item("export").id },
-    { id: "insight-support-audit", type: "support", title: "Audit export omits actor details", status: "in-progress", source: "Support ticket", sourceRef: "SUP-492", issue: "Downloaded audit rows do not identify the actor for some workspace events.", customerImpact: "A security review is blocked for one enterprise account.", severity: "critical", responseDueDate: "2026-07-25", resolution: "", tags: ["security", "audit"], owner: "Trust PM", initiativeId: item("audit").id },
-    { id: "insight-support-trial", type: "support", title: "Trial banner returns after upgrade", status: "waiting", source: "Support ticket", sourceRef: "SUP-487", issue: "The trial banner remains visible after a completed upgrade.", customerImpact: "Confusing but does not block product use.", severity: "medium", responseDueDate: "2026-07-29", resolution: "Waiting for a session trace.", tags: ["billing", "trial"], owner: "Monetization PM", initiativeId: item("trial").id }
+    { id: "insight-research-triage", type: "research", title: "Success manager triage study", status: "recruiting", owner: "Platform PM", objective: "Understand how customer feedback is captured, tagged, and escalated today.", questions: ["Where does feedback get lost?", "Which tags drive a product decision?"], method: "Five 30-minute customer-success interviews", recruitmentTarget: 5, participantCount: 2, findings: "", dueDate: demoDate(5), relatedRecordIds: ["insight-discovery-feedback"] },
+    { id: "insight-validation-triage", type: "validation", title: "Tagged inbox concierge test", status: "running", owner: "Platform PM", hypothesis: "A single tagged queue will shorten weekly synthesis time.", method: "Manually consolidate one week of incoming feedback for two success pods.", successMetric: "At least 30% less synthesis time with no missed urgent signals.", result: "", decision: "", decisionNotes: "", dueDate: demoDate(9), initiativeId: item("feedback").id, relatedRecordIds: ["insight-discovery-feedback"] },
+    { id: "insight-feedback-onboarding", type: "feedback", title: "Setup progress is hard to recover", status: "new", source: "Customer interview", sourceRef: "INT-104", signal: "We stop halfway through setup and cannot tell what remains when we return.", receivedAt: demoDate(-2), urgency: 4, tags: ["onboarding", "progress"], owner: "Growth PM", initiativeId: item("onboarding").id },
+    { id: "insight-feedback-export", type: "feedback", title: "Export permissions are unclear", status: "triaged", source: "Success call", sourceRef: "CALL-228", signal: "Security admins need an explicit record of who can export workspace data.", receivedAt: demoDate(-3), urgency: 3, tags: ["security", "exports"], owner: "Trust PM", initiativeId: item("export").id },
+    { id: "insight-support-audit", type: "support", title: "Audit export omits actor details", status: "in-progress", source: "Support ticket", sourceRef: "SUP-492", issue: "Downloaded audit rows do not identify the actor for some workspace events.", customerImpact: "A security review is blocked for one enterprise account.", severity: "critical", responseDueDate: demoDate(1), resolution: "", tags: ["security", "audit"], owner: "Trust PM", initiativeId: item("audit").id },
+    { id: "insight-support-trial", type: "support", title: "Trial banner returns after upgrade", status: "waiting", source: "Support ticket", sourceRef: "SUP-487", issue: "The trial banner remains visible after a completed upgrade.", customerImpact: "Confusing but does not block product use.", severity: "medium", responseDueDate: demoDate(4), resolution: "Waiting for a session trace.", tags: ["billing", "trial"], owner: "Monetization PM", initiativeId: item("trial").id }
   ];
-  return records.map((record) => createInsightRecord(record, timestamp, "pm-os"));
+  return migrateLegacyWorkRecords(items, records.map((record) => createInsightRecord(record, timestamp, "pm-os")));
 }
 
 function workspaceActivityForApp(activity = []) {
@@ -7849,8 +9491,9 @@ function workspaceActivityForApp(activity = []) {
   })).sort((left, right) => new Date(right.createdAt) - new Date(left.createdAt));
 }
 
-function exportPortableWorkspace(items = state.items, activity = state.activity, organization = state.organization, customerDirectory = state.customerDirectory, planningCalendar = state.planningCalendar, workflow = state.workflow, prioritization = state.prioritization, insightRecords = state.insightRecords, codeRepositories = state.codeRepositories, implementationRuns = state.implementationRuns, experience = state.experience) {
+function exportPortableWorkspace(items = state.items, activity = state.activity, organization = state.organization, customerDirectory = state.customerDirectory, planningCalendar = state.planningCalendar, workflow = state.workflow, prioritization = state.prioritization, insightRecords = state.insightRecords, codeRepositories = state.codeRepositories, implementationRuns = state.implementationRuns, experience = state.experience, artifacts = state.artifacts) {
   return encodeWorkspaceDocument(createWorkspaceDocument({
+    schema: WORKSPACE_DOCUMENT_SCHEMA,
     workspaceId: state.team.active ? state.team.workspace?.id : "browser",
     experience,
     planningCalendar,
@@ -7862,6 +9505,7 @@ function exportPortableWorkspace(items = state.items, activity = state.activity,
     insightRecords,
     codeRepositories,
     implementationRuns,
+    artifacts,
     activity: activity.map((entry) => ({
       ...entry,
       actor: entry.actorId
@@ -7884,6 +9528,7 @@ function importPortableWorkspace(text) {
     prioritization: normalizePrioritization(document.prioritization),
     codeRepositories: document.codeRepositories,
     implementationRuns: document.implementationRuns,
+    artifacts: document.artifacts || [],
     experience: normalizeWorkspaceExperience(document.experience)
   };
 }
@@ -7897,7 +9542,7 @@ function loadOperationalWorkspaceResult() {
       raw: "",
       workspace: emptyOperationWorkspace,
       corrupted: true,
-      warning: "This browser's operational workspace could not be accessed. PM OS did not load demo data or overwrite anything."
+      warning: "This browser's workspace could not be accessed. PM OS did not load demo data or overwrite anything."
     };
   }
   if (cachedOperationalWorkspaceResult && raw === cachedOperationalWorkspaceRaw) return cachedOperationalWorkspaceResult;
@@ -7913,7 +9558,7 @@ function loadOperationalWorkspaceResult() {
       raw,
       workspace: emptyOperationWorkspace,
       corrupted: true,
-      warning: "Your saved operational workspace could not be read. It has not been overwritten. Download the unreadable data, import a backup, or deliberately clear the workspace from Settings."
+      warning: "Your saved workspace could not be read. It has not been overwritten. Download the unreadable data, import a backup, or deliberately clear the workspace from Settings."
     };
   }
   return cachedOperationalWorkspaceResult;
@@ -7942,6 +9587,11 @@ function loadInsightRecords() {
 function loadCodeRepositories() {
   if (demoMode) return demoWorkspace.codeRepositories || [];
   return loadOperationalWorkspaceResult().workspace.codeRepositories;
+}
+
+function loadArtifacts() {
+  if (demoMode) return demoWorkspace.artifacts || [];
+  return loadOperationalWorkspaceResult().workspace.artifacts || [];
 }
 
 function loadImplementationRuns() {
@@ -7991,28 +9641,38 @@ async function authenticateTeamPassword(event) {
   const email = String(form.get("email") || "").trim();
   const password = String(form.get("password") || "");
   const create = event.submitter?.value === "create";
+  if (create && state.team.backendMode === "remote") {
+    state.team.error = true;
+    state.team.status = "Ask your administrator for an existing server account.";
+    renderAndFocus("teamEmail");
+    return;
+  }
   if (!email.includes("@") || password.length < 8) {
     state.team.error = true;
     state.team.status = "Enter a valid email and a password of at least 8 characters.";
     renderAndFocus(!email.includes("@") ? "teamEmail" : "teamPassword");
     return;
   }
+  state.team.email = email;
+  const errorContext = { passwordSignIn: false };
   await runTeamAction(async () => {
+    errorContext.passwordSignIn = !create;
     const auth = create
       ? await state.team.client.signUpWithPassword(email, password)
       : await state.team.client.signInWithPassword(email, password);
     if (auth?.status !== "authenticated" || !auth.user) throw { code: "AUTH_REQUIRED" };
+    errorContext.passwordSignIn = false;
     state.team.email = email;
     state.team.authUser = auth.user;
     await loadTeamWorkspaces();
     state.team.mode = "workspaces";
     state.team.error = false;
     state.team.status = create ? "Local account created. Create or open a workspace." : "Signed in. Choose a workspace to open.";
-  }, { pendingStatus: create ? "Creating the local account..." : "Signing in...", focusId: "teamStatus" });
+  }, { pendingStatus: create ? "Creating the local account..." : "Signing in...", focusId: "teamStatus", errorContext });
 }
 
 function defaultSyncState() {
-  return { lastPulledAt: "", lastPushedAt: "", baseRemote: null, remote: null, conflict: null, baseDocument: null, localPending: false, fileLastModified: 0, fileBaselineDocument: null, fileResolutionDocument: null, fileConflicts: [] };
+  return { lastPulledAt: "", lastPushedAt: "", baseRemote: null, remote: null, conflict: null, baseDocument: null, localPending: false, fileLastModified: 0, fileBaselineDocument: null, fileReview: null, fileResolutionDocument: null, fileConflicts: [] };
 }
 
 function loadSource() {
@@ -8052,6 +9712,7 @@ function loadSyncFromKey(key) {
       localPending: Boolean(parsed.localPending),
       fileLastModified: Number(parsed.fileLastModified || 0),
       fileBaselineDocument: parsed.fileBaselineDocument && typeof parsed.fileBaselineDocument === "object" ? parsed.fileBaselineDocument : null,
+      fileReview: parsed.fileReview && typeof parsed.fileReview === "object" ? parsed.fileReview : null,
       fileResolutionDocument: parsed.fileResolutionDocument && typeof parsed.fileResolutionDocument === "object" ? parsed.fileResolutionDocument : null,
       fileConflicts: Array.isArray(parsed.fileConflicts) ? parsed.fileConflicts : []
     };
@@ -8060,9 +9721,9 @@ function loadSyncFromKey(key) {
   }
 }
 
-function persistSource() {
+async function persistSource() {
   if (demoMode) return;
-  localStorage.setItem(sourceKey, JSON.stringify(normalizeWorkspaceSource(state.source)));
+  await runLocalStorageTransaction([sourceKey], () => localStorage.setItem(sourceKey, JSON.stringify(normalizeWorkspaceSource(state.source))));
   if (state.projects?.persistent && !state.team.active) {
     projectRegistry = updateActiveProjectProvider(localStorage, state.projects.registry, state.source.type);
     state.projects.registry = projectRegistry;
@@ -8073,26 +9734,31 @@ function sourceSelectionFor(source) {
   return ({ browser: "local", "google-drive": "drive-folder", "local-file": "local-file" })[source?.type] || "local";
 }
 
-function persistSync() {
+async function persistSync() {
   if (demoMode) return;
-  localStorage.setItem(syncKey, serializeSync(state.sync));
+  await runLocalStorageTransaction([syncKey], () => localStorage.setItem(syncKey, serializeSync(state.sync)));
+  state.localExternalEffect = "";
 }
 
-function commitSync(nextSync) {
-  if (!demoMode) localStorage.setItem(syncKey, serializeSync(nextSync));
+async function commitSync(nextSync) {
+  if (state.localExternalEffect) state.localExternalPendingSync = nextSync;
+  if (!demoMode) await runLocalStorageTransaction([syncKey], () => localStorage.setItem(syncKey, serializeSync(nextSync)));
   state.sync = nextSync;
+  state.localExternalEffect = "";
+  state.localExternalPendingSync = null;
 }
 
 function serializeSync(sync) {
   return JSON.stringify({ ...sync, schema: WORKSPACE_SYNC_SCHEMA });
 }
 
-function updateSourceSettings() {
+async function updateSourceSettings() {
   if (demoMode) {
     state.syncStatus = "Drive settings and actions are disabled in demo mode.";
     renderAndFocus("syncStatus");
     return;
   }
+  const previousSource = state.source, previousSync = state.sync;
   const previousType = state.source.type;
   const folderName = document.querySelector("#driveFolderName")?.value?.trim() || state.source.folderName || "PM OS";
   const fileName = document.querySelector("#driveFileName")?.value?.trim() || state.source.fileName || "pm-os-workspace.json";
@@ -8118,8 +9784,14 @@ function updateSourceSettings() {
     state.syncStatus = "Drive folder or file changed. Use Sync now to preview an existing file before upload.";
   }
   try {
-    persistSource();
-    if (locationChanged) persistSync();
+    const candidateSource = state.source, candidateSync = state.sync;
+    state.source = previousSource; state.sync = previousSync;
+    await runLocalStorageTransaction([sourceKey, syncKey], () => {
+      localStorage.setItem(sourceKey, JSON.stringify(normalizeWorkspaceSource(candidateSource)));
+      localStorage.setItem(syncKey, serializeSync(candidateSync));
+    });
+    state.source = candidateSource; state.sync = candidateSync;
+    if (state.projects?.persistent) { projectRegistry = updateActiveProjectProvider(localStorage, state.projects.registry, state.source.type); state.projects.registry = projectRegistry; }
   } catch (error) {
     state.syncStatus = `Drive settings could not be saved. ${error.message}`;
   }
@@ -8127,24 +9799,33 @@ function updateSourceSettings() {
 }
 
 function sourceHelpText() {
-  if (demoMode) return "Demo mode keeps workspace changes and recovery snapshots only for this session. External sources are disabled.";
-  if (state.sourceSelection === "local-server") return "A local or LAN Supabase deployment uses the same migrations, RLS roles, realtime updates, and repositories as Team Server.";
-  if (state.sourceSelection === "team") return "Team Server stays server-authoritative. Remote sessions and readable snapshots remain memory-only.";
-  if (state.source.type === "google-drive") return `Drive uses a trusted baseline to merge non-overlapping changes in ${state.source.fileName}. Browser storage remains the offline cache.`;
+  if (demoMode) return "Demo changes and recovery snapshots reset whenever this page reloads. External sources are disabled.";
+  if (state.sourceSelection === "local-server") return "Share work through a server on this device or your local network. Your current work stays open until setup succeeds.";
+  if (state.sourceSelection === "team") return "Team work is saved on the server. Access depends on your role. Team content is not kept in this browser after you leave the workspace.";
+  if (state.source.type === "google-drive") return `Drive sync combines changes in ${state.source.fileName} when they do not conflict. A copy stays on this device for offline work.`;
   if (state.source.type === "local-file") return "The browser keeps a recovery copy and autosaves to the linked file while permission remains available.";
-  return "Data and recovery snapshots are stored privately in this browser. JSON exports remain portable.";
+  return "Your work and recovery copies are saved in this browser on this device. Download a backup to keep a separate copy.";
 }
 
 async function useBrowserStorage() {
   if (state.dataBusy || demoMode) return;
-  try { await clearLinkedFileHandle(state.projects?.registry.activeProjectId || PRIMARY_PROJECT_ID); } catch { /* The browser workspace remains usable. */ }
-  state.linkedFile = { handle: null, name: "", permission: "unknown", lastModified: 0, status: "" };
-  state.sourceSelection = "local";
-  state.source = { ...state.source, type: "browser" };
-  state.sync = { ...state.sync, fileLastModified: 0, fileBaselineDocument: null, fileResolutionDocument: null, fileConflicts: [] };
-  persistSource();
-  persistSync();
-  state.syncStatus = "Browser storage is active. The previously linked file was not changed.";
+  const source = { ...state.source, type: "browser" };
+  const sync = { ...state.sync, fileLastModified: 0, fileBaselineDocument: null, fileReview: null, fileResolutionDocument: null, fileConflicts: [] };
+  try {
+    await runLocalStorageTransaction([sourceKey, syncKey], () => {
+      localStorage.setItem(sourceKey, JSON.stringify(normalizeWorkspaceSource(source)));
+      localStorage.setItem(syncKey, serializeSync(sync));
+    });
+    state.source = source;
+    state.sync = sync;
+    state.sourceSelection = "local";
+    state.linkedFile = { handle: null, name: "", permission: "unknown", lastModified: 0, status: "" };
+    try {
+      await runLocalExternalEffect(() => clearLinkedFileHandle(state.projects?.registry.activeProjectId || PRIMARY_PROJECT_ID), "Disconnect linked file");
+      state.localExternalEffect = "";
+    } catch { /* The durable browser source remains active; a retained handle does not write files. */ }
+    state.syncStatus = "Browser storage is active. The previously linked file was not changed.";
+  } catch (error) { state.syncStatus = safeTeamError(error, "Browser storage could not be activated."); }
   renderAndFocus("syncStatus");
 }
 
@@ -8162,13 +9843,13 @@ async function linkExistingWorkspaceFile(event) {
     });
     if (!confirmed) return { cancelled: true };
     const baseline = mergeReadyDocument(JSON.parse(file.text));
-    const nextSync = { ...state.sync, fileLastModified: file.lastModified, fileBaselineDocument: baseline, fileResolutionDocument: null, fileConflicts: [], localPending: false };
-    replaceWorkspace(workspace.items, workspace.activity, backupReasons.import, nextSync, workspace.organization, workspace.customerDirectory, workspace.planningCalendar, workspace.workflow, workspace.prioritization, workspace.insightRecords, workspace.codeRepositories, workspace.implementationRuns, workspace.experience);
+    const nextSync = { ...state.sync, fileLastModified: file.lastModified, fileBaselineDocument: baseline, fileReview: null, fileResolutionDocument: null, fileConflicts: [], localPending: false };
+    await replaceWorkspace(workspace.items, workspace.activity, backupReasons.import, nextSync, workspace.organization, workspace.customerDirectory, workspace.planningCalendar, workspace.workflow, workspace.prioritization, workspace.insightRecords, workspace.codeRepositories, workspace.implementationRuns, workspace.experience, workspace.artifacts || []);
     state.linkedFile = { handle, name: file.name, permission: await queryLinkedFilePermission(handle), lastModified: file.lastModified, status: "ready" };
     await storeLinkedFileHandle(state.projects.registry.activeProjectId, handle);
     state.sourceSelection = "local-file";
     state.source = { ...state.source, type: "local-file", fileName: file.name };
-    persistSource();
+    await persistSource();
     state.syncStatus = `Linked ${file.name}. Future changes autosave to this file.`;
     return { focusId: "syncStatus" };
   });
@@ -8179,15 +9860,15 @@ async function createNewWorkspaceFile(event) {
   await runLinkedFileAction(async () => {
     const handle = await createLinkedWorkspaceFile(globalThis, state.source.fileName || "pm-os-workspace.json");
     const content = exportPortableWorkspace();
-    await withWorkspaceFileLock(() => writeLinkedWorkspaceFile(handle, content));
+    await withWorkspaceFileLock(() => runLocalExternalEffect(() => writeLinkedWorkspaceFile(handle, content), "Workspace file creation"));
     const file = await readLinkedWorkspaceFile(handle);
     state.linkedFile = { handle, name: file.name, permission: await queryLinkedFilePermission(handle), lastModified: file.lastModified, status: "ready" };
     await storeLinkedFileHandle(state.projects.registry.activeProjectId, handle);
     state.sourceSelection = "local-file";
     state.source = { ...state.source, type: "local-file", fileName: file.name };
-    state.sync = { ...state.sync, fileLastModified: file.lastModified, fileBaselineDocument: mergeReadyDocument(JSON.parse(content)), fileResolutionDocument: null, fileConflicts: [], localPending: false };
-    persistSource();
-    persistSync();
+    state.sync = { ...state.sync, fileLastModified: file.lastModified, fileBaselineDocument: mergeReadyDocument(JSON.parse(content)), fileReview: null, fileResolutionDocument: null, fileConflicts: [], localPending: false };
+    await persistSource();
+    await persistSync();
     state.syncStatus = `Created and linked ${file.name}.`;
     return { focusId: "syncStatus" };
   }, event?.currentTarget);
@@ -8196,7 +9877,6 @@ async function createNewWorkspaceFile(event) {
 async function saveLinkedWorkspaceNow() {
   await runLinkedFileAction(async () => {
     await writeCurrentLinkedWorkspace();
-    state.syncStatus = `Saved ${state.linkedFile.name}.`;
   });
 }
 
@@ -8242,80 +9922,130 @@ async function restoreLinkedWorkspaceHandle() {
   }
 }
 
-async function inspectLinkedWorkspaceOnFocus({ forSwitch = false } = {}) {
-  if (demoMode || state.dataBusy || state.projects?.busy || (state.projects?.departurePending && !forSwitch) || state.source.type !== "local-file" || !state.linkedFile.handle) return false;
-  state.dataBusy = true;
-  try {
-    const permission = await queryLinkedFilePermission(state.linkedFile.handle);
-    state.linkedFile.permission = permission;
-    if (permission !== "granted") {
-      if (forSwitch) state.syncStatus = "Linked file write permission is required. Your changes remain in this browser.";
-      return false;
+async function synchronizeLinkedWorkspace({ resolution } = {}) {
+  assertLocalWorkspaceCurrent();
+  const handle = state.linkedFile.handle;
+  if (!handle) throw new Error("Choose a linked workspace file first.");
+  const source = state.source;
+  const projectId = state.projects?.registry.activeProjectId || PRIMARY_PROJECT_ID;
+  const assertCurrent = () => {
+    if (state.source !== source || state.linkedFile.handle !== handle || state.team.active
+      || (state.projects?.registry.activeProjectId || PRIMARY_PROJECT_ID) !== projectId) {
+      throw new Error("The active workspace changed. The linked-file operation stopped.");
     }
-    const file = await readLinkedWorkspaceFile(state.linkedFile.handle);
-    if (file.lastModified === state.sync.fileLastModified) return true;
-    if (!state.sync.fileLastModified && forSwitch) throw new Error("A trusted linked-file baseline is required before syncing. Reopen the file to review it.");
-    if (!state.sync.fileLastModified) return false;
+  };
+  const currentDocument = () => mergeReadyDocument(JSON.parse(exportPortableWorkspace()));
+  const sameDocument = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+  return withWorkspaceFileLock(async () => {
+    assertCurrent();
+    const permission = await queryLinkedFilePermission(handle);
+    assertCurrent();
+    state.linkedFile.permission = permission;
+    if (permission !== "granted") throw new Error("Linked file write permission is required. Your changes remain in this browser.");
+    const file = await readLinkedWorkspaceFile(handle);
+    assertCurrent();
+    // Validate every read, including files whose modification time did not change.
+    importPortableWorkspace(file.text);
     const remoteDocument = mergeReadyDocument(JSON.parse(file.text));
-    const localDocument = mergeReadyDocument(JSON.parse(exportPortableWorkspace()));
-    const baseDocument = state.sync.fileBaselineDocument || localDocument;
-    const result = mergeWorkspaceDocuments(baseDocument, localDocument, remoteDocument);
-    if (!result.clean) {
-      state.sync = { ...state.sync, fileResolutionDocument: result.merged, fileConflicts: result.conflicts };
-      persistSync();
-      state.syncStatus = `${result.conflicts.length} linked-file conflict${result.conflicts.length === 1 ? "" : "s"} need review. The external file was not overwritten.`;
-      render();
+    const localDocument = currentDocument();
+    const baseDocument = state.sync.fileBaselineDocument;
+    if (!baseDocument) throw new Error("Reopen the linked file so PM OS can save a version to compare changes against.");
+    const reviewCurrent = state.sync.fileReview
+      && sameDocument(state.sync.fileReview.local, localDocument)
+      && sameDocument(state.sync.fileReview.remote, remoteDocument);
+    let result = reviewCurrent && state.sync.fileResolutionDocument
+      ? { merged: state.sync.fileResolutionDocument, conflicts: state.sync.fileConflicts, clean: !state.sync.fileConflicts.length }
+      : mergeWorkspaceDocuments(baseDocument, localDocument, remoteDocument);
+    // A choice only applies to the exact versions the customer reviewed.
+    if (resolution && reviewCurrent) {
+      result = resolveWorkspaceConflicts(result, { [resolution.path]: resolution.choice });
+    }
+    if (result.conflicts.length) {
+      state.sync = { ...state.sync, fileResolutionDocument: result.merged,
+        fileConflicts: result.conflicts, fileReview: { local: localDocument, remote: remoteDocument }, localPending: true };
+      await persistSync();
+      state.syncStatus = (resolution && !reviewCurrent ? "The workspace changed during review. Review the latest values. " : "")
+        + result.conflicts.length + " linked-file conflict" + (result.conflicts.length === 1 ? "" : "s")
+        + " need review. The external file was not overwritten.";
       return false;
     }
     const workspace = importPortableWorkspace(JSON.stringify(result.merged));
-    const nextContent = JSON.stringify(result.merged, null, 2);
-    const writeRemote = JSON.stringify(result.merged) !== JSON.stringify(remoteDocument);
-    const nextSync = { ...state.sync, fileLastModified: file.lastModified, fileBaselineDocument: result.merged, fileResolutionDocument: null, fileConflicts: [], localPending: writeRemote };
-    replaceWorkspace(workspace.items, workspace.activity, backupReasons.drivePull, nextSync, workspace.organization, workspace.customerDirectory, workspace.planningCalendar, workspace.workflow, workspace.prioritization, workspace.insightRecords, workspace.codeRepositories, workspace.implementationRuns, workspace.experience);
-    if (writeRemote) await withWorkspaceFileLock(() => writeLinkedWorkspaceFile(state.linkedFile.handle, nextContent));
-    const updated = await readLinkedWorkspaceFile(state.linkedFile.handle);
+    const writeRemote = !sameDocument(result.merged, remoteDocument);
+    if (writeRemote) {
+      assertCurrent();
+      try {
+        await runLocalExternalEffect(() => writeLinkedWorkspaceFile(handle, JSON.stringify(result.merged, null, 2), { expectedText: file.text }), "Linked file update");
+      } catch (error) {
+        assertCurrent();
+        // Preserve a clean merge in recovery even when the disk is unavailable.
+        // Keep the previous baseline and all unresolved review state until a write succeeds.
+        if (!resolution && !state.sync.fileConflicts.length
+          && sameDocument(localDocument, currentDocument()) && !sameDocument(result.merged, localDocument)) {
+          const pendingSync = { ...state.sync, localPending: true };
+          await replaceWorkspace(workspace.items, workspace.activity, backupReasons.linkedFileMerge, pendingSync,
+            workspace.organization, workspace.customerDirectory, workspace.planningCalendar,
+            workspace.workflow, workspace.prioritization, workspace.insightRecords,
+            workspace.codeRepositories, workspace.implementationRuns, workspace.experience, workspace.artifacts || []);
+        }
+        throw error;
+      }
+      assertCurrent();
+    }
+    // An initiative may be saved while the asynchronous file write is in progress.
+    // Retain the earlier common baseline so the next pass can merge that new edit.
+    if (!sameDocument(localDocument, currentDocument())) {
+      state.sync = { ...state.sync, localPending: true };
+      await persistSync();
+      state.syncStatus = "New browser changes are waiting to sync. Checking the file again.";
+      scheduleLinkedWorkspaceWrite();
+      return false;
+    }
+    const updated = await readLinkedWorkspaceFile(handle);
+    assertCurrent();
+    if (!sameDocument(localDocument, currentDocument())) {
+      state.sync = { ...state.sync, localPending: true };
+      await persistSync();
+      state.syncStatus = "New browser changes are waiting to sync. Checking the file again.";
+      scheduleLinkedWorkspaceWrite();
+      return false;
+    }
+    // A later external edit remains remote work; never accept it as our saved baseline.
+    const expectedText = writeRemote ? JSON.stringify(result.merged, null, 2) : file.text;
+    const changedAgain = updated.text !== expectedText;
+    const nextSync = { ...state.sync, fileLastModified: updated.lastModified,
+      fileBaselineDocument: result.merged, fileResolutionDocument: null, fileConflicts: [],
+      fileReview: null, localPending: changedAgain };
+    if (!sameDocument(result.merged, localDocument)) {
+      await replaceWorkspace(workspace.items, workspace.activity, backupReasons.linkedFileMerge, nextSync,
+        workspace.organization, workspace.customerDirectory, workspace.planningCalendar,
+        workspace.workflow, workspace.prioritization, workspace.insightRecords,
+        workspace.codeRepositories, workspace.implementationRuns, workspace.experience, workspace.artifacts || []);
+    } else {
+      state.sync = nextSync;
+      await persistSync();
+    }
     state.linkedFile.lastModified = updated.lastModified;
-    state.sync = { ...state.sync, fileLastModified: updated.lastModified, fileBaselineDocument: result.merged, localPending: false };
-    persistSync();
-    state.syncStatus = writeRemote ? "Merged browser and external file changes." : "Loaded changes from the linked workspace file.";
-    render();
-    return true;
-  } catch (error) {
-    state.syncStatus = `Linked file check stopped. ${error.message}`;
-    render();
-    return false;
-  } finally {
-    state.dataBusy = false;
-    render();
-  }
+    state.syncStatus = changedAgain ? "The file changed again after syncing. Check the latest changes before continuing."
+      : resolution ? "Resolved every linked-file conflict and saved the merged workspace."
+      : writeRemote ? "Saved " + file.name + ". Merged browser and external file changes."
+      : "Loaded changes from the linked workspace file.";
+    return !changedAgain;
+  });
+}
+
+async function inspectLinkedWorkspaceOnFocus({ forSwitch = false } = {}) {
+  if (demoMode || state.dataBusy || state.projects?.busy || (state.projects?.departurePending && !forSwitch) || state.source.type !== "local-file" || !state.linkedFile.handle) return false;
+  state.dataBusy = true;
+  try { return await synchronizeLinkedWorkspace(); }
+  catch (error) { state.syncStatus = "Linked file check stopped. " + error.message; return false; }
+  finally { state.dataBusy = false; render(); }
 }
 
 async function resolveLinkedFileConflict(event) {
   const path = event.currentTarget.dataset.fileConflictPath || "";
   const choice = event.currentTarget.dataset.fileConflictChoice;
-  const conflict = state.sync.fileConflicts.find((entry) => entry.path === path);
-  if (!conflict || !["local", "remote"].includes(choice)) return;
-  await runLinkedFileAction(async () => {
-    const document = state.sync.fileResolutionDocument || mergeReadyDocument(JSON.parse(exportPortableWorkspace()));
-    const resolved = resolveWorkspaceConflicts({ merged: document, conflicts: [conflict] }, { [path]: choice });
-    const remaining = state.sync.fileConflicts.filter((entry) => entry.path !== path);
-    state.sync = { ...state.sync, fileResolutionDocument: resolved.merged, fileConflicts: remaining };
-    persistSync();
-    if (remaining.length) {
-      state.syncStatus = `Resolved ${path || "workspace"}. ${remaining.length} conflict${remaining.length === 1 ? "" : "s"} remain.`;
-      return;
-    }
-    const workspace = importPortableWorkspace(JSON.stringify(resolved.merged));
-    const content = JSON.stringify(resolved.merged, null, 2);
-    const nextSync = { ...state.sync, fileBaselineDocument: resolved.merged, fileResolutionDocument: null, fileConflicts: [], localPending: true };
-    replaceWorkspace(workspace.items, workspace.activity, backupReasons.drivePull, nextSync, workspace.organization, workspace.customerDirectory, workspace.planningCalendar, workspace.workflow, workspace.prioritization, workspace.insightRecords, workspace.codeRepositories, workspace.implementationRuns, workspace.experience);
-    await withWorkspaceFileLock(() => writeLinkedWorkspaceFile(state.linkedFile.handle, content));
-    const file = await readLinkedWorkspaceFile(state.linkedFile.handle);
-    state.linkedFile.lastModified = file.lastModified;
-    state.sync = { ...state.sync, fileLastModified: file.lastModified, localPending: false };
-    persistSync();
-    state.syncStatus = "Resolved every linked-file conflict and saved the merged workspace.";
-  });
+  if (!state.sync.fileConflicts.some((entry) => entry.path === path) || !["local", "remote"].includes(choice)) return;
+  await runLinkedFileAction(() => synchronizeLinkedWorkspace({ resolution: { path, choice } }));
 }
 
 let linkedFileWriteTimer = 0;
@@ -8330,18 +10060,7 @@ function scheduleLinkedWorkspaceWrite() {
 }
 
 async function writeCurrentLinkedWorkspace() {
-  if (!state.linkedFile.handle) throw new Error("Choose a linked workspace file first.");
-  const permission = await queryLinkedFilePermission(state.linkedFile.handle);
-  state.linkedFile.permission = permission;
-  if (permission !== "granted") throw new Error("Linked file write permission is required.");
-  const content = exportPortableWorkspace();
-  await withWorkspaceFileLock(() => writeLinkedWorkspaceFile(state.linkedFile.handle, content));
-  const file = await readLinkedWorkspaceFile(state.linkedFile.handle);
-  state.linkedFile.lastModified = file.lastModified;
-  state.sync = { ...state.sync, fileLastModified: file.lastModified, fileBaselineDocument: mergeReadyDocument(JSON.parse(content)), fileResolutionDocument: null, fileConflicts: [], localPending: false };
-  persistSync();
-  state.syncStatus = `Saved ${file.name}.`;
-  render();
+  return synchronizeLinkedWorkspace();
 }
 
 async function runLinkedFileAction(action) {
@@ -8372,7 +10091,7 @@ async function connectDrive(event) {
     const clientId = state.source.clientId || runtimeClientId;
     if (!state.source.clientId && clientId) {
       state.source = { ...state.source, clientId };
-      persistSource();
+      await persistSource();
     }
     state.driveToken = await requestDriveAccessToken(clientId);
     await refreshDriveMetadata();
@@ -8392,8 +10111,8 @@ async function chooseDriveFile(event) {
     state.source = { ...state.source, fileId: selected.id, fileName: selected.name || state.source.fileName };
     state.sync = defaultSyncState();
     state.driveReview = null;
-    persistSource();
-    persistSync();
+    await persistSource();
+    await persistSync();
     state.syncStatus = `Selected ${state.source.fileName}. Choose Sync now to preview and activate its content.`;
   }, { pendingStatus: "Opening Google Picker...", triggerId: event?.currentTarget?.id || "chooseDriveFileButton" });
 }
@@ -8420,7 +10139,7 @@ async function syncDriveNow(event) {
     if (!conflict) {
       if (state.sync.localPending) await pushCurrentWorkspaceToDrive();
       else {
-        commitSync({ ...state.sync, remote: remoteFingerprint, conflict: null });
+        await commitSync({ ...state.sync, remote: remoteFingerprint, conflict: null });
         state.syncStatus = "Drive and browser are already in sync.";
       }
       return;
@@ -8428,14 +10147,14 @@ async function syncDriveNow(event) {
     if (!state.sync.localPending) {
       const workspace = importPortableWorkspace(remoteWorkspace.content);
       const nextSync = { ...advanceDriveBaseline(state.sync, remoteFingerprint, "pull"), baseDocument: remoteDocument, localPending: false };
-      replaceWorkspace(workspace.items, workspace.activity, backupReasons.drivePull, nextSync, workspace.organization, workspace.customerDirectory, workspace.planningCalendar, workspace.workflow, workspace.prioritization, workspace.insightRecords, workspace.codeRepositories, workspace.implementationRuns, workspace.experience);
+      await replaceWorkspace(workspace.items, workspace.activity, backupReasons.drivePull, nextSync, workspace.organization, workspace.customerDirectory, workspace.planningCalendar, workspace.workflow, workspace.prioritization, workspace.insightRecords, workspace.codeRepositories, workspace.implementationRuns, workspace.experience, workspace.artifacts || []);
       state.driveReview = null;
       state.syncStatus = "Downloaded Drive changes and stored a browser recovery snapshot.";
       return;
     }
     if (!state.sync.baseDocument) {
       state.driveReview = conflict;
-      state.syncStatus = "Drive and browser both contain changes, but no trusted merge baseline exists. Review the advanced actions.";
+      state.syncStatus = "Drive and this device both have changes, but PM OS has no shared saved version to compare them against. Review the options under Replace one copy with another.";
       return;
     }
     const localDocument = mergeReadyDocument(JSON.parse(exportPortableWorkspace()));
@@ -8446,11 +10165,11 @@ async function syncDriveNow(event) {
       return;
     }
     const mergedContent = JSON.stringify(merged.merged, null, 2);
-    const saved = await saveDriveWorkspace(state.source, state.driveToken, mergedContent, remoteFingerprint);
+    const saved = await runLocalExternalEffect(() => saveDriveWorkspace(state.source, state.driveToken, mergedContent, remoteFingerprint), "Drive merge upload");
     const savedFingerprint = driveFileFingerprint(saved);
     const workspace = importPortableWorkspace(mergedContent);
     const nextSync = { ...advanceDriveBaseline(state.sync, savedFingerprint, "push"), baseDocument: merged.merged, localPending: false };
-    replaceWorkspace(workspace.items, workspace.activity, backupReasons.drivePull, nextSync, workspace.organization, workspace.customerDirectory, workspace.planningCalendar, workspace.workflow, workspace.prioritization, workspace.insightRecords, workspace.codeRepositories, workspace.implementationRuns, workspace.experience);
+    await replaceWorkspace(workspace.items, workspace.activity, backupReasons.drivePull, nextSync, workspace.organization, workspace.customerDirectory, workspace.planningCalendar, workspace.workflow, workspace.prioritization, workspace.insightRecords, workspace.codeRepositories, workspace.implementationRuns, workspace.experience, workspace.artifacts || []);
     state.driveReview = null;
     state.syncStatus = "Merged non-overlapping browser and Drive changes, then saved both copies.";
   }, { pendingStatus: "Synchronizing browser and Drive...", triggerId: event?.currentTarget?.id || "syncDriveButton" });
@@ -8462,26 +10181,26 @@ async function pullFromDrive(event) {
     assertDriveAvailable();
     const workspace = await readDriveWorkspace(state.source, state.driveToken);
     if (!workspace) {
-      state.syncStatus = "No canonical Drive workspace file was found.";
+      state.syncStatus = "No Drive workspace file was found.";
       return;
     }
     const remoteWorkspace = importPortableWorkspace(workspace.content);
     const remote = driveFileFingerprint(workspace.file);
     const confirmed = await requestDataConfirmation({
-      title: "Pull remote workspace?",
-      description: "Pull Remote will replace the browser workspace after storing a before-drive-pull recovery snapshot.",
-      confirmLabel: "Pull Remote",
+      title: "Replace this device's copy with Drive?",
+      description: "The Drive file will replace the workspace on this device. PM OS first saves a recovery copy here so you can restore the previous work.",
+      confirmLabel: "Use Drive copy",
       trigger: document.querySelector(`#${triggerId}`)
     });
     if (!confirmed) {
-      state.syncStatus = "Drive pull cancelled. The browser workspace was not changed.";
+      state.syncStatus = "Download cancelled. The workspace on this device was not changed.";
       return { cancelled: true, focusId: triggerId };
     }
     const nextSync = { ...advanceDriveBaseline(state.sync, remote, "pull"), baseDocument: mergeReadyDocument(JSON.parse(workspace.content)), localPending: false };
-    replaceWorkspace(remoteWorkspace.items, remoteWorkspace.activity, backupReasons.drivePull, nextSync, remoteWorkspace.organization, remoteWorkspace.customerDirectory, remoteWorkspace.planningCalendar, remoteWorkspace.workflow, remoteWorkspace.prioritization, remoteWorkspace.insightRecords, remoteWorkspace.codeRepositories, remoteWorkspace.implementationRuns, remoteWorkspace.experience);
+    await replaceWorkspace(remoteWorkspace.items, remoteWorkspace.activity, backupReasons.drivePull, nextSync, remoteWorkspace.organization, remoteWorkspace.customerDirectory, remoteWorkspace.planningCalendar, remoteWorkspace.workflow, remoteWorkspace.prioritization, remoteWorkspace.insightRecords, remoteWorkspace.codeRepositories, remoteWorkspace.implementationRuns, remoteWorkspace.experience, remoteWorkspace.artifacts || []);
     state.driveReview = null;
-    state.dataStatus = "Stored a recovery snapshot before the Drive pull.";
-    state.syncStatus = "Pulled a stable canonical Drive workspace and updated the sync baseline.";
+    state.dataStatus = "Saved a recovery copy before downloading the Drive workspace.";
+    state.syncStatus = "Downloaded the Drive workspace and saved the version used to compare future changes.";
   }, { pendingStatus: "Reading a stable Drive workspace...", triggerId });
 }
 
@@ -8497,27 +10216,28 @@ async function pushToDrive(event) {
       state.syncStatus = driveConflictStatus(conflict);
       return { review: true };
     }
-    const file = await saveDriveWorkspace(state.source, state.driveToken, exportPortableWorkspace(), state.sync.baseRemote);
+    const file = await runLocalExternalEffect(() => saveDriveWorkspace(state.source, state.driveToken, exportPortableWorkspace(), state.sync.baseRemote), "Drive upload");
     const remote = driveFileFingerprint(file);
     const complete = driveFingerprintComplete(remote);
     if (!complete) {
       state.driveReview = { kind: "unknown", baseRemote: state.sync.baseRemote, remote };
-      state.syncStatus = "Drive saved the workspace but returned incomplete metadata. Pull Remote before another canonical push.";
+      state.syncStatus = "Drive saved the workspace, but PM OS could not verify its file details. Download the Drive copy before uploading again.";
       return { review: true };
     }
     const nextSync = { ...advanceDriveBaseline(state.sync, remote, "push"), baseDocument: mergeReadyDocument(JSON.parse(exportPortableWorkspace())), localPending: false };
-    commitSync(nextSync);
+    await commitSync(nextSync);
     state.driveReview = null;
-    state.syncStatus = "Pushed the browser workspace to the canonical Drive file.";
+    state.syncStatus = "Uploaded this device's workspace to the Drive file.";
   }, { pendingStatus: "Checking Drive and pushing local workspace...", triggerId });
 }
 
 async function pushCurrentWorkspaceToDrive() {
+  assertLocalWorkspaceCurrent();
   const content = exportPortableWorkspace();
-  const file = await saveDriveWorkspace(state.source, state.driveToken, content, state.sync.baseRemote);
+  const file = await runLocalExternalEffect(() => saveDriveWorkspace(state.source, state.driveToken, content, state.sync.baseRemote), "Drive upload");
   const remote = driveFileFingerprint(file);
   if (!driveFingerprintComplete(remote)) throw new Error("Drive saved the file but did not return a complete revision. Inspect Drive before continuing.");
-  commitSync({ ...advanceDriveBaseline(state.sync, remote, "push"), baseDocument: mergeReadyDocument(JSON.parse(content)), localPending: false });
+  await commitSync({ ...advanceDriveBaseline(state.sync, remote, "push"), baseDocument: mergeReadyDocument(JSON.parse(content)), localPending: false });
   state.driveReview = null;
 }
 
@@ -8525,8 +10245,9 @@ async function saveLocalConflictCopy(event) {
   await runDriveAction(async () => {
     assertDriveAvailable();
     if (!(state.driveReview || state.sync.conflict)) throw new Error("No Drive conflict is active.");
-    const result = await saveDriveConflictCopy(state.source, state.driveToken, exportPortableWorkspace());
-    state.syncStatus = `Saved ${result.fileName}. The canonical Drive file was not changed and the conflict remains active.`;
+    const result = await runLocalExternalEffect(() => saveDriveConflictCopy(state.source, state.driveToken, exportPortableWorkspace()), "Drive conflict copy");
+    state.localExternalEffect = "";
+    state.syncStatus = `Saved ${result.fileName}. The original Drive file was not changed. Its conflicting changes still need review.`;
   }, { pendingStatus: "Saving a local conflict copy to Drive...", triggerId: event?.currentTarget?.id || "saveConflictCopyButton" });
 }
 
@@ -8534,10 +10255,10 @@ async function refreshDriveMetadata() {
   const info = await inspectDriveWorkspace(state.source, state.driveToken);
   const remote = driveFileFingerprint(info.file);
   const conflict = buildSyncConflict(state.sync.baseRemote, remote);
-  commitSync({ ...state.sync, remote, conflict });
+  await commitSync({ ...state.sync, remote, conflict });
   state.driveReview = null;
   if (conflict) state.syncStatus = driveConflictStatus(conflict);
-  else state.syncStatus = info.file ? "Drive metadata matches the last pull or push." : "Drive folder exists and no canonical workspace file was found.";
+  else state.syncStatus = info.file ? "The Drive file matches the version saved at your last sync." : "The Drive folder exists, but no workspace file was found.";
 }
 
 function buildSyncConflict(baseRemote, remote) {
@@ -8592,7 +10313,7 @@ function loadRecoverySnapshots() {
 function recoveryLoadStatus(result) {
   if (result.error) return result.error;
   if (result.ignoredCount) return `Ignored ${result.ignoredCount} malformed recovery snapshot${result.ignoredCount === 1 ? "" : "s"}.`;
-  return demoMode ? "Recovery snapshots are kept only for this demo session." : "Recovery snapshots are ready.";
+  return demoMode ? "Demo recovery snapshots reset whenever this page reloads. Download a backup to keep a separate copy." : "Recovery snapshots are ready.";
 }
 
 async function restoreBackup(event) {
@@ -8614,7 +10335,7 @@ async function restoreBackup(event) {
       });
       if (!confirmed) return { cancelled: true };
       const nextWorkspace = importPortableWorkspace(restored.snapshot.payload);
-      replaceWorkspace(nextWorkspace.items, nextWorkspace.activity, backupReasons.restore, undefined, nextWorkspace.organization, nextWorkspace.customerDirectory, nextWorkspace.planningCalendar, nextWorkspace.workflow, nextWorkspace.prioritization, nextWorkspace.insightRecords, nextWorkspace.codeRepositories, nextWorkspace.implementationRuns, nextWorkspace.experience);
+      await replaceWorkspace(nextWorkspace.items, nextWorkspace.activity, backupReasons.restore, undefined, nextWorkspace.organization, nextWorkspace.customerDirectory, nextWorkspace.planningCalendar, nextWorkspace.workflow, nextWorkspace.prioritization, nextWorkspace.insightRecords, nextWorkspace.codeRepositories, nextWorkspace.implementationRuns, nextWorkspace.experience, nextWorkspace.artifacts || []);
       state.dataStatus = `Restored ${reason.toLowerCase()} from ${time}.`;
       return { cancelled: false };
     }
@@ -8631,7 +10352,7 @@ function downloadBackup(event) {
     const restored = restoreWorkspaceSnapshot(state.backups, event.currentTarget.dataset.downloadBackup);
     const filename = backupDownloadName(restored.snapshot);
     downloadFile(restored.snapshot.payload, "application/json", filename);
-    announceDataStatus(`Downloaded ${filename}.`);
+    announceDataStatus(`Backup download requested: ${filename}. Check your browser's downloads.`);
   } catch (error) {
     announceDataStatus(`Backup download failed. ${error.message}`);
   }
@@ -8642,8 +10363,8 @@ async function resetWorkspace(event) {
   const confirmed = await requestDataConfirmation({
     title: clearingOperationWorkspace ? "Clear workspace?" : "Reset demo data?",
     description: clearingOperationWorkspace
-      ? "This removes all initiatives, insights, activity, organization and customer records, planning data, workflow settings, prioritization settings, and cached selections from this operational workspace. A before-reset recovery snapshot is stored in this browser first. Browser preferences, source configuration, tutorial progress, usage data, and existing recovery snapshots remain. Connected Drive and Team workspaces are not changed."
-      : "Reset will restore the built-in sample data after storing a session-only before-reset recovery snapshot. Your saved operational workspace will not change.",
+      ? "This removes all initiatives, insights, activity, organization and customer records, planning data, workflow settings, prioritization settings, and cached selections from this workspace. A before-reset recovery snapshot is stored in this browser first. Browser preferences, source configuration, tutorial progress, usage data, and existing recovery snapshots remain. Connected Drive and Team workspaces are not changed."
+      : "Reset will restore the built-in sample data after storing a before-reset recovery snapshot. Demo changes and recovery snapshots reset whenever this page reloads. Your saved workspace will not change.",
     confirmLabel: clearingOperationWorkspace ? "Clear Workspace" : "Reset Demo Data",
     secondaryLabel: clearingOperationWorkspace ? "Download backup first" : "",
     onSecondary: clearingOperationWorkspace ? downloadBeforeClearBackup : undefined,
@@ -8655,11 +10376,11 @@ async function resetWorkspace(event) {
   }
   try {
     const resetTarget = demoMode ? demoWorkspace : createEmptyWorkspaceDocument();
-    replaceWorkspace([...resetTarget.items], [], backupReasons.reset, clearingOperationWorkspace ? defaultSyncState() : undefined, resetTarget.organization, resetTarget.customerDirectory, resetTarget.planningCalendar, resetTarget.workflow, resetTarget.prioritization, resetTarget.insightRecords, resetTarget.codeRepositories || [], resetTarget.implementationRuns || [], resetTarget.experience);
+    await replaceWorkspace([...resetTarget.items], [], backupReasons.reset, clearingOperationWorkspace ? defaultSyncState() : undefined, resetTarget.organization, resetTarget.customerDirectory, resetTarget.planningCalendar, resetTarget.workflow, resetTarget.prioritization, resetTarget.insightRecords, resetTarget.codeRepositories || [], resetTarget.implementationRuns || [], resetTarget.experience, resetTarget.artifacts || []);
     if (clearingOperationWorkspace) resetWorkspaceUiState();
     state.dataStatus = clearingOperationWorkspace
       ? "Stored a recovery snapshot and cleared the workspace. To recover, use Restore Snapshot below or import the JSON backup you downloaded."
-      : "Reset the demo data. Your operational workspace was not changed.";
+      : "Reset the demo data. Your workspace was not changed.";
     if (clearingOperationWorkspace) pushViewUrl(true);
     renderAndFocus("dataStatus");
   } catch (error) {
@@ -8675,7 +10396,12 @@ function downloadBeforeClearBackup() {
 }
 
 function resetWorkspaceUiState() {
-  state.weeklyUpdateCopied = false;
+  portfolioOpenRecommendations.clear();
+  documentComposer.reset();
+  state.homeHealth = null;
+  state.experiencePresetChoice = "";
+  state.dataAdvancedOpen = false;
+  state.weeklyUpdateCopied = readWeeklyUpdateCopied(localStorage, weeklyChecklistStorageKey());
   state.spaceModes = {};
   state.query = "";
   state.periodSelection = normalizePeriodSelection({ kind: "all" }, state.planningCalendar);
@@ -8690,6 +10416,7 @@ function resetWorkspaceUiState() {
   state.customerStatus = "";
   state.customerImport = null;
   state.customerSegmentDraft = null;
+  state.customerAccountDrafts.clear();
   state.organizationStatus = "";
   state.workflowStatus = "";
   state.selectedWorkflowStatusId = "";
@@ -8712,17 +10439,19 @@ function resetWorkspaceUiState() {
   state.storageWarning = "";
 }
 
-function replaceWorkspace(items, activity, backupReason, nextSync, organization = state.organization, customerDirectory = state.customerDirectory, planningCalendar = state.planningCalendar, workflow = state.workflow, prioritization = state.prioritization, insightRecords = state.insightRecords, codeRepositories = state.codeRepositories, implementationRuns = state.implementationRuns, experience = state.experience) {
+async function replaceWorkspace(items, activity, backupReason, nextSync, organization = state.organization, customerDirectory = state.customerDirectory, planningCalendar = state.planningCalendar, workflow = state.workflow, prioritization = state.prioritization, insightRecords = state.insightRecords, codeRepositories = state.codeRepositories, implementationRuns = state.implementationRuns, experience = state.experience, artifacts = []) {
   if (state.team.active) throw new Error("Team workspace data cannot be stored in browser recovery.");
   const synchronizeReplacement = !demoMode && nextSync === undefined && [backupReasons.import, backupReasons.restore].includes(backupReason);
   if (synchronizeReplacement && ["google-drive", "local-file"].includes(state.source.type)) {
     // Persist the dirty marker in the same rollback-safe transaction as the import.
     nextSync = { ...state.sync, localPending: true };
   }
+  const replacementCandidate = { items, activity, organization, customerDirectory, planningCalendar, workflow, prioritization, insightRecords, codeRepositories, implementationRuns, experience, artifacts };
   const previousItems = state.items;
   const previousInsightRecords = state.insightRecords;
   const previousCodeRepositories = state.codeRepositories;
   const previousImplementationRuns = state.implementationRuns;
+  const previousArtifacts = state.artifacts;
   const previousActivity = state.activity;
   const previousPlanningCalendar = state.planningCalendar;
   const previousPeriodSelection = state.periodSelection;
@@ -8733,21 +10462,25 @@ function replaceWorkspace(items, activity, backupReason, nextSync, organization 
   const previousExperience = state.experience;
   const previousBackups = state.backups;
   const previousSync = state.sync;
-  const backupPayload = exportPortableWorkspace(previousItems, previousActivity, previousOrganization, previousCustomerDirectory, previousPlanningCalendar, previousWorkflow, previousPrioritization, previousInsightRecords, previousCodeRepositories, previousImplementationRuns, previousExperience);
+  const backupPayload = exportPortableWorkspace(previousItems, previousActivity, previousOrganization, previousCustomerDirectory, previousPlanningCalendar, previousWorkflow, previousPrioritization, previousInsightRecords, previousCodeRepositories, previousImplementationRuns, previousExperience, previousArtifacts);
   let nextBackups;
   if (demoMode) {
     nextBackups = addWorkspaceSnapshot(previousBackups, backupPayload, backupReason);
   } else {
-    runStorageTransaction(localStorage, [storageKey, activityKey, backupKey, syncKey], () => {
+    const checklistKey = weeklyChecklistStorageKey();
+    const clearingChecklist = backupReason === backupReasons.reset && Boolean(checklistKey);
+    await runLocalStorageTransaction([storageKey, activityKey, backupKey, syncKey, ...(clearingChecklist ? [checklistKey] : [])], () => {
       nextBackups = storeWorkspaceSnapshot(localStorage, backupKey, previousBackups, backupPayload, backupReason);
-      localStorage.setItem(storageKey, exportPortableWorkspace(items, activity, organization, customerDirectory, planningCalendar, workflow, prioritization, insightRecords, codeRepositories, implementationRuns, experience));
+      localStorage.setItem(storageKey, exportPortableWorkspace(items, activity, organization, customerDirectory, planningCalendar, workflow, prioritization, insightRecords, codeRepositories, implementationRuns, experience, artifacts));
       localStorage.setItem(activityKey, JSON.stringify({ activity }));
       if (nextSync) localStorage.setItem(syncKey, serializeSync(nextSync));
+      if (clearingChecklist) localStorage.removeItem(checklistKey);
     }, () => {
       state.items = previousItems;
       state.insightRecords = previousInsightRecords;
       state.codeRepositories = previousCodeRepositories;
       state.implementationRuns = previousImplementationRuns;
+      state.artifacts = previousArtifacts;
       state.activity = previousActivity;
       state.planningCalendar = previousPlanningCalendar;
       state.periodSelection = previousPeriodSelection;
@@ -8758,13 +10491,14 @@ function replaceWorkspace(items, activity, backupReason, nextSync, organization 
       state.experience = previousExperience;
       state.backups = previousBackups;
       state.sync = previousSync;
-    });
+    }, replacementCandidate);
   }
   try {
     state.items = items;
     state.insightRecords = insightRecords;
     state.codeRepositories = codeRepositories;
     state.implementationRuns = implementationRuns;
+    state.artifacts = artifacts;
     state.activity = activity;
     state.planningCalendar = normalizePlanningCalendar(planningCalendar);
     state.periodSelection = normalizePeriodSelection(state.periodSelection, state.planningCalendar);
@@ -8777,11 +10511,14 @@ function replaceWorkspace(items, activity, backupReason, nextSync, organization 
     state.backups = nextBackups;
     if (nextSync) state.sync = nextSync;
     state.storageWarning = "";
+    localCommittedWorkspace = localCanonicalFields();
+    state.localExternalEffect = "";
   } catch (error) {
     state.items = previousItems;
     state.insightRecords = previousInsightRecords;
     state.codeRepositories = previousCodeRepositories;
     state.implementationRuns = previousImplementationRuns;
+    state.artifacts = previousArtifacts;
     state.activity = previousActivity;
     state.planningCalendar = previousPlanningCalendar;
     state.periodSelection = previousPeriodSelection;
@@ -8801,24 +10538,295 @@ function replaceWorkspace(items, activity, backupReason, nextSync, organization 
   }
 }
 
-function persist() {
+async function persist() {
   if (demoMode || state.team.active) return;
-  persistLocalValue(storageKey, exportPortableWorkspace());
+  const candidate = localCanonicalFields();
+  Object.assign(state, localCommittedWorkspace);
+  await commitLocalWorkspacePatch(candidate);
 }
-function persistActivity() {
-  if (demoMode || state.team.active) return;
-  persistLocalValue(activityKey, JSON.stringify({ activity: state.activity }));
+
+async function persistActivity() {
+  await persist();
 }
-function persistLocalValue(key, value) {
-  const nextSync = ["local-file", "google-drive"].includes(state.source.type) ? { ...state.sync, localPending: true } : null;
-  // A switch or reload must never see saved edits paired with a clean source.
-  runStorageTransaction(localStorage, [key, syncKey], () => {
-    localStorage.setItem(key, value);
-    if (nextSync) localStorage.setItem(syncKey, serializeSync(nextSync));
+
+async function persistLocalValue() {
+  await persist();
+}
+
+
+function localCanonicalFields() {
+  return Object.fromEntries(["items", "activity", "organization", "customerDirectory", "planningCalendar", "workflow", "prioritization", "insightRecords", "codeRepositories", "implementationRuns", "experience", "artifacts"].map(key => [key, state[key]]));
+}
+
+function localWorkspacePayload(workspace) {
+  return exportPortableWorkspace(workspace.items, workspace.activity, workspace.organization, workspace.customerDirectory, workspace.planningCalendar, workspace.workflow, workspace.prioritization, workspace.insightRecords, workspace.codeRepositories, workspace.implementationRuns, workspace.experience, workspace.artifacts);
+}
+
+function createLocalWriteScope(values) {
+  return createStorageWriteScope(localStorage, [storageKey, activityKey, syncKey, sourceKey], values ? { values } : {});
+}
+
+function rememberLocalWorkspaceRead(values) {
+  localWriteScope = createLocalWriteScope(values);
+  localCommittedWorkspace = localCanonicalFields();
+  state.localWriteConflict = null;
+}
+
+function describeLocalWorkspaceChanges(before, after, path = []) {
+  const display = value => value === undefined ? 'Not present' : value === null || value === '' ? 'Not set' : typeof value === 'object' ? (value.title || value.name || value.displayName || value.itemTitle || 'Record') : String(value);
+  if (JSON.stringify(before) === JSON.stringify(after)) return [];
+  if (Array.isArray(before) && Array.isArray(after) && [...before, ...after].every(value => value && typeof value === 'object' && value.id)) {
+    const rows = [];
+    for (const id of new Set([...before, ...after].map(value => value.id))) {
+      const oldValue = before.find(value => value.id === id), newValue = after.find(value => value.id === id);
+      rows.push(...describeLocalWorkspaceChanges(oldValue, newValue, [...path, display(newValue || oldValue)]));
+    }
+    if (before.map(value => value.id).join('|') !== after.map(value => value.id).join('|') && before.length === after.length && before.every(value => after.some(next => next.id === value.id))) rows.push({ label: [...path, 'Order'].join(' / '), before: before.map(display).join(', '), after: after.map(display).join(', ') });
+    return rows;
+  }
+  if (before && after && !Array.isArray(before) && !Array.isArray(after) && typeof before === 'object' && typeof after === 'object') return [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(key => !['exportedAt', 'updatedAt', 'updatedBy', 'version', 'actorId'].includes(key)).flatMap(key => describeLocalWorkspaceChanges(before[key], after[key], [...path, key.replace(/([a-z])([A-Z])/g, '$1 $2')]));
+  return [{ label: path.join(' / ') || 'Workspace', before: Array.isArray(before) ? before.map(display).join(', ') : display(before), after: Array.isArray(after) ? after.map(display).join(', ') : display(after) }];
+}
+
+function localFormDraftScope() {
+  return JSON.stringify([storageKey, state.source.type, location.search, state.selectedWorkflowStatusId, state.selectedPriorityFrameworkId, state.selectedCustomerId, state.selectedSegmentId, state.selectedOrgUnitId, state.selectedPersonId, state.initiativeEditor.mode, state.initiativeEditor.selectedId, state.insightEditor.mode, state.insightEditor.type, state.insightEditor.selectedId]);
+}
+
+function captureLocalFormDrafts() {
+  return [...document.querySelectorAll('form[id]')].map(form => ({ id: form.id, scope: localFormDraftScope(), fields: [...form.elements].filter(field => field.name && !['password', 'file', 'submit', 'button'].includes(field.type)).map(field => ({ name: field.name, value: field.value, checked: field.checked, type: field.type, selectedValues: field.multiple ? [...field.selectedOptions].map(option => option.value) : undefined })) }));
+}
+
+function restoreLocalFormDrafts(drafts) {
+  for (const draft of drafts || []) {
+    const form = document.getElementById(draft.id);
+    if (!form || draft.scope !== localFormDraftScope()) continue;
+    for (const saved of draft.fields) {
+      const fields = [...form.elements].filter(field => field.name === saved.name);
+      const field = ['checkbox', 'radio'].includes(saved.type) ? fields.find(field => field.value === saved.value) : fields[0];
+      if (!field) continue;
+      if (saved.selectedValues && field.multiple) [...field.options].forEach(option => { option.selected = saved.selectedValues.includes(option.value); });
+      else if (['checkbox', 'radio'].includes(saved.type)) field.checked = saved.checked;
+      else field.value = saved.value;
+    }
+  }
+}
+
+function reportLocalWriteFailure(error, candidate) {
+  const external = state.localExternalEffect;
+  const message = external ? `${external} completed, but its local summary was not saved. Do not repeat the external action. ${error?.message || 'Review newer saved work.'}` : error?.message || 'The change could not be saved. Your draft is still available.';
+  if (external) {
+    const values = Object.fromEntries(localWriteScope.values().map(entry => [entry.key, entry.value]));
+    state.localExternalSavePending = { label: external, candidate, sync: state.localExternalPendingSync || state.sync, source: state.source,
+      baseSync: values[syncKey] ? JSON.parse(values[syncKey]) : defaultSyncState(), baseSource: values[sourceKey] ? JSON.parse(values[sourceKey]) : defaultSource() };
+  }
+  {
+    // Retain exact scoped form values for quota and I/O failures too.
+    state.localWriteConflict = { message, storageKey, baseline: localCommittedWorkspace, candidate, forms: captureLocalFormDrafts() };
+    state.editorAnnouncement = message;
+    document.querySelectorAll('.global-sync-pill').forEach(node => { node.textContent = 'Not saved · review newer work'; });
+    const existing = document.getElementById('localWriteRecovery');
+    existing?.remove();
+    const target = document.querySelector('dialog[open] .initiative-editor-body') || document.querySelector('dialog[open]') || document.querySelector('main');
+    target?.insertAdjacentHTML('afterbegin', localWriteRecoveryMarkup());
+    bindLocalWriteRecovery();
+  }
+}
+
+function localWriteRecoveryMarkup() {
+  const conflict = state.localWriteConflict;
+  if (!conflict || conflict.storageKey !== storageKey || state.team.active) return '';
+  return `<aside id="localWriteRecovery" class="storage-warning" role="alert"><div><strong>Changes were not saved</strong><p>${escapeHtml(conflict.message)}</p><p>Keep editing or download your draft. Review the latest saved workspace before choosing which changes to submit again.</p></div><button type="button" class="secondary" id="downloadLocalWriteDraft">Download my draft</button><button type="button" class="secondary" id="reviewLocalWriteLatest">Review latest saved work</button></aside>`;
+}
+
+function bindLocalWriteRecovery() {
+  for (const form of document.querySelectorAll('form[id]')) {
+    const remember = () => { if (state.localWriteConflict?.forms.some(draft => draft.scope === localFormDraftScope())) state.localWriteConflict.forms = captureLocalFormDrafts(); };
+    form.addEventListener('input', remember);
+    form.addEventListener('change', remember);
+  }
+  document.getElementById('downloadLocalWriteDraft')?.addEventListener('click', () => {
+    const conflict = state.localWriteConflict;
+    downloadFile(JSON.stringify({ workspace: conflict.candidate, forms: captureLocalFormDrafts() }, null, 2), 'application/json', 'pm-os-unsaved-draft.json');
   });
-  if (nextSync) state.sync = nextSync;
-  markExternalSourcePending();
+  document.getElementById('reviewLocalWriteLatest')?.addEventListener('click', async event => {
+    const conflict = state.localWriteConflict;
+    if (!conflict || conflict.storageKey !== storageKey) return;
+    const forms = captureLocalFormDrafts();
+    conflict.forms = forms;
+    const sourceType = state.source.type;
+    const projectId = state.projects?.registry?.activeProjectId;
+    let values, latest, reviewSnapshot;
+    const reviewScope = localWriteScope;
+    try {
+      reviewSnapshot = await reviewScope.reviewSnapshot();
+      values = reviewSnapshot.values;
+      if (!values[0].value && localWriteScope.values().find(entry => entry.key === storageKey)?.value) throw new Error("The saved workspace was removed.");
+      latest = importPortableWorkspace(values[0].value || encodeWorkspaceDocument(emptyOperationWorkspace));
+    } catch { conflict.message = 'The latest saved workspace is missing or cannot be read. Download your draft and recover the saved data in Settings; it has not been overwritten.'; render(); return; }
+    const review = document.createElement('dialog');
+    review.setAttribute('aria-label', 'Review newer saved work');
+    review.className = 'confirmation-dialog';
+    const changes = describeLocalWorkspaceChanges(conflict.baseline, latest);
+    const pendingExternal = state.localExternalSavePending;
+    const summaryMerge = pendingExternal ? mergeWorkspaceDocuments(
+      { workspace: conflict.baseline, sync: pendingExternal.baseSync, source: pendingExternal.baseSource },
+      { workspace: pendingExternal.candidate, sync: pendingExternal.sync, source: pendingExternal.source },
+      { workspace: latest, sync: values[2].value ? JSON.parse(values[2].value) : defaultSyncState(), source: values[3].value ? JSON.parse(values[3].value) : defaultSource() }) : null;
+    review.innerHTML = `<h2>Review newer saved work</h2><p>These changes were saved in another tab. Nothing will be written now. Your form draft will stay available; saving it afterwards replaces the fields you submit. Download the draft first to preserve a non-form action or a completed external result.</p><ul>${changes.map(change => `<li><strong>${escapeHtml(change.label)}</strong>: ${escapeHtml(change.before)} → ${escapeHtml(change.after)}</li>`).join('') || '<li>The saved workspace or connection metadata changed.</li>'}</ul><button type="button" class="secondary" data-keep>Keep editing without saving</button><button type="button" class="primary" data-review>Use latest and keep my form draft</button>`;
+    const uncoordinated = reviewSnapshot.committed && JSON.stringify(reviewSnapshot.committed) !== JSON.stringify(values);
+    if (uncoordinated) {
+      const warning = document.createElement('section');
+      const committedText = reviewSnapshot.committed.find(entry => entry.key === storageKey)?.value;
+      let differences = [];
+      try { differences = describeLocalWorkspaceChanges(importPortableWorkspace(committedText || encodeWorkspaceDocument(emptyOperationWorkspace)), latest); } catch { /* Metadata or recovery-only mismatch. */ }
+      warning.innerHTML = `<h3>Stored values differ from the last protected save</h3><p>Another app version, an interrupted save, or a delayed browser update may explain this difference. Choosing the displayed stored values explicitly uses them as your next save's starting point. Keep editing or download your draft if you do not recognize these changes.</p><ul>${differences.map(change => `<li><strong>${escapeHtml(change.label)}</strong>: last protected save ${escapeHtml(change.before)}; displayed stored value ${escapeHtml(change.after)}</li>`).join('') || '<li>Connection or history metadata differs.</li>'}</ul>`;
+      review.append(warning);
+      review.querySelector('[data-review]').textContent = 'Use displayed stored values and keep my form draft';
+    }
+    if (pendingExternal) {
+      const explanation = document.createElement('p');
+      explanation.textContent = `${pendingExternal.label} already completed. Save only its local summary; this will not repeat that action.`;
+      review.prepend(explanation);
+      const saveSummary = document.createElement('button');
+      saveSummary.type = 'button';
+      saveSummary.className = 'primary';
+      saveSummary.textContent = summaryMerge.clean ? 'Save completed action summary' : 'Use completed action values for listed conflicts';
+      if (!summaryMerge.clean) {
+        const list = document.createElement('ul');
+        for (const entry of summaryMerge.conflicts) {
+          const row = document.createElement('li');
+          row.textContent = describeLocalWorkspaceChanges(entry.remote, entry.local, [entry.path]).map(change => `${change.label}: latest ${change.before}; completed action ${change.after}`).join(". ") + ". Choosing the completed action values replaces these saved fields.";
+          list.append(row);
+        }
+        review.append(list);
+      }
+      saveSummary.onclick = async () => {
+        if (storageKey !== conflict.storageKey || state.team.active || state.source.type !== sourceType || state.projects?.registry?.activeProjectId !== projectId || values.some(entry => localStorage.getItem(entry.key) !== entry.value)) { review.close(); reportLocalWriteFailure(staleWorkspaceWriteError(), conflict.candidate); return; }
+        const approved = summaryMerge.clean ? summaryMerge : resolveWorkspaceConflicts(summaryMerge, Object.fromEntries(summaryMerge.conflicts.map(entry => [entry.path, 'local'])));
+        if (!approved.clean) return;
+        try {
+          await reviewScope.adoptReviewed(reviewSnapshot, () => localWriteScope === reviewScope && storageKey === conflict.storageKey && !state.team.active && state.source.type === sourceType && state.projects?.registry?.activeProjectId === projectId);
+          Object.assign(state, latest);
+          localCommittedWorkspace = localCanonicalFields();
+          const candidate = approved.merged.workspace;
+          const sync = approved.merged.sync;
+          const source = approved.merged.source;
+          await runLocalStorageTransaction([storageKey, activityKey, syncKey, sourceKey], () => {
+            localStorage.setItem(storageKey, localWorkspacePayload(candidate));
+            localStorage.setItem(activityKey, JSON.stringify({ activity: candidate.activity }));
+            localStorage.setItem(syncKey, serializeSync(sync));
+            localStorage.setItem(sourceKey, JSON.stringify(normalizeWorkspaceSource(source)));
+          }, () => {}, candidate);
+          Object.assign(state, candidate);
+          state.sync = sync;
+          state.source = source;
+          state.sourceSelection = sourceSelectionFor(source);
+          localCommittedWorkspace = localCanonicalFields();
+          state.localExternalEffect = '';
+          state.localExternalPendingSync = null;
+          state.localExternalSavePending = null;
+          state.localWriteConflict = null;
+          state.editorAnnouncement = 'Completed action summary saved. The external action was not repeated.';
+          review.close(); render(); restoreLocalFormDrafts(forms);
+        } catch (error) { review.close(); reportLocalWriteFailure(error, approved.merged.workspace); render(); }
+      };
+      review.append(saveSummary);
+      review.querySelector('[data-review]').hidden = true;
+    }
+    review.style.cssText = 'width:min(900px,90vw); max-height:85vh; overflow:auto; padding:22px';
+
+    review.querySelector('[data-keep]').onclick = () => review.close();
+    review.addEventListener('close', () => review.remove());
+    review.querySelector('[data-review]').onclick = async () => {
+      if (storageKey !== conflict.storageKey || state.team.active || state.source.type !== sourceType || state.projects?.registry?.activeProjectId !== projectId || values.some(entry => localStorage.getItem(entry.key) !== entry.value)) {
+        review.close();
+        reportLocalWriteFailure(staleWorkspaceWriteError(), conflict.candidate);
+        return;
+      }
+      try {
+        await reviewScope.adoptReviewed(reviewSnapshot, () => localWriteScope === reviewScope && storageKey === conflict.storageKey && !state.team.active && state.source.type === sourceType && state.projects?.registry?.activeProjectId === projectId);
+      } catch (error) { review.close(); reportLocalWriteFailure(error, conflict.candidate); return; }
+      const experienceDraft = state.experienceDraft;
+      Object.assign(state, latest);
+      state.experienceDraft = experienceDraft;
+      state.sync = loadSync();
+      state.source = loadSource();
+      localCommittedWorkspace = localCanonicalFields();
+      state.localWriteConflict = null;
+      review.close();
+      render();
+      restoreLocalFormDrafts(forms);
+      state.editorAnnouncement = 'Latest saved work loaded. Your form draft is retained for review before saving.';
+    };
+    document.body.append(review);
+    review.showModal();
+  });
 }
+
+async function runLocalStorageTransaction(keys, operation, rollbackMemory = () => {}, candidate = localCanonicalFields()) {
+  const scope = localWriteScope;
+  const workspaceKey = storageKey;
+  try {
+    if (!scope) throw staleWorkspaceWriteError();
+    const result = await scope.run(keys, operation, rollbackMemory, () => scope === localWriteScope && workspaceKey === storageKey && !state.team.active);
+    if (scope === localWriteScope && workspaceKey === storageKey && !state.localExternalSavePending) state.localWriteConflict = null;
+    return result;
+  } catch (error) {
+    if (workspaceKey === storageKey) {
+      reportLocalWriteFailure(error, candidate);
+      const observed = Object.fromEntries(scope?.values().map(entry => [entry.key, entry.value]) || []);
+      try { state.source = observed[sourceKey] ? normalizeWorkspaceSource(JSON.parse(observed[sourceKey])) : defaultSource(); } catch { /* Retain the recoverable source draft. */ }
+      try { state.sync = observed[syncKey] ? { ...defaultSyncState(), ...JSON.parse(observed[syncKey]) } : defaultSyncState(); } catch { /* The saved metadata needs recovery. */ }
+    }
+    throw error;
+  }
+}
+
+function assertLocalWorkspaceCurrent() {
+  if (demoMode || state.team.active) return;
+  if (state.localExternalSavePending) throw Object.assign(new Error('An external action already completed, but its local summary is not saved. Review or download that result before starting another action; do not repeat the external operation.'), { code: 'LOCAL_WORKSPACE_CHANGED' });
+  try { localWriteScope?.assertCurrent(); if (!localWriteScope) throw staleWorkspaceWriteError(); }
+  catch (error) { reportLocalWriteFailure(error, localCanonicalFields()); throw error; }
+}
+
+async function runLocalExternalEffect(operation, label) {
+  if (demoMode || state.team.active) return operation();
+  const scope = localWriteScope, workspaceKey = storageKey;
+  assertLocalWorkspaceCurrent();
+  let operationStarted = false;
+  try {
+    const result = await scope.externalEffect(() => {
+      operationStarted = true;
+      return operation();
+    }, () => scope === localWriteScope && storageKey === workspaceKey && !state.team.active);
+    if (scope === localWriteScope && storageKey === workspaceKey) state.localExternalEffect = label;
+    return result;
+  } catch (error) {
+    // A rejected external write does not invalidate an already saved local copy.
+    if (!operationStarted && storageKey === workspaceKey) reportLocalWriteFailure(error, localCanonicalFields());
+    throw error;
+  }
+}
+
+async function commitLocalWorkspacePatch(patch, entries = [], scope = null) {
+  const candidate = { ...localCanonicalFields(), ...patch };
+  if (entries.length) candidate.activity = [...entries, ...candidate.activity].slice(0, 250);
+  const sync = ['local-file', 'google-drive'].includes(state.source.type) ? { ...state.sync, localPending: true } : state.sync;
+  if (!demoMode) {
+    const payload = localWorkspacePayload(candidate);
+    await runLocalStorageTransaction([storageKey, activityKey, syncKey], () => {
+      localStorage.setItem(storageKey, payload);
+      localStorage.setItem(activityKey, JSON.stringify({ activity: candidate.activity }));
+      if (sync !== state.sync) localStorage.setItem(syncKey, serializeSync(sync));
+    }, () => {}, candidate);
+  }
+  if (scope && !documentArtifactScopeIsCurrent(scope)) throw documentArtifactError("PROJECT_CHANGED", "The original project save completed after the active project changed.");
+  Object.assign(state, candidate);
+  localCommittedWorkspace = localCanonicalFields();
+  state.localExternalEffect = "";
+  if (!demoMode) { state.sync = sync; markExternalSourcePending(); }
+}
+
 function markExternalSourcePending() {
   if (state.source.type === "local-file") scheduleLinkedWorkspaceWrite();
   if (state.source.type === "google-drive" && state.driveToken) scheduleAutomaticDriveSync();
@@ -8828,70 +10836,86 @@ function scheduleAutomaticDriveSync() {
   window.clearTimeout(automaticDriveTimer);
   automaticDriveTimer = window.setTimeout(() => { if (!state.dataBusy && !state.projects?.departurePending && navigator.onLine) void syncDriveNow(); }, 1800);
 }
-function logActivity(action, item, changes) { if (state.team.active) return; state.activity = [createActivityEntry(action, item, changes), ...state.activity].slice(0, 250); persistActivity(); }
-function formatActivityChanges(changes) { return describeActivityChanges(changes); }
-function downloadFile(content, type, filename) { const blob = new Blob([content], { type }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = filename; link.click(); URL.revokeObjectURL(url); }
-
-function importFromFile(event) {
-  const input = event.currentTarget;
-  const file = input.files?.[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = async () => {
-    try {
-      const prepared = prepareImport(String(reader.result), file.name);
-      const issueBundle = file.name.toLowerCase().endsWith(".md");
-      const confirmed = await requestDataConfirmation({
-        title: "Import workspace data?",
-        description: issueBundle
-          ? `Import ${file.name} will add its initiatives after storing a before-import recovery snapshot.`
-          : `Import ${file.name} will replace the current workspace data after storing a before-import recovery snapshot.`,
-        confirmLabel: "Import File",
-        trigger: document.querySelector("#importButton")
-      });
-      if (!confirmed) {
-        input.value = "";
-        announceDataStatus("Import cancelled. The workspace was not changed.", false);
-        return;
-      }
-      const activityEntry = createActivityEntry("imported", { title: file.name }, prepared.changes);
-      replaceWorkspace(prepared.items, [activityEntry, ...prepared.activity].slice(0, 250), backupReasons.import, undefined, prepared.organization || state.organization, prepared.customerDirectory || state.customerDirectory, prepared.planningCalendar || state.planningCalendar, prepared.workflow || state.workflow, prepared.prioritization || state.prioritization, prepared.insightRecords || state.insightRecords, prepared.codeRepositories || state.codeRepositories, prepared.implementationRuns || state.implementationRuns, prepared.experience || state.experience);
-      state.dataStatus = `Stored a recovery snapshot and imported ${file.name}.`;
-      input.value = "";
-      renderAndFocus("dataStatus");
-    } catch (error) {
-      input.value = "";
-      announceDataStatus(`Import stopped. ${error.message}`);
-    }
-  };
-  reader.onerror = () => {
-    input.value = "";
-    announceDataStatus("Import stopped. The selected file could not be read.");
-  };
-  reader.readAsText(file);
+async function logActivity(action, item, changes) {
+  if (state.team.active) return;
+  await commitLocalWorkspacePatch({}, [createActivityEntry(action, item, changes)]);
 }
 
-function prepareImport(text, fileName) {
-  const name = fileName.toLowerCase();
-  if (name.endsWith(".md")) {
-    const imported = importGitHubIssueMarkdown(text);
-    if (!imported.length) throw new Error("The issue bundle did not contain any importable initiatives.");
-    return { items: [...imported, ...state.items], activity: state.activity, changes: { source: fileName, items: imported.length } };
+function formatActivityChanges(changes) { return describeActivityChanges(changes, state); }
+function downloadFile(content, type, filename) { const blob = new Blob([content], { type }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = filename; link.click(); URL.revokeObjectURL(url); }
+
+async function importFromFile(event) {
+  const input = event.currentTarget;
+  const file = input.files?.[0];
+  if (!file || state.dataBusy || state.team.active) return;
+  const scope = captureDocumentArtifactScope();
+  const captureImportWorkspace = () => {
+    const snapshot = JSON.parse(exportPortableWorkspace());
+    delete snapshot.exportedAt;
+    return snapshot;
+  };
+  const workspace = captureImportWorkspace();
+  const original = JSON.stringify(workspace);
+  const importedAt = new Date().toISOString();
+  const assertImportScope = () => {
+    if (!documentArtifactScopeIsCurrent(scope) || JSON.stringify(captureImportWorkspace()) !== original) {
+      throw new Error("The project or its saved work changed after this preview. Cancel and select the file again to review the latest work.");
+    }
+    assertLocalWorkspaceCurrent();
+  };
+  let completionFocus = "dataStatus";
+  state.dataBusy = true;
+  try {
+    const text = await file.text();
+    assertImportScope();
+    const model = parseInboundFile(text, file.name);
+    if (model) {
+      const result = await reviewInboundImport({ model, workspace, fileName: file.name,
+        storage: localStorage, demo: demoMode, trigger: document.querySelector("#importButton"),
+        apply: async options => {
+          assertImportScope();
+          const prepared = buildInboundWorkspace(model, { ...options, workspace, now: importedAt });
+          const next = prepared.workspace;
+          const activityEntry = createActivityEntry("imported", { title: file.name }, { source: file.name, items: prepared.addedCount, skipped: prepared.skippedCount });
+          await replaceWorkspace(next.items, [activityEntry, ...state.activity].slice(0, 250), backupReasons.import, undefined,
+            next.organization, next.customerDirectory, next.planningCalendar, next.workflow, next.prioritization,
+            next.insightRecords, next.codeRepositories, next.implementationRuns, next.experience, next.artifacts);
+          return { addedCount: prepared.addedCount, skippedCount: prepared.skippedCount };
+        }
+      });
+      if (!result) completionFocus = "importButton";
+      if (documentArtifactScopeIsCurrent(scope)) state.dataStatus = result
+        ? `Stored a recovery snapshot and imported ${file.name}. Added ${result.addedCount} initiatives; skipped ${result.skippedCount}.${result.preferenceWarning}`
+        : "Import cancelled. The workspace was not changed.";
+      return;
+    }
+    const prepared = importPortableWorkspace(text);
+    const confirmed = await requestDataConfirmation({
+      title: "Import workspace data?",
+      description: `Import ${file.name} will replace the current workspace data after storing a before-import recovery snapshot.`,
+      confirmLabel: "Import File", trigger: document.querySelector("#importButton")
+    });
+    if (!confirmed) { completionFocus = "importButton"; state.dataStatus = "Import cancelled. The workspace was not changed."; return; }
+    assertImportScope();
+    const activityEntry = createActivityEntry("imported", { title: file.name }, { source: file.name });
+    await replaceWorkspace(prepared.items, [activityEntry, ...prepared.activity].slice(0, 250), backupReasons.import, undefined,
+      prepared.organization, prepared.customerDirectory, prepared.planningCalendar, prepared.workflow, prepared.prioritization,
+      prepared.insightRecords, prepared.codeRepositories || [], prepared.implementationRuns || [], prepared.experience, prepared.artifacts || []);
+    state.dataStatus = `Stored a recovery snapshot and imported ${file.name}.`;
+  } catch (error) {
+    if (documentArtifactScopeIsCurrent(scope)) state.dataStatus = `Import stopped. ${error.message}`;
+  } finally {
+    input.value = "";
+    state.dataBusy = false;
+    if (documentArtifactScopeIsCurrent(scope)) renderAndFocus(completionFocus);
   }
-  if (name.endsWith(".csv")) {
-    const imported = importCsv(text);
-    if (!imported.length) throw new Error("The CSV file did not contain any importable initiatives.");
-    return { items: imported, activity: state.activity, changes: { source: fileName } };
-  }
-  const workspace = importPortableWorkspace(text);
-  return { ...workspace, changes: { source: fileName } };
 }
 
 function confirmationDialogMarkup() {
   return `<dialog class="confirmation-dialog" id="confirmationDialog" aria-labelledby="confirmationTitle" aria-describedby="confirmationDescription"><form method="dialog"><h3 id="confirmationTitle">Confirm action</h3><p id="confirmationDescription"></p><div class="confirmation-actions"><button class="secondary" id="confirmationSecondary" type="button" hidden></button><button class="secondary" id="confirmationCancel" value="cancel" autofocus>Cancel</button><button class="danger" id="confirmationConfirm" value="confirm">Continue</button></div></form></dialog>`;
 }
 
-function requestDataConfirmation({ title, description, confirmLabel, secondaryLabel = "", onSecondary, trigger }) {
+function requestDataConfirmation({ title, description, confirmLabel, secondaryLabel = "", onSecondary, trigger, scrollable = false }) {
   const dialog = document.querySelector("#confirmationDialog");
   const titleElement = document.querySelector("#confirmationTitle");
   const descriptionElement = document.querySelector("#confirmationDescription");
@@ -8899,6 +10923,8 @@ function requestDataConfirmation({ title, description, confirmLabel, secondaryLa
   const confirmButton = document.querySelector("#confirmationConfirm");
   const secondaryButton = document.querySelector("#confirmationSecondary");
   if (!dialog || !titleElement || !descriptionElement || !cancelButton || !confirmButton) return Promise.resolve(false);
+  descriptionElement.classList.toggle("scrollable-import-preview", scrollable);
+  descriptionElement.tabIndex = scrollable ? 0 : -1;
   return requestNativeConfirmation({ dialog, titleElement, descriptionElement, cancelButton, confirmButton, secondaryButton, trigger, title, description, confirmLabel, secondaryLabel, onSecondary });
 }
 
@@ -8934,9 +10960,12 @@ function nearestCoreView(space) { return policyNearestCoreView(space); }
 function recoverUnavailableRoute() {
   if (!visibleViewDefinition(state.selectedView)) {
     const requested = state.selectedView;
+    const known = viewByDeepLink.has(requested) && allowedModes(requested, fullWorkspaceExperience()).includes(state.selectedMode);
     state.selectedView = nearestCoreView(requested);
     state.selectedMode = defaultSpaceMode(state.selectedView);
-    state.routeAnnouncement = `${titleCase(requested)} is hidden in this workspace. Showing ${viewLabel(visibleViewDefinition(state.selectedView))}; enable it in Workspace setup.`;
+    state.routeAnnouncement = known
+      ? `${titleCase(requested)} is hidden in this workspace. Showing ${viewLabel(visibleViewDefinition(state.selectedView))}; enable it in Workspace setup.`
+      : `This link points to an unknown page or view. Showing ${viewLabel(visibleViewDefinition(state.selectedView))}. Check the link or choose a view from the navigation.`;
     pushViewUrl(true);
     return;
   }
@@ -8945,7 +10974,9 @@ function recoverUnavailableRoute() {
     const requested = state.selectedMode;
     state.selectedMode = defaultSpaceMode(state.selectedView);
     state.spaceModes[state.selectedView] = state.selectedMode;
-    state.routeAnnouncement = `${titleCase(requested)} is hidden in this workspace. Showing ${titleCase(state.selectedMode)}; enable it in Workspace setup.`;
+    state.routeAnnouncement = allowedModes(state.selectedView, fullWorkspaceExperience()).includes(requested)
+      ? `${titleCase(requested)} is hidden in this workspace. Showing ${titleCase(state.selectedMode)}; enable it in Workspace setup.`
+      : `This link points to an unknown view. Showing ${titleCase(state.selectedMode)}. Check the link or choose a view from the navigation.`;
     pushViewUrl(true);
   }
 }
@@ -8953,8 +10984,8 @@ function defaultSpaceMode(space, experience = state.experience) { return policyD
 function initialView() {
   const params = new URLSearchParams(location.search);
   const space = params.get("space");
-  if (viewByDeepLink.has(space)) return space;
-  return LEGACY_VIEW_REDIRECTS[params.get("view")]?.[0] || (!params.has("space") && !params.has("view") ? activeRegistryProject(projectRegistry)?.location.space : "") || "today";
+  if (space !== null) return space;
+  return LEGACY_VIEW_REDIRECTS[params.get("view")]?.[0] || params.get("view") || (!params.has("space") && !params.has("view") ? activeRegistryProject(projectRegistry)?.location.space : "") || "today";
 }
 function initialMode() {
   const params = new URLSearchParams(location.search);
@@ -9094,6 +11125,7 @@ function handleViewsEscape(event) {
   viewsToggle?.focus();
 }
 function navigateToView(deepLink, origin, requestedMode = "") {
+  state.routeAnnouncement = "";
   let nextView = visibleViewDefinition(deepLink);
   if (!nextView) {
     const recovered = nearestCoreView(deepLink);
@@ -9141,7 +11173,8 @@ async function restoreViewFromLocation() {
     if (!params.has("space") && !params.has("view")) return;
   }
   const legacy = LEGACY_VIEW_REDIRECTS[params.get("view")];
-  const nextView = viewByDeepLink.get(params.get("space")) || viewByDeepLink.get(legacy?.[0]) || viewByDeepLink.get("today");
+  const requestedSpace = params.get("space") ?? legacy?.[0] ?? params.get("view") ?? "today";
+  const nextView = viewByDeepLink.get(requestedSpace) || { deepLink: requestedSpace };
   const nextMode = params.get("mode") || legacy?.[1] || defaultSpaceMode(nextView.deepLink);
   const selectedId = params.get("initiative")?.trim() || "";
   const focusSection = ["risks", "dependencies"].includes(params.get("section")) ? params.get("section") : "";
@@ -9149,9 +11182,9 @@ async function restoreViewFromLocation() {
   const changed = state.selectedView !== nextView.deepLink;
   state.selectedView = nextView.deepLink;
   state.selectedMode = nextMode;
+  state.routeAnnouncement = "";
   state.periodSelection = normalizePeriodSelection(params, state.planningCalendar);
   state.periodAnnouncement = periodRequestInvalid(params, state.planningCalendar) ? "That timeline selection is invalid or unavailable. Showing All time." : "";
-  state.spaceModes[nextView.deepLink] = nextMode;
   state.customerView = params.get("customerView") || state.customerView || "accounts";
   state.selectedCustomerId = params.get("customerId") || "";
   state.selectedSegmentId = params.get("segmentId") || "";
@@ -9169,11 +11202,13 @@ async function restoreViewFromLocation() {
     triggerId: history.state?.detailTriggerId || "",
     historyOwned: Boolean(selectedId && history.state?.detailOpenedFromUi)
   }), state.items.find((item) => item.id === selectedId));
+  recoverUnavailableRoute();
+  state.spaceModes[state.selectedView] = state.selectedMode;
   if (switchingProject) pushViewUrl(true);
   else persistCurrentProjectLocation();
   if (changed) {
     state.query = "";
-    recordViewUsage(nextView.deepLink);
+    recordViewUsage(state.selectedView);
   }
   render();
   if (changed) window.scrollTo({ top: 0, left: 0, behavior: "auto" });
@@ -9268,7 +11303,9 @@ function scopeGeneratedText(text, items) {
   const label = periodSelectionLabel(state.periodSelection, state.planningCalendar);
   const range = periodSelectionRangeLabel(state.periodSelection, state.planningCalendar);
   const count = Array.isArray(items) ? items.length : 0;
-  return `Scope: ${label} | ${range} | ${count} initiative${count === 1 ? "" : "s"}\n\n${String(text || "")}`;
+  return `Scope: ${label} | ${range} | ${count} initiative${count === 1 ? "" : "s"}\n\n${String(text || "")}
+
+${workflowReportingNote(items, state.workflow)}`;
 }
 function decorateInitiativeAudiences(items) {
   return items.map((item) => {
@@ -9292,7 +11329,9 @@ function workspacePriorityForItem(item) {
 function initiativeTargetChips(item, limit = 4) {
   const labels = initiativeAudienceLabels(item, state.customerDirectory);
   const targets = [...labels.segments.map((label) => ({ label, kind: "segment" })), ...labels.accounts.map((label) => ({ label, kind: "account" }))];
-  if (!targets.length) return `<span class="muted">No customer targets</span>`;
+  if (!targets.length) return item.customer?.trim()
+    ? `<span>${escapeHtml(item.customer)}</span> <span class="muted">(audience text; not linked)</span>`
+    : `<span class="muted">No customer targets</span>`;
   const shown = targets.slice(0, limit);
   return `<span class="target-chip-list">${shown.map((target) => `<span class="target-chip ${target.kind}">${escapeHtml(target.label)}</span>`).join("")}${targets.length > shown.length ? `<span class="target-chip more">+${targets.length - shown.length}</span>` : ""}</span>`;
 }
@@ -9311,22 +11350,6 @@ function metric(label, value, explanation = "") { return `<article class="metric
 function statusOptions(selected) { return state.workflow.statuses.map((status) => `<option value="${escapeHtml(status.id)}" ${status.id === selected ? "selected" : ""}>${escapeHtml(status.name)}</option>`).join(""); }
 function effortOptions(selected) { return Object.entries(effortLabels).map(([value, label]) => `<option value="${value}" ${Number(value) === Number(selected) ? "selected" : ""}>${label}</option>`).join(""); }
 function emptyState(text) { return `<p class="empty">${text}</p>`; }
-function todayStamp() { return new Date().toISOString().slice(0, 10); }
+function todayStamp() { return localDateStamp(); }
 function cssEscape(value) { return globalThis.CSS?.escape ? globalThis.CSS.escape(String(value)) : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&"); }
 function escapeHtml(value) { return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;"); }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

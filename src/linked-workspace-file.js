@@ -3,9 +3,19 @@ const storeName = "handles";
 const activeKey = "active";
 
 export function linkedFileSupported(globalObject = globalThis) {
-  return typeof globalObject.showOpenFilePicker === "function"
+  return chromiumFilePickerEnvironment(globalObject)
+    && typeof globalObject.showOpenFilePicker === "function"
     && typeof globalObject.showSaveFilePicker === "function"
     && typeof globalObject.indexedDB?.open === "function";
+}
+
+function chromiumFilePickerEnvironment(globalObject) {
+  const brands = globalObject.navigator?.userAgentData?.brands;
+  if (Array.isArray(brands) && brands.length) {
+    return brands.some(entry => /Chromium|Google Chrome|Microsoft Edge/i.test(String(entry?.brand || "")));
+  }
+  const userAgent = String(globalObject.navigator?.userAgent || "");
+  return /(?:HeadlessChrome|Chrome|Chromium|Edg|OPR)\//i.test(userAgent);
 }
 
 export async function openLinkedWorkspaceFile(globalObject = globalThis, { storeHandle = true } = {}) {
@@ -34,10 +44,20 @@ export async function readLinkedWorkspaceFile(handle) {
   return { name: file.name, lastModified: file.lastModified, text: await file.text() };
 }
 
-export async function writeLinkedWorkspaceFile(handle, text) {
+export async function writeLinkedWorkspaceFile(handle, text, { expectedText } = {}) {
   if (!handle?.createWritable) throw new Error("The linked workspace file cannot be written.");
+  if (expectedText !== undefined && (await readLinkedWorkspaceFile(handle)).text !== expectedText) {
+    throw new Error("The linked file changed again before saving. Review the latest file changes and retry.");
+  }
   const writable = await handle.createWritable();
-  try { await writable.write(String(text)); await writable.close(); }
+  try {
+    await writable.write(String(text));
+    // File System Access stages writes until close. Recheck before committing.
+    if (expectedText !== undefined && (await readLinkedWorkspaceFile(handle)).text !== expectedText) {
+      throw new Error("The linked file changed again before saving. Review the latest file changes and retry.");
+    }
+    await writable.close();
+  }
   catch (error) { try { await writable.abort?.(); } catch { /* Best-effort cleanup. */ } throw error; }
   return true;
 }

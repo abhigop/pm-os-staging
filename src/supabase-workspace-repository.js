@@ -1,3 +1,4 @@
+import { ARTIFACT_AUTHOR_FIELDS, createArtifactRecord } from "./artifacts.js";
 import {
   TeamWorkspaceService,
   WORKSPACE_CONFLICT_STRATEGIES,
@@ -54,6 +55,10 @@ const itemTextLimits = Object.freeze({
   title: 500,
   customer: 300,
   problem: 8000,
+  objective: 8000,
+  primaryMetric: 8000,
+  metricTarget: 8000,
+  metricReviewDate: 10,
   owner: 200,
   status: 40,
   statusId: 64,
@@ -122,6 +127,12 @@ export class SupabaseWorkspaceRepository extends WorkspaceRepository {
   open() { return this._withAsyncContext("open", () => this._open()); }
   subscribe(listener) { return this._withContext("subscribe", () => this._subscribe(listener)); }
   createItem(input) { return this._withAsyncContext("createItem", () => this._createItem(input)); }
+  createArtifact(input, expectedSupersededVersion = null) {
+    return this._withAsyncContext("createArtifact", () => this._createArtifact(input, expectedSupersededVersion));
+  }
+  deleteArtifact(id, expectedVersion) {
+    return this._withAsyncContext("deleteArtifact", () => this._deleteArtifact(id, expectedVersion));
+  }
   createInsightRecord(input) {
     return this._withAsyncContext("createInsightRecord", () => this._createInsightRecord(input));
   }
@@ -281,6 +292,41 @@ export class SupabaseWorkspaceRepository extends WorkspaceRepository {
       if (!isAmbiguousRemoteError(error)) this._createAttempts.delete(attemptKey);
       throw error;
     }
+  }
+
+  async _createArtifact(input, expectedSupersededVersion) {
+    this._assertWritable("createArtifact");
+    const artifact = pickArtifactInput(input, this.providerId);
+    if (artifact.supersedesId) this._assertExpectedVersion(expectedSupersededVersion, artifact.supersedesId, "createArtifact", "Saved document");
+    else if (expectedSupersededVersion !== null) throw invalidInput(this.providerId, "createArtifact", "An independent saved document cannot have a predecessor version.");
+    const suppliedAttemptId = optionalAttemptIdentity(input, this.providerId, "createArtifact");
+    const intent = { artifact, expectedSupersededVersion };
+    const attemptKey = suppliedAttemptId ? `artifact:id:${suppliedAttemptId}` : `artifact:intent:${canonicalStringify(intent)}`;
+    let attempt = this._createAttempts.get(attemptKey);
+    if (!attempt) {
+      attempt = { parameters: immutableWorkspaceValue({ p_workspace_id: this.workspaceId, p_artifact: artifact, p_expected_superseded_version: expectedSupersededVersion }), mutationId: suppliedAttemptId || this._newMutationId("createArtifact") };
+      this._createAttempts.set(attemptKey, attempt);
+    }
+    try {
+      const result = await this._executeMutation("createArtifact", "pm_create_artifact", attempt.parameters,
+        (envelope) => artifactMutationResult(envelope, "createArtifact", this),
+        { mutationId: attempt.mutationId, identityKey: `createArtifact:${attemptKey}` });
+      this._createAttempts.delete(attemptKey);
+      return result;
+    } catch (error) {
+      if (!isAmbiguousRemoteError(error)) this._createAttempts.delete(attemptKey);
+      throw error;
+    }
+  }
+
+  async _deleteArtifact(idValue, expectedVersion) {
+    this._assertWritable("deleteArtifact");
+    const id = typeof idValue === "string" ? idValue.trim() : "";
+    if (!id || [...id].length > 200) throw invalidInput(this.providerId, "deleteArtifact", "A saved document identity is required.");
+    this._assertExpectedVersion(expectedVersion, id, "deleteArtifact", "Saved document");
+    return this._executeMutation("deleteArtifact", "pm_delete_artifact",
+      { p_workspace_id: this.workspaceId, p_artifact_id: id, p_expected_version: expectedVersion },
+      (envelope) => immutableWorkspaceValue({ deleted: Boolean(envelope.deleted), activity: resolveActivity(envelope), snapshot: this._snapshot, revision: this._revision }));
   }
 
   async _createInsightRecord(input) {
@@ -583,7 +629,7 @@ export class SupabaseWorkspaceRepository extends WorkspaceRepository {
     }
     let planningCalendar;
     try {
-      planningCalendar = normalizePlanningCalendar(input);
+      planningCalendar = normalizePlanningCalendar({ ...input, capacityPlan: Object.hasOwn(input || {}, "capacityPlan") ? input.capacityPlan : this._snapshot.planningCalendar.capacityPlan });
     } catch (cause) {
       if (!(cause instanceof PlanningCalendarError)) throw cause;
       throw this._error(WORKSPACE_REPOSITORY_ERROR_CODES.INVALID_DOCUMENT, "updatePlanningCalendar", cause.message, cause.details, cause);
@@ -749,12 +795,41 @@ export class SupabaseWorkspaceRepository extends WorkspaceRepository {
     let resolveSubscribed;
     let rejectSubscribed;
     let settled = false;
+    let channelSubscribed = false;
+    let postgresReady = false;
     const subscribed = new Promise((resolve, reject) => {
       resolveSubscribed = resolve;
       rejectSubscribed = reject;
     });
+    const finishSubscription = () => {
+      if (settled || !channelSubscribed || !postgresReady) return;
+      settled = true;
+      resolveSubscribed();
+    };
+    const failSubscription = (status) => {
+      const failure = this._realtimeTransportError(operation, status);
+      if (!settled) {
+        settled = true;
+        rejectSubscribed(failure);
+      } else {
+        this._handleRealtimeFailure(failure, channel, generation, channelGeneration);
+      }
+    };
     try {
       channel = this.client.channel(`pm-os-workspace:${this.workspaceId}`);
+      // Joining the channel can precede the database replication listener. Wait
+      // for both before resyncing so writes in that attach gap are not missed.
+      channel.on("system", {}, (payload) => {
+        if (this._channel !== channel || generation !== this._generation
+          || channelGeneration !== this._channelGeneration
+          || payload?.extension !== "postgres_changes") return;
+        if (payload.status === "ok") {
+          postgresReady = true;
+          finishSubscription();
+        } else if (payload.status === "error" || payload.status === "timeout") {
+          failSubscription("CHANNEL_ERROR");
+        }
+      });
       channel.on("postgres_changes", {
         event: "UPDATE",
         schema: "public",
@@ -771,18 +846,12 @@ export class SupabaseWorkspaceRepository extends WorkspaceRepository {
         if (this._channel !== channel || generation !== this._generation) return;
         const status = String(statusValue || "").toUpperCase();
         if (status === "SUBSCRIBED" && !settled) {
-          settled = true;
-          resolveSubscribed();
+          channelSubscribed = true;
+          finishSubscription();
           return;
         }
         if (!realtimeFailureStates.has(status)) return;
-        const failure = this._realtimeTransportError(operation, status);
-        if (!settled) {
-          settled = true;
-          rejectSubscribed(failure);
-        } else {
-          this._handleRealtimeFailure(failure, channel, generation, channelGeneration);
-        }
+        failSubscription(status);
       });
     } catch (error) {
       this._handshaking = false;
@@ -1328,18 +1397,40 @@ export class SupabaseTeamWorkspaceService extends TeamWorkspaceService {
       p_workspace_id: requiredIdentity(workspaceId, this.providerId, "listMembers", "workspace")
     });
   }
-  createInvite(input = {}) {
+  async createInvite(input = {}) {
     const role = requireInviteRole(input.role || "editor", this.providerId, "createInvite");
     const hours = Number(input.expiresInHours ?? 72);
     if (!Number.isInteger(hours) || hours < 1 || hours > 168) {
       throw invalidInput(this.providerId, "createInvite", "Invite expiry must be between 1 and 168 hours.");
     }
-    return this._call("createInvite", "pm_create_invite", {
-      p_workspace_id: requiredIdentity(input.workspaceId, this.providerId, "createInvite", "workspace"),
-      p_role: role,
-      p_expires_in_hours: hours
-    });
+    const email = requiredText(input.email, this.providerId, "createInvite", "recipient email", 254).toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw invalidInput(this.providerId, "createInvite", "Enter the recipient's email address.");
+    const workspaceId = requiredIdentity(input.workspaceId, this.providerId, "createInvite", "workspace");
+    const requestId = requiredIdentity(input.requestId, this.providerId, "createInvite", "invitation request");
+    const result = await this.client.functions.invoke("team-invitations", { body: {
+      workspaceId, email, role, requestId, expiresInHours: hours,
+      ...(input.previousInviteId ? { previousInviteId: input.previousInviteId } : {})
+    } });
+    if (result.error) {
+      let detail;
+      try { detail = await result.error.context?.json(); } catch { /* Keep a safe generic error below. */ }
+      const messages = {
+        SIGN_IN_REQUIRED: "Sign in again before inviting a colleague.",
+        INVITATION_NOT_ALLOWED: "Only a workspace owner can send this invitation.",
+        INVITATION_RATE_LIMIT: "Too many invitations were requested. Wait a minute, then try again.",
+        INVALID_INVITATION: "Check the recipient email and invitation role.",
+        INVITATION_STATUS_UNKNOWN: "The invitation result is unconfirmed. Refresh invitations before retrying."
+      };
+      throw new WorkspaceRepositoryError(WORKSPACE_REPOSITORY_ERROR_CODES.REMOTE_ERROR,
+        messages[detail?.error] || "The invitation service is unavailable. Ask your administrator to check email delivery.",
+        { providerId: this.providerId, operation: "createInvite", details: { invitationError: detail?.error || "INVITATION_UNAVAILABLE" }, retryable: true });
+    }
+    if (!result.data?.invitation?.id) throw invalidInput(this.providerId, "createInvite", "The invitation service returned no invitation.");
+    return immutableWorkspaceValue(result.data);
   }
+  listInvites(workspaceId) { return this._call("listInvites", "pm_list_invites", { p_workspace_id: requiredIdentity(workspaceId, this.providerId, "listInvites", "workspace") }); }
+  revokeInvite(input = {}) { return this._call("revokeInvite", "pm_revoke_invite", { p_workspace_id: input.workspaceId, p_invite_id: input.inviteId }); }
+  previewInvite(input = {}) { return this._call("previewInvite", "pm_preview_invite", { p_code: requiredText(input.code, this.providerId, "previewInvite", "invite code", 200) }); }
   acceptInvite(input = {}) {
     return this._call("acceptInvite", "pm_accept_invite", {
       p_code: requiredText(input.code, this.providerId, "acceptInvite", "invite code", 200)
@@ -1448,6 +1539,7 @@ function normalizeEnvelope(input, workspaceId, providerId, operation) {
   if (!Array.isArray(source.document.items) || source.document.items.length > MAX_WORKSPACE_ITEMS
     || !Array.isArray(source.document.insightRecords)
     || source.document.insightRecords.length > MAX_WORKSPACE_INSIGHTS
+    || (source.document.artifacts !== undefined && (!Array.isArray(source.document.artifacts) || source.document.artifacts.length > 5000))
     || !Array.isArray(source.document.activity)
     || source.document.activity.length > MAX_WORKSPACE_ACTIVITY) {
     throw invalidInput(providerId, operation, "Supabase returned a workspace beyond supported limits.");
@@ -1472,9 +1564,34 @@ function normalizeEnvelope(input, workspaceId, providerId, operation) {
     snapshot: { ...document, revision },
     item: source.item || null,
     record: source.record || null,
+    artifact: source.artifact || null,
     activity: source.activity || null,
     deleted: Boolean(source.deleted)
   });
+}
+
+function artifactMutationResult(envelope, operation, repository) {
+  const artifact = repository._snapshot.artifacts.find(entry => entry.id === envelope.artifact?.id);
+  if (!artifact) throw repository._invalidEnvelope(operation);
+  return immutableWorkspaceValue({ artifact, activity: resolveActivity(envelope), snapshot: repository._snapshot, revision: repository._revision });
+}
+
+function pickArtifactInput(input, providerId) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw invalidInput(providerId, "createArtifact", "Saved document input must be an object.");
+  const output = Object.fromEntries(ARTIFACT_AUTHOR_FIELDS.filter(field => Object.prototype.hasOwnProperty.call(input, field)).map(field => [field,input[field]]));
+  try {
+    // Validate author fields without accepting caller-controlled identity or audit metadata.
+    const check = createArtifactRecord({ ...output, supersedesId: "" }, { id: "provider-validation", now: "2026-01-01T00:00:00.000Z", actor: { id: "provider-validation", displayName: "Provider validation" } });
+    for (const field of ARTIFACT_AUTHOR_FIELDS) {
+      if (field === "generatedAt" && output.generatedAt == null) continue;
+      if (field !== "supersedesId") output[field] = check[field];
+    }
+    if (output.supersedesId === undefined || output.supersedesId === null) output.supersedesId = "";
+    if (typeof output.supersedesId !== "string" || [...output.supersedesId.trim()].length > 200) throw new Error("Invalid predecessor identity");
+    output.supersedesId = output.supersedesId.trim();
+  } catch { throw invalidInput(providerId, "createArtifact", "Saved document fields exceed supported limits or are invalid."); }
+  assertPayloadSize(output, 1024 * 1024, providerId, "createArtifact", "saved document");
+  return output;
 }
 
 function insightMutationResult(envelope, operation, repository) {
@@ -1519,9 +1636,24 @@ function pickItemInput(input, includeId, providerId, operation) {
   for (const field of WORKSPACE_MUTABLE_ITEM_FIELDS) {
     if (Object.prototype.hasOwnProperty.call(input, field)) output[field] = input[field];
   }
+  const authoredFields = new Set(["objective", "primaryMetric", "metricTarget", "metricReviewDate"]);
+  for (const field of authoredFields) {
+    if (!Object.prototype.hasOwnProperty.call(output, field)) continue;
+    if (output[field] == null) output[field] = "";
+    else if (typeof output[field] !== "string") throw invalidInput(providerId, operation, `Workspace item ${field} must be text.`);
+    else output[field] = output[field].trim();
+  }
+  if (output.metricReviewDate) {
+    const value = output.metricReviewDate;
+    const date = new Date(`${value}T00:00:00.000Z`);
+    if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(value) || value.startsWith("0000")
+      || !Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== value) {
+      throw invalidInput(providerId, operation, "Workspace item metricReviewDate must be a real YYYY-MM-DD date.");
+    }
+  }
   for (const [field, limit] of Object.entries(itemTextLimits)) {
     if (!Object.prototype.hasOwnProperty.call(output, field)) continue;
-    if (String(output[field] ?? "").length > limit) {
+    if ((authoredFields.has(field) ? [...output[field]].length : String(output[field] ?? "").length) > limit) {
       throw invalidInput(providerId, operation, `Workspace item ${field} is too long.`);
     }
   }

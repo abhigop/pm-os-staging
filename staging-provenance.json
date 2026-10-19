@@ -1,7 +1,7 @@
 {
   "schema": "pm-os.github-staging.v1",
-  "sourceCommit": "b12979bd483a482f7db0484b6489854fa522def3",
-  "artifactHash": "3f01eddc1376d5aeb44be2e14d6d750d5a1fd5adcadb39dfd2c850b0b6fd9003",
+  "sourceCommit": "916c87435a227ee125611170a1a0f3156635c182",
+  "artifactHash": "43f84b92e02b65d9193ca723c7aa301757f5eb61353006bd84fac1a1a74af352",
   "hashAlgorithm": "sha256",
   "artifactHashInput": "JSON.stringify(files); provenance excluded",
   "basePath": "/pm-os-staging/",
@@ -40,18 +40,23 @@
     },
     {
       "path": "src/app.js",
-      "sha256": "463fa7c02aaf577430f9506668caccf461493496e97af1af9498f8a967d8edea",
-      "bytes": 667997
+      "sha256": "76c823be1df510c8d782edd9d22c89341aa9490e9107d2d0e871068d1c647126",
+      "bytes": 842397
+    },
+    {
+      "path": "src/artifacts.js",
+      "sha256": "fb7ccc6580ed5a4e6f5c709057a5eb690ac565296253406b7f38c37faae819a7",
+      "bytes": 5770
     },
     {
       "path": "src/backups.js",
-      "sha256": "b42363a1b3cc3db2f217ba0275861d87014637ff85ae3e63a85ba8e4cf48f738",
-      "bytes": 8063
+      "sha256": "1e36ca50f1f6a029b153f07df548c3fa8c1b1989d4fb016d633f73f5f2592517",
+      "bytes": 9259
     },
     {
       "path": "src/customers.js",
-      "sha256": "6a1d4df454e911d312793643de4f2d93de1f2ca000a7deed10d90ddfba33389f",
-      "bytes": 29190
+      "sha256": "0f2b8ade19d80e1fb8b5a7cbe16a83e7bed3da7d8a22b5ca13b7427b778f1908",
+      "bytes": 33033
     },
     {
       "path": "src/data.js",
@@ -64,29 +69,49 @@
       "bytes": 3950
     },
     {
+      "path": "src/document-composer.js",
+      "sha256": "57322db34f312d107fc441aa4bc34a33c1dd7acfba422be82bf489f7c7271650",
+      "bytes": 26658
+    },
+    {
       "path": "src/domain.js",
-      "sha256": "721a748f44f69b0bdfdf2b3c0fa1ae7cc77a08facc4e687c2aa907751e83ce18",
-      "bytes": 145787
+      "sha256": "d3647429cc3972b20b35a6048a301f2ef0e3a927d11f357a4e3d8100a932fdf9",
+      "bytes": 200326
     },
     {
       "path": "src/drive.js",
-      "sha256": "7ed25e65d99ea85560c55d53c7135dc8613c597e541c70a1ab141a7dfdc7b81f",
-      "bytes": 19251
+      "sha256": "638e8a08cfe951f3234ce5d9544bd053d685bb8f48d97852c597aa4571cd3545",
+      "bytes": 19391
     },
     {
       "path": "src/experience.js",
-      "sha256": "5958c86109fdb7cffcbe47a61bc9e2a080ce3059712c062511c0a692490cadb1",
-      "bytes": 7619
+      "sha256": "82049f50c9bb5a165cfaf40ed6eaed98cc6dc10b19ee21a3ff95349f9927e6e3",
+      "bytes": 9775
+    },
+    {
+      "path": "src/inbound-import-dialog.js",
+      "sha256": "ead3f33e4e1ba15a6b631273cd73bbc6be95e6ca329d9f6167578b672d874319",
+      "bytes": 11296
+    },
+    {
+      "path": "src/inbound-import.js",
+      "sha256": "e902d6c4f529abeebbaf3563d526ed7eaf884739ada1a7c6ebe5d2e38b60c8e6",
+      "bytes": 23536
     },
     {
       "path": "src/insights.js",
-      "sha256": "595c4c2d020733402cf2761286c1d8ebaf9cd0d7e81681c495bab8e73805605c",
-      "bytes": 22344
+      "sha256": "e92ac8b526829b42c52ace56392fec30dc4d5532c13932cf688460662025a076",
+      "bytes": 33535
     },
     {
       "path": "src/linked-workspace-file.js",
-      "sha256": "ab55411f7c57603188c974b58d2b4880dc9687aff1866297df3ef085d7393a3f",
-      "bytes": 5584
+      "sha256": "ab040466dbf96c5fa546134441b82c228c42f59c00a93c4187ba63bca6370026",
+      "bytes": 6631
+    },
+    {
+      "path": "src/local-date.js",
+      "sha256": "eafab83931ea4a628ed9dbec3b334b5ed47ce7955ccc233082dae42a4ae4c044",
+      "bytes": 1195
     },
     {
       "path": "src/organization.js",
@@ -95,23 +120,38 @@
     },
     {
       "path": "src/planning-calendar.js",
-      "sha256": "7ff2f7966dc255454bcca59cdc273ccd66952ae0f09ee5415e50529010a00841",
-      "bytes": 12561
+      "sha256": "55988581fdce77b596c1c3af60eb3ae28993ca9e2c293804e6db6f6950be0894",
+      "bytes": 16186
+    },
+    {
+      "path": "src/planning-capacity-ui.js",
+      "sha256": "13dc778d0f4f7aafc3c67a570bd44641a2f4b4303cd4b43c43eff28d62871354",
+      "bytes": 5806
     },
     {
       "path": "src/prioritization.js",
-      "sha256": "a6f570a510d88a0d60b57ee37684de39b6b6660854ba15b0f65bd08d54a43740",
-      "bytes": 30056
+      "sha256": "11fd042721c8973a873a81bef18ff36d344d54123584542ee33bc2ee3ac291b5",
+      "bytes": 30671
     },
     {
       "path": "src/project-switcher.js",
-      "sha256": "8f99632b76d24888f6bcad9d2482d1d00732be001fa0480d56386f06b3635468",
-      "bytes": 26572
+      "sha256": "70b83d831d446ab0e894d0345a92fb2515e04f1ae338b1d6f6a2c5d5f79590e4",
+      "bytes": 34611
     },
     {
       "path": "src/projects.js",
-      "sha256": "4655a229ec594cdc8cbc45923e92eedefb9c8368f1caa8583b6690179bc15733",
-      "bytes": 18624
+      "sha256": "7085d119257d7dcf33b71ffe662664426d8235fe9f3f4da964602a98277fd989",
+      "bytes": 19352
+    },
+    {
+      "path": "src/record-drafts.js",
+      "sha256": "9ac205dabd3f6162c8b87f30dee481348dd293950e5cc92c917cefa7f2137922",
+      "bytes": 1589
+    },
+    {
+      "path": "src/release.js",
+      "sha256": "9dbf51ff62b1b2ce439f820474e38cc3056013aef67da4b524d54a491a2ca6b1",
+      "bytes": 270
     },
     {
       "path": "src/server-connectors.js",
@@ -120,8 +160,8 @@
     },
     {
       "path": "src/service-worker-update.js",
-      "sha256": "d0d34be38284aa791a65d33722820d1c01dd5c5cfcd5e348ba100e216130f2fc",
-      "bytes": 9485
+      "sha256": "1767f1b3096b58705ff3aed14d5627417f26a504f21bc3ef2c435e6024a23b16",
+      "bytes": 9791
     },
     {
       "path": "src/source-config.js",
@@ -130,13 +170,13 @@
     },
     {
       "path": "src/storage.js",
-      "sha256": "4a84f173c3bcfb4ec28c422b4c6cb41a6036eecd1761fa54e9b4e4fbd06e65ed",
-      "bytes": 1052
+      "sha256": "9f53962250c9d38282eb05d0ad2bc38fc96ef30812c18f06e987ec946bc03a71",
+      "bytes": 9563
     },
     {
       "path": "src/styles.css",
-      "sha256": "22124ce310b650c9fdd067ee40569d6d036d204a07b4122637937785034e8b6a",
-      "bytes": 169445
+      "sha256": "a72997cb22f681464e70c5db2d20032cd70c4ffe310a4352c2a544e084586903",
+      "bytes": 180514
     },
     {
       "path": "src/supabase-client-loader.js",
@@ -145,48 +185,53 @@
     },
     {
       "path": "src/supabase-team-client.js",
-      "sha256": "58443a6972a1cd607ee40264f8d5795accc0d9ff5a35e3f664d1a73963fc274a",
-      "bytes": 21133
+      "sha256": "886c47df456ea25810fa9efd0e7365abc488b89b2ed648e8d75658008889cdae",
+      "bytes": 21915
     },
     {
       "path": "src/supabase-workspace-repository.js",
-      "sha256": "bf8d2d0d7487544be4b045255dd43dc81f50f754dd8f3486f2a35b716efe22d3",
-      "bytes": 69431
+      "sha256": "cac66b9749e17e1e462d1d3d59d097d3f85b3c9ac02434bd214f7f3bdd213c84",
+      "bytes": 78669
+    },
+    {
+      "path": "src/team-invitation.js",
+      "sha256": "2483f2cc7051ff34a9e939497cf53d45ed51b421a669c6f6e44ea9c48f55d30d",
+      "bytes": 8279
     },
     {
       "path": "src/tutorial.js",
-      "sha256": "d2dfa7b67e914d1f3d255eaab71db24cbde0c3e8b539a2029f65a22f60642a86",
-      "bytes": 18232
+      "sha256": "159b477e96cab076e3c7309b966cbb4700824ceeaf5adea29810eafb1c3184a5",
+      "bytes": 18253
     },
     {
       "path": "src/view-policy.js",
-      "sha256": "62a828990633ca80cf84e77f7f964067e42a4dc5502a0bd4421f6ea7f71bf8e6",
-      "bytes": 4401
+      "sha256": "4c635a2e2b5bcf64e66a441374738a7bc0ccacceebf8f6204b9fbd486fc878fc",
+      "bytes": 4434
     },
     {
       "path": "src/workflow.js",
-      "sha256": "240a89279c4698a13623656fe5d1a2bd7d923c7047c84182e3713d202cfa85ab",
-      "bytes": 7628
+      "sha256": "874457df955971292320aa084f0e59572df8679cb153acf40b33b4b600fea634",
+      "bytes": 8411
     },
     {
       "path": "src/workspace-contract.js",
-      "sha256": "5fb331bb78d000b71882dd7feebb691e8395fa2576d76ba2f73f0088cc052b6f",
-      "bytes": 13237
+      "sha256": "a618490bd1421e998f7e9022b44193bfdd68d5973bc2053a3839fbaf632fbdd9",
+      "bytes": 15974
     },
     {
       "path": "src/workspace-document.js",
-      "sha256": "350c8cc0e7ce8e1e67bef66430bf9a4aafd94e9f08cbb82fdf551362a007bd4b",
-      "bytes": 41983
+      "sha256": "4f53da2e6704b8a91e84302104afdc1654d7409cb0b0f9f51f8966acaa215016",
+      "bytes": 47344
     },
     {
       "path": "src/workspace-merge.js",
-      "sha256": "d425d379c5d143d835cdc34c611c691cd24f2516eb0dd705cb680674ba192645",
-      "bytes": 5750
+      "sha256": "223a1fa79d2d8e98b2f71fba05cb7de36f67bccc85c3127be47a646c96ad25ff",
+      "bytes": 8005
     },
     {
       "path": "sw.js",
-      "sha256": "4f0fd7e8abead45ba67f2521803257712a6d3fe08109a0baf2256b12f00546d0",
-      "bytes": 3195
+      "sha256": "e8b08e00e94459b17d05ec7d6cf3afb2a35d9f514c0f799c1f6ed84f6625a30d",
+      "bytes": 3459
     },
     {
       "path": "vendor/supabase-2.110.0.js",

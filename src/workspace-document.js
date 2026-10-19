@@ -1,7 +1,9 @@
+import { ARTIFACT_FIELDS, normalizeArtifactRecord } from "./artifacts.js";
 import {
   WORKSPACE_REPOSITORY_ERROR_CODES,
   WorkspaceRepositoryError,
-  immutableWorkspaceValue
+  immutableWorkspaceValue,
+  sanitizePortableBuildSummary
 } from "./workspace-contract.js";
 import {
   OrganizationError,
@@ -35,6 +37,7 @@ import {
   INSIGHT_TYPE_FIELDS,
   InsightRecordError,
   migrateLegacyValidationRecords,
+  migrateLegacyWorkRecords,
   normalizeInsightRecord
 } from "./insights.js";
 import {
@@ -49,26 +52,37 @@ import {
   normalizeWorkspaceExperience
 } from "./experience.js";
 
-export const WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v10";
-export const PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v9";
-export const SECOND_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v8";
-export const THIRD_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v7";
-export const FOURTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v6";
-export const FIFTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v5";
-export const SIXTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v4";
-export const SEVENTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v3";
-export const EIGHTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v2";
+export const WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v16";
+export const PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v14";
+export const SECOND_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v13";
+export const THIRD_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v12";
+export const FOURTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v11";
+export const FIFTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v10";
+export const SIXTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v9";
+export const SEVENTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v8";
+export const EIGHTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v7";
+export const NINTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v6";
+export const TENTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v5";
+export const ELEVENTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v4";
+export const TWELFTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v3";
+export const THIRTEENTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v2";
 export const LEGACY_WORKSPACE_DOCUMENT_SCHEMA = "pm-os.workspace.v1";
-export const WORKSPACE_SCHEMA_V10 = WORKSPACE_DOCUMENT_SCHEMA;
-export const WORKSPACE_SCHEMA_V9 = PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA;
-export const WORKSPACE_SCHEMA_V8 = SECOND_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA;
-export const WORKSPACE_SCHEMA_V7 = THIRD_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA;
-export const WORKSPACE_SCHEMA_V6 = FOURTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA;
-export const WORKSPACE_SCHEMA_V5 = FIFTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA;
-export const WORKSPACE_SCHEMA_V4 = SIXTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA;
-export const WORKSPACE_SCHEMA_V3 = SEVENTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA;
-export const WORKSPACE_SCHEMA_V2 = EIGHTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA;
-export const WORKSPACE_SCHEMA_V1 = LEGACY_WORKSPACE_DOCUMENT_SCHEMA;
+export const WORKSPACE_SCHEMA_V16 = WORKSPACE_DOCUMENT_SCHEMA;
+export const WORKSPACE_SCHEMA_V15 = "pm-os.workspace.v15";
+export const WORKSPACE_SCHEMA_V14 = "pm-os.workspace.v14";
+export const WORKSPACE_SCHEMA_V13 = "pm-os.workspace.v13";
+export const WORKSPACE_SCHEMA_V12 = "pm-os.workspace.v12";
+export const WORKSPACE_SCHEMA_V11 = "pm-os.workspace.v11";
+export const WORKSPACE_SCHEMA_V10 = "pm-os.workspace.v10";
+export const WORKSPACE_SCHEMA_V9 = "pm-os.workspace.v9";
+export const WORKSPACE_SCHEMA_V8 = "pm-os.workspace.v8";
+export const WORKSPACE_SCHEMA_V7 = "pm-os.workspace.v7";
+export const WORKSPACE_SCHEMA_V6 = "pm-os.workspace.v6";
+export const WORKSPACE_SCHEMA_V5 = "pm-os.workspace.v5";
+export const WORKSPACE_SCHEMA_V4 = "pm-os.workspace.v4";
+export const WORKSPACE_SCHEMA_V3 = "pm-os.workspace.v3";
+export const WORKSPACE_SCHEMA_V2 = "pm-os.workspace.v2";
+export const WORKSPACE_SCHEMA_V1 = "pm-os.workspace.v1";
 
 /** Deterministic timestamp used only when legacy input contains no time signal. */
 export const LEGACY_WORKSPACE_FALLBACK_TIMESTAMP = "1970-01-01T00:00:00.000Z";
@@ -76,16 +90,16 @@ export const LEGACY_WORKSPACE_FALLBACK_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 export const DEFAULT_WORKSPACE_ACTOR = Object.freeze({ id: "pm-os", displayName: "PM OS" });
 
 export const WORKSPACE_ITEM_FIELDS = Object.freeze([
-  "id", "title", "customer", "customerIds", "segmentIds", "problem", "owner", "status", "statusId", "reach",
+  "id", "title", "customer", "customerIds", "segmentIds", "problem", "objective", "primaryMetric", "metricTarget", "metricReviewDate", "owner", "status", "statusId", "reach",
   "impact", "confidence", "effort", "startDate", "dueDate", "nextStep", "risks", "dependencies",
   "experiment", "decision", "priority", "priorityLevelId", "pocPersonId", "orgUnitId", "priorityInputs", "version",
   "updatedAt", "updatedBy"
 ]);
 
 export const WORKSPACE_MUTABLE_ITEM_FIELDS = Object.freeze([
-  "title", "customer", "customerIds", "segmentIds", "problem", "owner", "status", "statusId", "reach", "impact",
-  "confidence", "effort", "startDate", "dueDate", "nextStep", "risks", "dependencies", "experiment",
-  "decision", "priority", "priorityLevelId", "pocPersonId", "orgUnitId", "priorityInputs"
+  "title", "customer", "customerIds", "segmentIds", "problem", "objective", "primaryMetric", "metricTarget", "metricReviewDate", "owner", "status", "statusId", "reach", "impact",
+  "confidence", "effort", "startDate", "dueDate", "risks", "dependencies",
+  "priority", "priorityLevelId", "pocPersonId", "orgUnitId", "priorityInputs"
 ]);
 
 export const WORKSPACE_INSIGHT_FIELDS = Object.freeze([
@@ -105,13 +119,17 @@ const validDependencyStatuses = new Set(["pending", "at-risk", "blocked", "resol
 const validDependencyTargets = new Set(["initiative", "external"]);
 const changeFields = new Set([
   ...WORKSPACE_MUTABLE_ITEM_FIELDS,
+  ...ARTIFACT_FIELDS,
+  "artifacts",
   ...WORKSPACE_MUTABLE_INSIGHT_FIELDS,
+  "nextStep", "decision", "experiment", "legacyField",
   "source", "fileName", "itemCount", "items", "activityCount", "activity",
   "insightRecords", "reason", "workspace", "experience", "organization", "customerDirectory", "workflow", "prioritization", "planningCalendar"
 ]);
 
 const supportedSchemas = new Set([
   WORKSPACE_DOCUMENT_SCHEMA,
+  WORKSPACE_SCHEMA_V15,
   PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
   SECOND_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
   THIRD_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
@@ -120,6 +138,11 @@ const supportedSchemas = new Set([
   SIXTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
   SEVENTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
   EIGHTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
+  NINTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
+  TENTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
+  ELEVENTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
+  TWELFTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
+  THIRTEENTH_PREVIOUS_WORKSPACE_DOCUMENT_SCHEMA,
   LEGACY_WORKSPACE_DOCUMENT_SCHEMA
 ]);
 
@@ -142,13 +165,13 @@ export function decodeWorkspaceDocument(input, options = {}) {
 
   return normalizeDocument(source, {
     ...options,
-    legacy: source.schema !== WORKSPACE_DOCUMENT_SCHEMA
+    legacy: ![WORKSPACE_SCHEMA_V15, WORKSPACE_DOCUMENT_SCHEMA].includes(source.schema)
   });
 }
 
 /**
- * Creates a canonical v10 document from application data. Unlike decoding an
- * existing v10 export, omitted concurrency metadata is initialized safely.
+ * Creates a canonical v16 document from application data. Unlike decoding an
+ * existing v16 export, omitted concurrency metadata is initialized safely.
  */
 export function createWorkspaceDocument(input = {}, options = {}) {
   if (!isPlainObject(input)) throw invalidDocument("Workspace input must be an object.");
@@ -164,7 +187,7 @@ export function createWorkspaceDocument(input = {}, options = {}) {
 
 export function createEmptyWorkspaceDocument(options = {}) {
   const prioritization = { ...defaultPrioritization(), defaultFrameworkId: "manual", activeMethodId: "manual" };
-  return createWorkspaceDocument({ experience: focusedWorkspaceExperience(), planningCalendar: emptyPlanningCalendar(), organization: emptyOrganization(), customerDirectory: emptyCustomerDirectory(), workflow: defaultInitiativeWorkflow(), prioritization, items: [], insightRecords: [], codeRepositories: [], implementationRuns: [], activity: [] }, options);
+  return createWorkspaceDocument({ experience: focusedWorkspaceExperience(), planningCalendar: emptyPlanningCalendar(), organization: emptyOrganization(), customerDirectory: emptyCustomerDirectory(), workflow: defaultInitiativeWorkflow(), prioritization, items: [], insightRecords: [], artifacts: [], codeRepositories: [], implementationRuns: [], activity: [] }, options);
 }
 
 /** Serializes only the versioned workspace allowlist; provider configuration and tokens cannot leak. */
@@ -256,6 +279,7 @@ export function normalizeWorkspaceActor(value, options = {}) {
 }
 
 function normalizeDocument(source, options) {
+  options = { ...options, canonicalRecords: [WORKSPACE_SCHEMA_V12, WORKSPACE_SCHEMA_V13, WORKSPACE_SCHEMA_V14, WORKSPACE_SCHEMA_V15, WORKSPACE_DOCUMENT_SCHEMA].includes(source.schema), canonicalExperiments: [WORKSPACE_SCHEMA_V13, WORKSPACE_SCHEMA_V14, WORKSPACE_SCHEMA_V15, WORKSPACE_DOCUMENT_SCHEMA].includes(source.schema) };
   if (!Array.isArray(source.items)) throw invalidDocument("Workspace document must contain an items array.");
   if (!options.legacy && !Array.isArray(source.insightRecords)) throw invalidDocument("Workspace document must contain an insightRecords array.");
   if (!options.legacy && !Array.isArray(source.activity)) {
@@ -301,7 +325,7 @@ function normalizeDocument(source, options) {
   let organization;
   try {
     organization = normalizeOrganization(source.organization || emptyOrganization());
-    if (options.legacy) {
+    if (options.legacy && source.schema !== WORKSPACE_DOCUMENT_SCHEMA) {
       const migrated = migrateLegacyOwners(items, organization);
       organization = migrated.organization;
       items = migrated.items;
@@ -356,12 +380,29 @@ function normalizeDocument(source, options) {
       assertUniqueId(insightIds, normalized.id, "insight record");
       return normalized;
     });
-    if (options.legacy) insightRecords = migrateLegacyValidationRecords(items, insightRecords, { now: timestamp, updatedBy: defaultActor.id });
+    const sourceItems = new Map(source.items.map((item) => [String(item.id), item]));
+    if (!options.canonicalExperiments) {
+      insightRecords = migrateLegacyValidationRecords(items.map(item => ({ ...item,
+        experiment: stringValue(sourceItems.get(item.id)?.experiment ?? item.experiment),
+        decision: options.canonicalRecords ? "" : stringValue(sourceItems.get(item.id)?.decision ?? item.decision),
+        createdAt: validTimestamp(sourceItems.get(item.id)?.createdAt) ? new Date(sourceItems.get(item.id).createdAt).toISOString() : item.updatedAt
+      })), insightRecords, { now: timestamp, updatedBy: defaultActor.id });
+    }
+    if (!options.canonicalRecords) {
+      insightRecords = migrateLegacyWorkRecords(items.map((item) => ({
+        ...item,
+        nextStep: stringValue(sourceItems.get(item.id)?.nextStep ?? item.nextStep),
+        decision: stringValue(sourceItems.get(item.id)?.decision ?? item.decision),
+        createdAt: validTimestamp(sourceItems.get(item.id)?.createdAt) ? new Date(sourceItems.get(item.id).createdAt).toISOString() : item.updatedAt
+      })), insightRecords, { now: timestamp, updatedBy: defaultActor.id });
+    }
+    items = items.map((item) => ({ ...item, nextStep: "", decision: "", experiment: "" }));
   } catch (error) {
     if (error instanceof InsightRecordError) throw invalidDocument(error.message, error);
     throw error;
   }
   assertInsightAssignments(insightRecords, items, customerDirectory, organization);
+  const artifacts = normalizeArtifacts(source.artifacts, options.legacy);
   const codeRepositories = normalizePortableCollection(source.codeRepositories, "codeRepositories", options.legacy);
   const implementationRuns = normalizePortableCollection(source.implementationRuns, "implementationRuns", options.legacy);
   assertBuildReferences(codeRepositories, implementationRuns, items);
@@ -393,9 +434,11 @@ function normalizeDocument(source, options) {
   document.prioritization = prioritization;
   document.items = items;
   document.insightRecords = insightRecords;
+  document.artifacts = artifacts;
   document.codeRepositories = codeRepositories;
   document.implementationRuns = implementationRuns;
   document.activity = activity;
+  if (artifacts.length && new TextEncoder().encode(JSON.stringify(document)).length > 16 * 1024 * 1024) throw invalidDocument("Workspace with saved artifacts exceeds the 16 MiB snapshot limit.");
   return immutableWorkspaceValue(document);
 }
 
@@ -428,6 +471,10 @@ function normalizeItem(value, context) {
     customerIds: uniqueStringArray(value.customerIds),
     segmentIds: uniqueStringArray(value.segmentIds),
     problem: stringValue(value.problem).trim(),
+    objective: authoredOutcomeText(value.objective, "objective"),
+    primaryMetric: authoredOutcomeText(value.primaryMetric, "primaryMetric"),
+    metricTarget: authoredOutcomeText(value.metricTarget, "metricTarget"),
+    metricReviewDate: authoredOutcomeDate(value.metricReviewDate),
     owner: stringValue(value.owner).trim(),
     status: validStatuses.has(value.status) ? value.status : "intake",
     statusId: stringValue(value.statusId).trim() || (validStatuses.has(value.status) ? value.status : "intake"),
@@ -437,11 +484,11 @@ function normalizeItem(value, context) {
     effort: clampNumber(value.effort, 1, 8, 3),
     startDate: stringValue(value.startDate).trim(),
     dueDate: stringValue(value.dueDate).trim(),
-    nextStep: stringValue(value.nextStep).trim(),
+    nextStep: context.canonicalRecords ? "" : stringValue(value.nextStep).trim(),
     risks,
     dependencies,
-    experiment: stringValue(value.experiment).trim(),
-    decision: stringValue(value.decision).trim(),
+    experiment: context.canonicalExperiments ? "" : stringValue(value.experiment).trim(),
+    decision: context.canonicalRecords ? "" : stringValue(value.decision).trim(),
     priority: normalizeItemPriority(value.priority, {
       legacyRice: context.legacy && value.priority === undefined,
       priorityInputs,
@@ -617,7 +664,11 @@ function normalizeChanges(value) {
   const output = {};
   for (const [field, change] of Object.entries(value)) {
     if (!changeFields.has(field)) continue;
-    const sanitized = sanitizeChangeValue(change);
+    const sanitized = field === "priorityInputs"
+      ? isPlainObject(change) && "from" in change && "to" in change
+        ? { from: normalizePriorityInputs(change.from), to: normalizePriorityInputs(change.to) }
+        : normalizePriorityInputs(change)
+      : sanitizeChangeValue(change);
     if (sanitized !== undefined) output[field] = sanitized;
   }
   return output;
@@ -629,7 +680,7 @@ function sanitizeChangeValue(value) {
   if (Array.isArray(value)) return value.map(sanitizeChangeValue).filter((entry) => entry !== undefined);
   if (!isPlainObject(value)) return undefined;
   const output = {};
-  for (const field of ["from", "to"]) {
+  for (const field of new Set(["from", "to", ...ARTIFACT_FIELDS, "type", "initiative", "query", "period", "startDate", "displayName"])) {
     if (!Object.prototype.hasOwnProperty.call(value, field)) continue;
     const sanitized = sanitizeChangeValue(value[field]);
     if (sanitized !== undefined) output[field] = sanitized;
@@ -644,7 +695,7 @@ function allowlistedDocument(document, exportedAt) {
   }
   output.experience = pick(document.experience, ["version", "enabledCapabilities"]);
   output.planningCalendar = pick(document.planningCalendar, [
-    "version", "enabledPeriodTypes", "fiscalYearStartMonth", "sprintLengthWeeks", "sprintAnchorDate"
+    "version", "enabledPeriodTypes", "fiscalYearStartMonth", "sprintLengthWeeks", "sprintAnchorDate", "capacityPlan"
   ]);
   output.organization = {
     version: document.organization.version,
@@ -685,6 +736,7 @@ function allowlistedDocument(document, exportedAt) {
   };
   output.items = document.items.map((item) => pick(item, WORKSPACE_ITEM_FIELDS));
   output.insightRecords = document.insightRecords.map((record) => pick(record, WORKSPACE_INSIGHT_FIELDS));
+  output.artifacts = document.artifacts.map((record) => pick(record, ARTIFACT_FIELDS));
   output.codeRepositories = document.codeRepositories.map((entry) => portableJsonValue(entry, "codeRepositories"));
   output.implementationRuns = document.implementationRuns.map((entry) => portableJsonValue(entry, "implementationRuns"));
   output.activity = document.activity.map((entry) => ({
@@ -699,6 +751,18 @@ function allowlistedDocument(document, exportedAt) {
 
 const sensitiveBuildKey = /(token|secret|credential|password|session|threadId|projectId|worktree|localPath|endpoint|providerSelection)/i;
 
+function normalizeArtifacts(value, legacy) {
+  if (value === undefined && legacy) return [];
+  if (!Array.isArray(value) || value.length > 5000) throw invalidDocument("Workspace artifacts must be an array of at most 5000 saved versions.");
+  const ids = new Set();
+  return value.map(input => {
+    let record;
+    try { record = normalizeArtifactRecord(input); }
+    catch (error) { throw invalidDocument(error.message, error); }
+    assertUniqueId(ids, record.id, "artifact");
+    return record;
+  });
+}
 function normalizePortableCollection(value, label, legacy) {
   if (value === undefined && legacy) return [];
   if (!Array.isArray(value)) throw invalidDocument(`${label} must be an array.`);
@@ -713,7 +777,11 @@ function normalizePortableCollection(value, label, legacy) {
 }
 
 function portableJsonValue(value, path = "workspace") {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const generatedSummary = /^implementationRuns(?:\[\d+\])?\.(?:changeSummary|approvedPlan\.summary|checkSummary\[\d+\]\.(?:label|detail))$/.test(path);
+    return generatedSummary ? sanitizePortableBuildSummary(value) : value;
+  }
+  if (value === null || typeof value === "boolean") return value;
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (Array.isArray(value)) return value.map((entry, index) => portableJsonValue(entry, `${path}[${index}]`));
   if (!isPlainObject(value)) throw invalidDocument(`${path} contains a non-portable value.`);
@@ -868,6 +936,18 @@ function boundedText(value, limit, label) {
   return text;
 }
 
+function authoredOutcomeText(value, label, limit = 8000) {
+  if (value != null && typeof value !== "string") throw invalidDocument(`${label} must be text.`);
+  const text = (value ?? "").trim();
+  if ([...text].length > limit) throw invalidDocument(`${label} cannot exceed ${limit} characters.`);
+  return text;
+}
+
+function authoredOutcomeDate(value) {
+  const text = authoredOutcomeText(value, "metricReviewDate", 10);
+  if (text && (!/^(?!0000)\d{4}-\d{2}-\d{2}$/.test(text) || Number.isNaN(Date.parse(`${text}T00:00:00.000Z`)) || new Date(`${text}T00:00:00.000Z`).toISOString().slice(0, 10) !== text)) throw invalidDocument("metricReviewDate must be a real YYYY-MM-DD date.");
+  return text;
+}
 function normalizedOptionalDate(value, label) {
   const text = stringValue(value).trim();
   if (!text) return "";

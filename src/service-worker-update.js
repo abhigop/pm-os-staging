@@ -200,7 +200,13 @@ export async function registerServiceWorkerUpdates({
 } = {}) {
   if (!serviceWorker?.register) return null;
   const coordinator = createServiceWorkerUpdateCoordinator({ rootDocument, reload });
-  serviceWorker.addEventListener?.("controllerchange", coordinator.controllerChanged);
+  let hasController = Boolean(serviceWorker.controller);
+  serviceWorker.addEventListener?.("controllerchange", () => {
+    const wasControlled = hasController;
+    hasController = Boolean(serviceWorker.controller);
+    // The first clients.claim() installs offline support; only a replacement is an update.
+    if (wasControlled && hasController) coordinator.controllerChanged();
+  });
   try {
     const registration = await serviceWorker.register(workerUrl);
     watchServiceWorkerRegistration(registration, {

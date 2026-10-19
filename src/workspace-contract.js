@@ -193,6 +193,8 @@ export class WorkspaceRepository {
   subscribe(listener) { void listener; throw unsupported(this.providerId, "subscribe"); }
   createItem(input) { void input; throw unsupported(this.providerId, "createItem"); }
   updateItem(id, patch, expectedVersion) { void id; void patch; void expectedVersion; throw unsupported(this.providerId, "updateItem"); }
+  createArtifact(input, expectedSupersededVersion = null) { void input; void expectedSupersededVersion; throw unsupported(this.providerId, "createArtifact"); }
+  deleteArtifact(id, expectedVersion) { void id; void expectedVersion; throw unsupported(this.providerId, "deleteArtifact"); }
   createInsightRecord(input) { void input; throw unsupported(this.providerId, "createInsightRecord"); }
   updateInsightRecord(id, patch, expectedVersion) { void id; void patch; void expectedVersion; throw unsupported(this.providerId, "updateInsightRecord"); }
   updateExperience(input, expectedVersion) {
@@ -307,4 +309,43 @@ function unsupported(providerId, operation) {
     `${operation} is not implemented by this workspace provider.`,
     { providerId, operation }
   );
+}
+
+/** Remove device filesystem references from generated, portable Build summaries.
+ * Approved plan Markdown is intentionally handled separately: its exact text is
+ * the approval/handoff contract, not a generated completion summary.
+ */
+export function sanitizePortableBuildSummary(value) {
+  if (typeof value !== "string") return "";
+  const localStart = /^(?:[a-z]:[\\/]|\\\\|file:\/\/|~\/|\/(?:Users|home|root|tmp|private|var|opt|srv|workspace|workspaces|mnt|media|Volumes|run\/user)\/)/i;
+  const isLocal = (target) => localStart.test(target.trim().replace(/^</, ""));
+  // Parse balanced destinations so a folder such as "Project (new)" cannot
+  // leave the tail of its local path behind after removing a Markdown link.
+  const links = /\[([^\]\r\n]+)\]\(/g;
+  let output = "", cursor = 0, match;
+  while ((match = links.exec(value))) {
+    const start = links.lastIndex;
+    let end = start, depth = 1;
+    for (; end < value.length && value[end] !== "\n" && depth; end++) {
+      if (value[end] === "(") depth++;
+      else if (value[end] === ")") depth--;
+    }
+    if (depth || !isLocal(value.slice(start, end - 1))) continue;
+    output += value.slice(cursor, match.index) + sanitizePortableBuildSummary(match[1]);
+    cursor = end;
+    links.lastIndex = end;
+  }
+  output += value.slice(cursor);
+  // Preserve complete web URLs, even if their route includes a filesystem-like
+  // word. Only recognizable local references in the surrounding text change.
+  return output.split(/(https?:\/\/[^\s<>"'`]+)/gi).map((part) => {
+    if (/^https?:\/\//i.test(part)) return part;
+    const quoted = part.replace(/(["'`])([^\r\n]*?)\1/g, (whole, quote, content) => isLocal(content) ? `${quote}[local path]${quote}` : whole);
+    const redact = (path) => `[local path]${/[.]$/.test(path) ? "." : ""}`;
+    // Backslash-delimited Windows components can contain spaces. Consume whole
+    // directory components, then only the final filename token, so prose after
+    // "C:\\Users\\Private Person\\repo\\README.md" is left intact.
+    const windows = quoted.replace(/(?:\b[a-z]:\\|\\\\[^\s\\]+\\)(?:[^\\\r\n<>"'`|,;:!?()\[\]]+\\)*[^\s\\<>"'`|,;!?()\[\]]*/gi, redact);
+    return windows.replace(/(?:\b[a-z]:[\\/]|\\\\[^\s\\/]+[\\/]|file:\/\/|~\/|(?<![\w:/])\/(?:Users|home|root|tmp|private|var|opt|srv|workspace|workspaces|mnt|media|Volumes|run\/user)(?=\/))[^\s<>"'`|,;!?)\]]*/gi, redact);
+  }).join("");
 }

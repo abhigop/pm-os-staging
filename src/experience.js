@@ -119,3 +119,33 @@ function immutable(value) {
   else Object.values(value).forEach(immutable);
   return Object.freeze(value);
 }
+
+// Presets select workflows; they do not assign roles or change access permissions.
+export const WORKSPACE_PRESETS = Object.freeze([
+  workspacePreset("solo-pm", "Solo PM", "Focus on today's priorities and your core product work.", []),
+  workspacePreset("product-team", "Product team", "Coordinate shared work, ownership, delivery, and team updates.", ["shared-workspace", "team-ownership", "delivery-tracking", "activity-history", "communications-reviews"]),
+  workspacePreset("leadership-viewer", "Leadership viewer", "Review portfolio outcomes, leadership briefings, and updates.", ["portfolio-planning", "leadership-briefing", "communications-reviews"]),
+  workspacePreset("technical-admin", "Technical administrator", "Configure shared workflows, ownership, and activity history.", ["shared-workspace", "team-ownership", "custom-workflow", "activity-history"]),
+  workspacePreset("custom", "Custom setup", "Keep your current workflows and choose what to add.", [])
+]);
+
+export function workspaceExperienceForPreset(presetId, currentExperience = focusedWorkspaceExperience()) {
+  const preset = WORKSPACE_PRESETS.find((entry) => entry.id === presetId);
+  if (!preset) fail("Unknown workspace preset: " + presetId + ".", { presetId });
+  const current = normalizeWorkspaceExperience(currentExperience);
+  if (preset.id === "custom") return current;
+  return normalizeWorkspaceExperience({ version: current.version + 1, enabledCapabilities: [...preset.capabilityIds] });
+}
+
+export function matchingWorkspacePreset(experience) {
+  const normalized = normalizeWorkspaceExperience(experience);
+  const preset = WORKSPACE_PRESETS.find((entry) => entry.id !== "custom"
+    && entry.capabilityIds.length === normalized.enabledCapabilities.length
+    && entry.capabilityIds.every((id, index) => id === normalized.enabledCapabilities[index]));
+  return preset?.id || "custom";
+}
+
+function workspacePreset(id, label, description, selectedIds) {
+  const selected = new Set(selectedIds);
+  return immutable({ id, label, description, capabilityIds: EXPERIENCE_CAPABILITY_IDS.filter((capabilityId) => selected.has(capabilityId)) });
+}

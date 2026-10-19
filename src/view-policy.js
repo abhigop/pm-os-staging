@@ -42,7 +42,7 @@ export function viewLabel(view) {
 
 export function allowedModes(space, experience) {
   return {
-    today: ["focus", "actions"],
+    today: ["focus", "actions", "manager", "documents", "admin"],
     initiatives: ["list", "priorities", "board", "roadmap", ...(experienceHas(experience, "portfolio-planning") ? ["portfolio"] : [])],
     insights: ["discovery", ...(experienceHas(experience, "research-validation") ? ["research", "validation"] : []), "feedback", ...(experienceHas(experience, "customer-support") ? ["support", "customers"] : [])],
     planning: [...(experienceHas(experience, "timeline-planning") ? ["quarter", "roadmap"] : []), ...(experienceHas(experience, "portfolio-planning") ? ["capacity", "outcomes", "metrics"] : [])],

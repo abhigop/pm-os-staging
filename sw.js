@@ -1,14 +1,19 @@
 const cachePrefix = "pm-os-staging-";
-const cacheName = cachePrefix + "c94bb2ad46a0247da2f418f5";
+const cacheName = cachePrefix + "b9453529130bd7fa6e23dbed";
 const assets = [
   "./",
   "./index.html",
-  "./src/app.js",
+  "./src/inbound-import.js", "./src/inbound-import-dialog.js",
+  "./src/app.js", "./src/release.js",
+  "./src/record-drafts.js",
+  "./src/document-composer.js",
+  "./src/artifacts.js",
   "./src/projects.js",
   "./src/project-switcher.js",
   "./src/server-connectors.js",
   "./src/view-policy.js",
   "./src/domain.js",
+  "./src/local-date.js",
   "./src/experience.js",
   "./src/insights.js",
   "./src/customers.js",
@@ -20,6 +25,7 @@ const assets = [
   "./src/workflow.js",
   "./src/prioritization.js",
   "./src/planning-calendar.js",
+  "./src/planning-capacity-ui.js",
   "./src/storage.js",
   "./src/tutorial.js",
   "./src/workspace-contract.js",
@@ -30,6 +36,7 @@ const assets = [
   "./src/supabase-client-loader.js",
   "./src/supabase-workspace-repository.js",
   "./src/supabase-team-client.js",
+  "./src/team-invitation.js",
   "./src/service-worker-update.js",
   "./src/styles.css",
   "./vendor/supabase-2.110.0.js",

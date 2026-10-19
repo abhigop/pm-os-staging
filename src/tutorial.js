@@ -12,7 +12,7 @@ const groupDefinitions = [
         mode: "focus",
         target: "workspace-navigation",
         title: "Your product workspace",
-        description: "Eight spaces organize daily focus, initiatives, evidence, plans, delivery, briefings, team ownership, and settings. The source card shows where this workspace currently lives."
+        description: "Today, Work, Insights, and Settings organize your workspace. Supporting workflows open from these four areas. The project switcher shows the current project and where its work is saved."
       },
       {
         id: "shared-controls",
@@ -114,7 +114,7 @@ const groupDefinitions = [
     label: "Settings",
     description: "Control data ownership, workflow, planning cadence, prioritization, and history.",
     steps: [
-      { id: "data", space: "settings", mode: "data", target: "active-mode", title: "Data and sync", description: "Choose Browser, guarded Google Drive, or optional Team storage; import and export portable files; manage recovery snapshots, members, invites, and local-only usage." },
+      { id: "data", space: "settings", mode: "data", target: "active-mode", title: "Data and sync", description: "Choose Browser, Google Drive with change checks, or optional Team storage; import and export portable files; manage recovery snapshots, members, invites, and local-only usage." },
       { id: "workflow", space: "settings", mode: "workflow", target: "active-mode", title: "Workflow", description: "Configure the ordered initiative stages and their stable reporting categories while protecting stages that are still in use." },
       { id: "calendar", space: "settings", mode: "calendar", target: "active-mode", title: "Planning calendar", description: "Enable sprint, month, fiscal quarter, and fiscal year layers and configure the cadence used by shared timeline scope." },
       { id: "prioritization", space: "settings", mode: "prioritization", target: "active-mode", title: "Prioritization", description: "Choose the workspace method, define priority levels or bounded custom scorecards, and set exact-team board overrides." },

@@ -1,7 +1,9 @@
+import { normalizePlanningCalendar } from "./planning-calendar.js";
 export const backupReasons = Object.freeze({
   import: "before-import",
   reset: "before-reset",
   drivePull: "before-drive-pull",
+  linkedFileMerge: "before-linked-file-merge",
   restore: "before-restore",
   teamSwitch: "before-team-switch"
 });
@@ -11,8 +13,8 @@ const allowedReasons = new Set(Object.values(backupReasons));
 const snapshotLimit = 5;
 const envelopeKeys = new Set(["schema", "snapshots"]);
 const snapshotKeys = new Set(["id", "createdAt", "reason", "payload"]);
-const workspaceKeys = new Set(["schema", "exportedAt", "workspace", "workspaceId", "workspaceVersion", "experience", "planningCalendar", "organization", "customerDirectory", "workflow", "prioritization", "items", "insightRecords", "codeRepositories", "implementationRuns", "activity"]);
-const workspaceSchemas = new Set(["pm-os.workspace.v1", "pm-os.workspace.v2", "pm-os.workspace.v3", "pm-os.workspace.v4", "pm-os.workspace.v5", "pm-os.workspace.v6", "pm-os.workspace.v7", "pm-os.workspace.v8", "pm-os.workspace.v9", "pm-os.workspace.v10"]);
+const workspaceKeys = new Set(["schema", "exportedAt", "workspace", "workspaceId", "workspaceVersion", "experience", "planningCalendar", "organization", "customerDirectory", "workflow", "prioritization", "items", "insightRecords", "artifacts", "codeRepositories", "implementationRuns", "activity"]);
+const workspaceSchemas = new Set(["pm-os.workspace.v1", "pm-os.workspace.v2", "pm-os.workspace.v3", "pm-os.workspace.v4", "pm-os.workspace.v5", "pm-os.workspace.v6", "pm-os.workspace.v7", "pm-os.workspace.v8", "pm-os.workspace.v9", "pm-os.workspace.v10", "pm-os.workspace.v11", "pm-os.workspace.v12", "pm-os.workspace.v13", "pm-os.workspace.v14", "pm-os.workspace.v15", "pm-os.workspace.v16"]);
 const sensitiveKeys = /^(accessToken|clientId|credential|credentials|driveToken|refreshToken|token)$/i;
 
 export function addWorkspaceSnapshot(snapshots, payload, reason, now = new Date(), idFactory = defaultSnapshotId) {
@@ -81,6 +83,7 @@ export function backupReasonLabel(reason) {
     [backupReasons.import]: "Before import",
     [backupReasons.reset]: "Before reset",
     [backupReasons.drivePull]: "Before Drive pull",
+    [backupReasons.linkedFileMerge]: "Before linked-file merge",
     [backupReasons.restore]: "Before restore",
     [backupReasons.teamSwitch]: "Before Team switch"
   })[reason] || "Workspace backup";
@@ -129,14 +132,18 @@ function normalizeSnapshot(value) {
 
 function parseWorkspacePayload(payload) {
   const workspace = JSON.parse(payload);
-  if (!workspaceSchemas.has(workspace?.schema) || !Array.isArray(workspace.items) || !Array.isArray(workspace.activity)
-    || (["pm-os.workspace.v8", "pm-os.workspace.v9", "pm-os.workspace.v10"].includes(workspace.schema) && !Array.isArray(workspace.insightRecords))
-    || (["pm-os.workspace.v9", "pm-os.workspace.v10"].includes(workspace.schema) && (!workspace.experience || !Array.isArray(workspace.experience.enabledCapabilities)))
-    || (workspace.schema === "pm-os.workspace.v10" && (!Array.isArray(workspace.codeRepositories) || !Array.isArray(workspace.implementationRuns)))) {
+  if ((["pm-os.workspace.v15", "pm-os.workspace.v16"].includes(workspace?.schema) && !Array.isArray(workspace.artifacts)) || !workspaceSchemas.has(workspace?.schema) || !Array.isArray(workspace.items) || !Array.isArray(workspace.activity)
+    || (["pm-os.workspace.v8", "pm-os.workspace.v9", "pm-os.workspace.v10", "pm-os.workspace.v11", "pm-os.workspace.v12", "pm-os.workspace.v13", "pm-os.workspace.v14", "pm-os.workspace.v15", "pm-os.workspace.v16"].includes(workspace.schema) && !Array.isArray(workspace.insightRecords))
+    || (["pm-os.workspace.v9", "pm-os.workspace.v10", "pm-os.workspace.v11", "pm-os.workspace.v12", "pm-os.workspace.v13", "pm-os.workspace.v14", "pm-os.workspace.v15", "pm-os.workspace.v16"].includes(workspace.schema) && (!workspace.experience || !Array.isArray(workspace.experience.enabledCapabilities)))
+    || (["pm-os.workspace.v10", "pm-os.workspace.v11", "pm-os.workspace.v12", "pm-os.workspace.v13", "pm-os.workspace.v14", "pm-os.workspace.v15", "pm-os.workspace.v16"].includes(workspace.schema) && (!Array.isArray(workspace.codeRepositories) || !Array.isArray(workspace.implementationRuns)))) {
     throw new Error("Recovery snapshot must contain a portable PM OS workspace and activity log.");
   }
   if (Object.keys(workspace).some((key) => !workspaceKeys.has(key)) || containsSensitiveKey(workspace)) {
     throw new Error("Recovery snapshot must not contain source settings, credentials, or tokens.");
+  }
+  if (workspace.schema === "pm-os.workspace.v16") {
+    if (!workspace.planningCalendar || typeof workspace.planningCalendar !== "object" || Array.isArray(workspace.planningCalendar)) throw new Error("Recovery snapshot requires its planning calendar.");
+    normalizePlanningCalendar(workspace.planningCalendar);
   }
   return workspace;
 }

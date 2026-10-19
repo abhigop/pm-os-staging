@@ -15,6 +15,7 @@ export const PRIORITY_METHODS = Object.freeze({
 });
 
 const frameworkIdPattern = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const criterionIdPattern = /^[a-z0-9][a-zA-Z0-9-]{0,63}$/;
 const directions = new Set(["higher", "lower"]);
 const MAX_MANUAL_ORDER = 1000;
 const MAX_LEVELS = 6;
@@ -36,13 +37,13 @@ const builtInDefinitions = [
   {
     id: "rice",
     name: "RICE",
-    description: "Balances reach, impact, confidence, and effort.",
+    description: "RICE compares expected benefit with effort: Reach × Impact × Confidence ÷ Effort. Higher scores rank first.",
     formula: "(Reach x Impact x Confidence) / Effort",
     fields: [
       field("reach", "Reach", 0, 100000),
       field("impact", "Impact", 1, 5),
       field("confidence", "Confidence", 0.1, 1, 0.1),
-      field("effort", "Effort", 1, 8)
+      field("effort", "Effort", 1, 8, 1, "lower")
     ]
   },
   {
@@ -61,7 +62,7 @@ const builtInDefinitions = [
       field("businessValue", "Business value", 1, 10),
       field("timeCriticality", "Time criticality", 1, 10),
       field("riskReduction", "Risk reduction", 1, 10),
-      field("jobSize", "Job size", 1, 10)
+      field("jobSize", "Job size", 1, 10, 1, "lower")
     ]
   },
   {
@@ -69,7 +70,7 @@ const builtInDefinitions = [
     name: "Value / Effort",
     description: "A simple value-to-complexity comparison.",
     formula: "Value / Effort",
-    fields: [field("value", "Value", 1, 10), field("effort", "Effort", 1, 10)]
+    fields: [field("value", "Value", 1, 10), field("effort", "Effort", 1, 10, 1, "lower")]
   }
 ];
 
@@ -178,6 +179,8 @@ export function normalizePriorityInputs(value, legacyItem = null) {
     if (Object.keys(normalized).length) output[frameworkId] = normalized;
   }
 
+  // The modern map owns every framework, including scores the customer cleared.
+  if (plainObject(value)) return deepFreeze(output);
   const legacyPriority = plainObject(legacyItem?.priority) ? legacyItem.priority : {};
   const legacyValues = plainObject(legacyPriority.valuesByMethod) ? legacyPriority.valuesByMethod : {};
   for (const methodId of ["ice", "wsjf", "value-effort"]) {
@@ -227,18 +230,24 @@ export function assertPriorityAssignments(prioritization, organization, items = 
   }
   const levelIds = new Set(normalized.levels.map((level) => level.id));
   for (const item of items) {
+    const initiativeLabel = clean(item.title) ? `Initiative “${clean(item.title)}”` : "This initiative";
     const levelId = clean(item?.priority?.tierByMethod?.levels || item?.priorityLevelId);
-    if (levelId && !levelIds.has(levelId)) fail(`Initiative ${item.id} references a missing priority level.`, { itemId: item.id, levelId });
+    if (levelId && !levelIds.has(levelId)) fail(`${initiativeLabel} has an unavailable priority level. Choose an available priority level.`, { itemId: item.id, levelId });
     for (const [frameworkId, inputs] of Object.entries(item.priorityInputs || {})) {
       const framework = frameworks.get(frameworkId);
-      if (!framework) fail(`Initiative ${item.id} references a missing prioritization framework.`, { itemId: item.id, frameworkId });
+      if (!framework) fail(`${initiativeLabel} has an unavailable prioritization framework. Choose an available framework.`, { itemId: item.id, frameworkId });
       if (!framework.fields.length) continue;
       const fieldIds = new Set(framework.fields.map((entry) => entry.id));
       const invalid = Object.keys(inputs).find((criterionId) => !fieldIds.has(criterionId));
-      if (invalid) fail(`Initiative ${item.id} contains an unknown ${framework.name} criterion.`, { itemId: item.id, frameworkId, criterionId: invalid });
+      if (invalid) fail(`${initiativeLabel} contains an unrecognized ${framework.name} scoring field.`, { itemId: item.id, frameworkId, criterionId: invalid });
       for (const [criterionId, raw] of Object.entries(inputs)) {
         const definition = framework.fields.find((entry) => entry.id === criterionId);
-        if (!validFieldValue(raw, definition)) fail(`Initiative ${item.id} contains an invalid ${framework.name} value for ${definition.name}.`, { itemId: item.id, frameworkId, criterionId });
+        if (!validFieldValue(raw, definition)) {
+          const percent = frameworkId === "rice" && criterionId === "confidence";
+          const minimum = percent ? `${definition.min * 100}%` : definition.min;
+          const maximum = percent ? `${definition.max * 100}%` : definition.max;
+          fail(`${initiativeLabel}: ${framework.name} ${definition.name} must be a number from ${minimum} to ${maximum}.`, { itemId: item.id, frameworkId, criterionId });
+        }
       }
     }
   }
@@ -455,13 +464,11 @@ function methodIdForFramework(frameworkId) {
 }
 
 function priorityInputsForFramework(item, framework) {
+  // Missing entries in a modern map are unscored, not requests to restore legacy values.
+  if (plainObject(item?.priorityInputs)) return plainObject(item.priorityInputs[framework.id]) ? item.priorityInputs[framework.id] : {};
   if (framework.id === "rice") {
-    // An explicit input map is authoritative, including empty or partial scores.
-    // Only unmigrated records may fall back to the old top-level fields.
-    if (plainObject(item?.priorityInputs)) return plainObject(item.priorityInputs.rice) ? item.priorityInputs.rice : {};
     return { reach: item?.reach, impact: item?.impact, confidence: item?.confidence, effort: item?.effort };
   }
-  if (plainObject(item?.priorityInputs?.[framework.id])) return item.priorityInputs[framework.id];
   const legacyMethod = framework.id.startsWith("custom-") ? "custom" : framework.id;
   return plainObject(item?.priority?.valuesByMethod?.[legacyMethod]) ? item.priority.valuesByMethod[legacyMethod] : {};
 }
@@ -469,7 +476,7 @@ function priorityInputsForFramework(item, framework) {
 function numericInputs(value) {
   const output = {};
   for (const [criterionId, raw] of Object.entries(value || {})) {
-    if (!frameworkIdPattern.test(criterionId) || criterionId === "scored") continue;
+    if (!criterionIdPattern.test(criterionId) || criterionId === "scored") continue;
     const number = Number(raw);
     if (Number.isFinite(number)) output[criterionId] = number;
   }
@@ -493,7 +500,7 @@ function legacyRiceOrder(items) {
     .map((item) => clean(item?.id)).filter(Boolean).slice(0, MAX_MANUAL_ORDER);
 }
 
-function field(id, name, min, max, step = 1) { return { id, name, min, max, step, weight: 1, direction: "higher" }; }
+function field(id, name, min, max, step = 1, direction = "higher") { return { id, name, min, max, step, weight: 1, direction }; }
 function validFieldValue(value, definition) { const number = Number(value); return value !== "" && value !== null && value !== undefined && Number.isFinite(number) && number >= definition.min && number <= definition.max; }
 function formatScore(value) { return Number.isInteger(value) ? String(value) : String(roundScore(value)); }
 function roundScore(value) { return Math.round(value * 10) / 10; }

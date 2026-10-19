@@ -117,6 +117,20 @@ export class SupabaseTeamClient {
     return this._authState;
   }
 
+  async acceptEmailSession(session) {
+    this._assertActive("acceptEmailSession");
+    const client = await this._prepareClient("acceptEmailSession");
+    try {
+      const result = await client.auth.setSession({ access_token: session.access_token, refresh_token: session.refresh_token });
+      if (result?.error) throw result.error;
+      // Validate the identity with Auth; never authorize from the URL payload.
+      return await this.getAuthState();
+    } catch (error) {
+      try { await client.auth.signOut({ scope: "local" }); } catch { /* Invalid session is not retained. */ }
+      throw this._handleError(error, "acceptEmailSession");
+    }
+  }
+
   async sendOtp(email) {
     this._assertActive("sendOtp");
     this._setConnection("connecting");
@@ -486,6 +500,7 @@ function normalizeCapabilities(input) {
     ...(typeof source.workspaceLifecycle === "boolean"
       ? { workspaceLifecycle: source.workspaceLifecycle }
       : {}),
+    ...(typeof source.emailInvitations === "boolean" ? { emailInvitations: source.emailInvitations } : {}),
     ...(Array.isArray(source.workspaceTemplates)
       ? { workspaceTemplates: source.workspaceTemplates.filter((id) => ["focused", "full", "blank"].includes(id)) }
       : {})
