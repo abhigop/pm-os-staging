@@ -1,5 +1,5 @@
 const cachePrefix = "pm-os-staging-";
-const cacheName = cachePrefix + "b9453529130bd7fa6e23dbed";
+const cacheName = cachePrefix + "fb3c90b5364916268343980d";
 const assets = [
   "./",
   "./index.html",

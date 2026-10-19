@@ -219,6 +219,10 @@ export function migrateLegacyCustomers(items, directory = emptyCustomerDirectory
   const migratedItems = [];
 
   for (const item of list(items)) {
+    if (list(item.customerIds).length || list(item.segmentIds).length) {
+      migratedItems.push({ ...item, customerIds: unique(list(item.customerIds)), segmentIds: unique(list(item.segmentIds)) });
+      continue;
+    }
     const legacyName = text(item.customer);
     let tag = legacyName ? tagByName.get(key(legacyName)) : null;
     if (legacyName && !tag) {

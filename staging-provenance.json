@@ -1,7 +1,7 @@
 {
   "schema": "pm-os.github-staging.v1",
-  "sourceCommit": "916c87435a227ee125611170a1a0f3156635c182",
-  "artifactHash": "43f84b92e02b65d9193ca723c7aa301757f5eb61353006bd84fac1a1a74af352",
+  "sourceCommit": "4fe3ab66faa73a38ba2a3eecbc6583c49f8ece59",
+  "artifactHash": "ef965a07bf0e1b887fc3bf3b61efb6e0cbca46300d0057d43ca5e6a680686ef0",
   "hashAlgorithm": "sha256",
   "artifactHashInput": "JSON.stringify(files); provenance excluded",
   "basePath": "/pm-os-staging/",
@@ -55,8 +55,8 @@
     },
     {
       "path": "src/customers.js",
-      "sha256": "0f2b8ade19d80e1fb8b5a7cbe16a83e7bed3da7d8a22b5ca13b7427b778f1908",
-      "bytes": 33033
+      "sha256": "82137125bc586728d58e43faf15cdee3a465d864621bcdaf467015760ca81a4e",
+      "bytes": 33259
     },
     {
       "path": "src/data.js",
@@ -150,7 +150,7 @@
     },
     {
       "path": "src/release.js",
-      "sha256": "9dbf51ff62b1b2ce439f820474e38cc3056013aef67da4b524d54a491a2ca6b1",
+      "sha256": "c7514d5fc8916b8ef230ca826ef0fddea173e9a6bb4b6742071118827305704a",
       "bytes": 270
     },
     {
@@ -230,8 +230,8 @@
     },
     {
       "path": "sw.js",
-      "sha256": "e8b08e00e94459b17d05ec7d6cf3afb2a35d9f514c0f799c1f6ed84f6625a30d",
-      "bytes": 3459
+      "sha256": "8b6198a68821798f0e6d68376a927a5f4e04ec9f8f496de24b88e9c4327f40a0",
+      "bytes": 3366
     },
     {
       "path": "vendor/supabase-2.110.0.js",

@@ -2,6 +2,6 @@
 export const APP_RELEASE = Object.freeze({
   "edition": "web",
   "version": "0.4.0",
-  "id": "web-97e0e9eb9143",
-  "sourceSha256": "97e0e9eb9143b9fab424f07ac4f8614a7b02009ab114d952a2139e2de389485e"
+  "id": "web-319e6035510b",
+  "sourceSha256": "319e6035510b58cf8aabf43ff6930ab0c380bba7d9cc0bba2a576eae8d257f4c"
 });
